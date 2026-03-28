@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "axiom-cas"
+name = "axiom-core"
 version = "0.1.0"
 dependencies = [
  "serde",
