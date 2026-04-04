@@ -4,8 +4,8 @@ pub type CasResult<T> = Result<T, CasError>;
 
 #[derive(Error, Debug)]
 pub enum CasError {
-    #[error("object not found")]
-    NotFound,
+    #[error("not found: {0}")]
+    NotFound(String),
 
     #[error("already exists")]
     AlreadyExists,
@@ -15,6 +15,9 @@ pub enum CasError {
 
     #[error("invalid object: {0}")]
     InvalidObject(String),
+
+    #[error("invalid ref: {0}")]
+    InvalidRef(String),
 
     #[error("store error: {0}")]
     Store(String),

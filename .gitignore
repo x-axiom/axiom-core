@@ -1,1 +1,30 @@
-/target
+/target/
+/docs
+/.github
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+
+# Environment overrides
+.env
+.env.*
+!.env.example
+
+# Logs and runtime outputs
+*.log
+*.pid
+
+# Local persistence files for upcoming single-node POC backends
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Local data directories
+/tmp/
+/data/
+/.axiom/

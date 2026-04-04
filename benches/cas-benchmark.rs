@@ -1,4 +1,5 @@
-use axiom_core::cas::{CasStore, InMemoryCas};
+use axiom_core::store::{ChunkStore, InMemoryChunkStore, InMemoryCas};
+use axiom_core::model::hash_children;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -10,7 +11,7 @@ fn bench_put_chunk_various_sizes(c: &mut Criterion) {
             BenchmarkId::from_parameter(format!("{}kb", size / 1024)),
             size,
             |b, &size| {
-                let store = InMemoryCas::new();
+                let store = InMemoryChunkStore::new();
                 let data = vec![42u8; size];
 
                 b.iter(|| {
@@ -24,9 +25,9 @@ fn bench_put_chunk_various_sizes(c: &mut Criterion) {
 
 fn bench_get_chunk(c: &mut Criterion) {
     c.bench_function("get_chunk_4kb", |b| {
-        let store = InMemoryCas::new();
+        let store = InMemoryChunkStore::new();
         let data = vec![7u8; 4096];
-        let hash = store.put_chunk(data);
+        let hash = store.put_chunk(data).unwrap();
 
         b.iter(|| {
             let _ = store.get_chunk(black_box(&hash));
@@ -42,7 +43,7 @@ fn bench_put_object(c: &mut Criterion) {
             .collect();
 
         b.iter(|| {
-            let _ = store.put_object(black_box(chunks.clone()));
+            let _ = hash_children(black_box(&chunks));
         });
     });
 }
