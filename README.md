@@ -1,87 +1,87 @@
 # Axiom
 
-Axiom是下一代高性能、版本化、内容寻址的大对象存储引擎
+Axiom is a next-generation high-performance, versioned, content-addressed large-object storage engine.
 
 # Axiom-core
 
-Axiom 的核心 Rust 原型仓库，当前聚焦于版本化、内容寻址的大对象存储引擎基础能力。项目处于 v0.1 POC 的基础设施阶段，已经完成统一领域模型、内存版存储抽象，以及一条最小可运行的 chunk → tree root → version → ref 演示链路。
+This repository contains the core Rust prototype for Axiom. It currently focuses on the foundational capabilities of a versioned, content-addressed large-object storage engine. The project is in the v0.1 POC infrastructure phase and already includes a unified domain model, in-memory storage abstractions, and a minimal end-to-end demo flow of chunk -> tree root -> version -> ref.
 
-## 当前状态
+## Current Status
 
-已经具备以下能力：
+The project currently provides:
 
-- 基于 BLAKE3 的内容哈希与版本 ID 建模
-- 面向 v0.1 的领域模型拆分：chunk、tree、node、version、ref、diff
-- 内存版 repository / store 抽象：ChunkStore、TreeStore、NodeStore、VersionRepo、RefRepo
-- **RocksDB 持久化 CAS**：chunk、tree node、directory node 三类数据通过独立 Column Family 持久化到本地磁盘，支持幂等写入和跨进程重启恢复
-- 分支与标签的基础引用语义，其中 tag 默认不可覆盖
-- 兼容过渡期的旧版 `cas` / `version` 模块
-- 37 个自动化测试覆盖内存实现、RocksDB 持久化、跨 reopen 恢复和错误路径
+- BLAKE3-based content hashing and version ID modeling
+- Domain model decomposition for v0.1: chunk, tree, node, version, ref, and diff
+- In-memory repository and store abstractions: `ChunkStore`, `TreeStore`, `NodeStore`, `VersionRepo`, and `RefRepo`
+- **Persistent RocksDB CAS**: chunk, tree node, and directory node data are stored in separate column families on local disk, with idempotent writes and recovery after process restart
+- Basic branch and tag reference semantics, with tags non-overwritable by default
+- Compatibility with the transitional legacy `cas` and `version` modules
+- 37 automated tests covering the in-memory implementation, RocksDB persistence, reopen recovery, and error paths
 
-当前尚未实现：FastCDC、文件级 Merkle builder、目录树提交流程、SQLite 元数据层、HTTP API 与流式上传下载。
+Not implemented yet: FastCDC, file-level Merkle builder, directory tree commit flow, SQLite metadata layer, HTTP API, and streaming upload/download.
 
-## 快速开始
+## Quick Start
 
-环境要求：
+Requirements:
 
 - Rust stable
 - Cargo
 
-安装依赖并运行演示：
+Install dependencies and run the demo:
 
 ```bash
 cargo run
 ```
 
-执行测试：
+Run tests:
 
 ```bash
 cargo test
 ```
 
-运行基准：
+Run benchmarks:
 
 ```bash
 cargo bench
 ```
 
-## 当前演示做了什么
+## What The Demo Does
 
-`src/main.rs` 包含两段演示：
+`src/main.rs` contains two demo flows:
 
-**InMemory Demo** — 验证领域模型连通性：
+**InMemory Demo** - verifies domain model connectivity:
 
-1. 写入一段原始字节到 `InMemoryChunkStore`
-2. 对 chunk hash 列表计算对象根哈希
-3. 创建 `VersionNode`
-4. 创建名为 `main` 的 branch ref
-5. 通过 ref 解析到 version，再解析到 root hash
-6. 从 chunk store 取回原始数据
+1. Write raw bytes into `InMemoryChunkStore`
+2. Compute an object root hash from a list of chunk hashes
+3. Create a `VersionNode`
+4. Create a branch ref named `main`
+5. Resolve the ref to a version, then resolve the version to a root hash
+6. Read the original data back from the chunk store
 
-**RocksDB Persistence Demo** — 验证磁盘持久化能力：
+**RocksDB Persistence Demo** - verifies on-disk persistence:
 
-1. 打开 `.axiom/demo-cas` 目录下的 RocksDB 实例
-2. 写入 chunk 并验证幂等性（重复写入返回相同 hash）
-3. 写入 tree node 引用该 chunk
-4. 关闭 store，模拟进程退出
-5. 重新打开同一路径，验证 chunk 和 tree node 均可恢复
+1. Open a RocksDB instance at `.axiom/demo-cas`
+2. Write a chunk and verify idempotency by getting the same hash on repeated writes
+3. Write a tree node that references the chunk
+4. Close the store to simulate process exit
+5. Reopen the same path and verify that both the chunk and tree node are recovered
 
-运行后会在项目根目录生成 `.axiom/demo-cas/` 数据目录（已被 `.gitignore` 忽略）。
+After execution, a `.axiom/demo-cas/` data directory is created in the project root. It is already ignored by `.gitignore`.
 
-## 设计原则
+## Design Principles
 
-- 资产即对象：内容通过哈希与树结构表达
-- 版本即声明：版本节点不可变，refs 负责命名和移动
-- 存储即哈希：chunk、tree、node 均以内容哈希寻址
-- 抽象先于实现：HTTP 层与 RocksDB / SQLite 落盘实现通过 trait 解耦，上层代码不直接依赖存储细节
+- Assets are objects: content is represented through hashes and tree structures
+- Versions are declarations: version nodes are immutable, while refs provide names and movement
+- Storage is hash-addressed: chunks, trees, and nodes are all addressed by content hash
+- Abstractions come before implementations: the HTTP layer and RocksDB / SQLite persistence implementations are decoupled through traits, and higher-level code does not depend directly on storage details
 
-## 下一步
+## Next Steps
 
-按当前计划，后续实现顺序为：
+The planned implementation order is:
 
-1. ~~RocksDB 持久化 CAS~~ ✅ 已完成（AXIOM-102）
-2. SQLite 元数据层
-3. FastCDC 分块
-4. 文件级 Merkle Tree
-5. 目录树、Version Commit 与 refs 闭环
-6. Diff Engine 与 axum API
+1. ~~Persistent RocksDB CAS~~ completed (AXIOM-102)
+2. SQLite metadata layer
+3. FastCDC chunking
+4. File-level Merkle tree
+5. Directory tree, version commit, and refs end-to-end flow
+6. Diff engine and axum API
