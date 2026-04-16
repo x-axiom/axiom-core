@@ -3,6 +3,17 @@ use crate::model::{
     ChunkHash, NodeEntry, Ref, RefKind, TreeNode, VersionId, VersionNode,
 };
 
+/// Metadata about a path entry in a specific version.
+#[derive(Clone, Debug)]
+pub struct PathEntry {
+    /// The path relative to the version root (e.g. "src/main.rs").
+    pub path: String,
+    /// Content hash of the node at this path.
+    pub node_hash: ChunkHash,
+    /// Whether this path is a directory (true) or file (false).
+    pub is_directory: bool,
+}
+
 /// Content-addressed storage for raw chunks.
 pub trait ChunkStore: Send + Sync {
     /// Store a chunk and return its content hash. Idempotent.
@@ -50,4 +61,30 @@ pub trait RefRepo: Send + Sync {
     fn delete_ref(&self, name: &str) -> CasResult<()>;
     /// List all refs, optionally filtered by kind.
     fn list_refs(&self, kind: Option<RefKind>) -> CasResult<Vec<Ref>>;
+}
+
+/// Repository for path-based metadata indexing per version.
+pub trait PathIndexRepo: Send + Sync {
+    /// Index a path entry for a given version.
+    fn put_path_entry(
+        &self,
+        version_id: &VersionId,
+        path: &str,
+        node_hash: &ChunkHash,
+        is_directory: bool,
+    ) -> CasResult<()>;
+
+    /// Look up a node by version and path.
+    fn get_by_path(
+        &self,
+        version_id: &VersionId,
+        path: &str,
+    ) -> CasResult<Option<PathEntry>>;
+
+    /// List immediate children under a directory path for a given version.
+    fn list_directory(
+        &self,
+        version_id: &VersionId,
+        dir_path: &str,
+    ) -> CasResult<Vec<PathEntry>>;
 }
