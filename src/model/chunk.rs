@@ -16,4 +16,6 @@ pub struct ChunkDescriptor {
     pub offset: u64,
     pub length: u32,
     pub hash: ChunkHash,
+    /// Zero-based order within the file.
+    pub order: u32,
 }
