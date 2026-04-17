@@ -2,6 +2,7 @@ use crate::error::CasResult;
 use crate::model::{
     ChunkHash, NodeEntry, Ref, RefKind, TreeNode, VersionId, VersionNode,
 };
+use std::sync::Arc;
 
 /// Metadata about a path entry in a specific version.
 #[derive(Clone, Debug)]
@@ -87,4 +88,35 @@ pub trait PathIndexRepo: Send + Sync {
         version_id: &VersionId,
         dir_path: &str,
     ) -> CasResult<Vec<PathEntry>>;
+}
+
+// ---------------------------------------------------------------------------
+// Arc blanket impls — allows sharing a single store across multiple services
+// ---------------------------------------------------------------------------
+
+impl<T: VersionRepo> VersionRepo for Arc<T> {
+    fn put_version(&self, version: &VersionNode) -> CasResult<()> {
+        (**self).put_version(version)
+    }
+    fn get_version(&self, id: &VersionId) -> CasResult<Option<VersionNode>> {
+        (**self).get_version(id)
+    }
+    fn list_history(&self, from: &VersionId, limit: usize) -> CasResult<Vec<VersionNode>> {
+        (**self).list_history(from, limit)
+    }
+}
+
+impl<T: RefRepo> RefRepo for Arc<T> {
+    fn put_ref(&self, r: &Ref) -> CasResult<()> {
+        (**self).put_ref(r)
+    }
+    fn get_ref(&self, name: &str) -> CasResult<Option<Ref>> {
+        (**self).get_ref(name)
+    }
+    fn delete_ref(&self, name: &str) -> CasResult<()> {
+        (**self).delete_ref(name)
+    }
+    fn list_refs(&self, kind: Option<RefKind>) -> CasResult<Vec<Ref>> {
+        (**self).list_refs(kind)
+    }
 }

@@ -13,12 +13,16 @@ The project currently provides:
 - BLAKE3-based content hashing and version ID modeling
 - Domain model decomposition for v0.1: chunk, tree, node, version, ref, and diff
 - In-memory repository and store abstractions: `ChunkStore`, `TreeStore`, `NodeStore`, `VersionRepo`, and `RefRepo`
-- **Persistent RocksDB CAS**: chunk, tree node, and directory node data are stored in separate column families on local disk, with idempotent writes and recovery after process restart
+- **Persistent RocksDB CAS** (AXIOM-102): chunk, tree node, and directory node data are stored in separate column families on local disk, with idempotent writes and recovery after process restart
+- **SQLite metadata layer** (AXIOM-103): version, ref, and path index persistence with WAL mode, migration support, and `SqliteMetadataStore` implementing `VersionRepo`, `RefRepo`, and `PathIndexRepo`
+- **FastCDC content-defined chunking** (AXIOM-104): configurable chunk policy (16KB–256KB), streaming `chunk_and_persist()`, deduplication, and `reassemble()` for reconstruction
+- **File-level Merkle tree** (AXIOM-105): multi-level tree with configurable fan-out (default 64), `build_tree()` and `rehydrate()` for chunk-order recovery, persisted to RocksDB
+- **File and directory tree namespace** (AXIOM-106): `build_directory_tree()` from file paths, deterministic directory hashing, version-scoped `resolve_path()`, and SQLite path index integration
 - Basic branch and tag reference semantics, with tags non-overwritable by default
 - Compatibility with the transitional legacy `cas` and `version` modules
-- 37 automated tests covering the in-memory implementation, RocksDB persistence, reopen recovery, and error paths
+- 90 automated tests covering domain model, RocksDB persistence, SQLite metadata, chunking, Merkle tree, and namespace operations
 
-Not implemented yet: FastCDC, file-level Merkle builder, directory tree commit flow, SQLite metadata layer, HTTP API, and streaming upload/download.
+Not implemented yet: version commit flow, branch/tag ref management, diff engine, HTTP API, and streaming upload/download.
 
 ## Quick Start
 
@@ -80,8 +84,10 @@ After execution, a `.axiom/demo-cas/` data directory is created in the project r
 The planned implementation order is:
 
 1. ~~Persistent RocksDB CAS~~ completed (AXIOM-102)
-2. SQLite metadata layer
-3. FastCDC chunking
-4. File-level Merkle tree
-5. Directory tree, version commit, and refs end-to-end flow
-6. Diff engine and axum API
+2. ~~SQLite metadata layer~~ completed (AXIOM-103)
+3. ~~FastCDC chunking~~ completed (AXIOM-104)
+4. ~~File-level Merkle tree~~ completed (AXIOM-105)
+5. ~~File and directory tree namespace~~ completed (AXIOM-106)
+6. Version commit flow and branch/tag refs (AXIOM-107)
+7. Diff engine (AXIOM-108)
+8. axum HTTP API and streaming IO (AXIOM-109+)
