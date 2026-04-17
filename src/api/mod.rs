@@ -21,6 +21,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/v1/versions", routes::versions::router())
         .nest("/api/v1/refs", routes::refs::router())
         .nest("/api/v1/diff", routes::diff::router())
+        .nest("/api/v1/upload", routes::upload::router())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

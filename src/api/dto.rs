@@ -104,3 +104,71 @@ pub struct DiffResponse {
     pub removed_chunks: usize,
     pub unchanged_chunks: usize,
 }
+
+// ---------------------------------------------------------------------------
+// Upload
+// ---------------------------------------------------------------------------
+
+/// Query parameters for single-file streaming upload.
+#[derive(Deserialize)]
+pub struct FileUploadQuery {
+    /// Relative path for the file (e.g. "src/main.rs").
+    pub path: String,
+    /// Branch to commit to. Defaults to "main".
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Commit message.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Parent version IDs (comma-separated).
+    #[serde(default)]
+    pub parents: Option<String>,
+}
+
+/// A file entry in a directory upload request.
+#[derive(Deserialize)]
+pub struct DirectoryFileEntry {
+    /// Relative path (e.g. "src/main.rs").
+    pub path: String,
+    /// File content, base64-encoded.
+    pub content_base64: String,
+}
+
+/// Request body for directory (multi-file) upload.
+#[derive(Deserialize)]
+pub struct DirectoryUploadRequest {
+    /// Files to include in this version.
+    pub files: Vec<DirectoryFileEntry>,
+    /// Branch to commit to. Defaults to "main".
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Commit message.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Parent version IDs.
+    #[serde(default)]
+    pub parents: Vec<String>,
+}
+
+/// Deduplication and ingestion statistics.
+#[derive(Serialize)]
+pub struct UploadStats {
+    pub total_files: usize,
+    pub total_bytes: u64,
+    pub total_chunks: usize,
+    /// Chunks that were already present in CAS.
+    pub dedup_chunks: usize,
+    /// Chunks newly written to CAS.
+    pub new_chunks: usize,
+    /// Bytes saved by deduplication.
+    pub dedup_bytes: u64,
+}
+
+/// Response for both file and directory upload.
+#[derive(Serialize)]
+pub struct UploadResponse {
+    pub version_id: String,
+    pub root: String,
+    pub branch: String,
+    pub stats: UploadStats,
+}
