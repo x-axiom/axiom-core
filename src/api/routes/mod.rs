@@ -6,3 +6,4 @@ pub mod versions;
 pub mod refs;
 pub mod diff;
 pub mod upload;
+pub mod download;

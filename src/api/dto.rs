@@ -172,3 +172,26 @@ pub struct UploadResponse {
     pub branch: String,
     pub stats: UploadStats,
 }
+
+// ---------------------------------------------------------------------------
+// Download / Directory listing
+// ---------------------------------------------------------------------------
+
+/// A child entry in a directory listing.
+#[derive(Serialize)]
+pub struct DirChildEntry {
+    pub name: String,
+    pub is_directory: bool,
+    /// Size in bytes (files only, 0 for directories).
+    pub size: u64,
+    /// Content hash hex.
+    pub hash: String,
+}
+
+/// Response for a directory listing request.
+#[derive(Serialize)]
+pub struct DirListingResponse {
+    pub version_id: String,
+    pub path: String,
+    pub entries: Vec<DirChildEntry>,
+}
