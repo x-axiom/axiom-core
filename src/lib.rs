@@ -6,6 +6,7 @@ pub mod merkle;
 pub mod namespace;
 pub mod commit;
 pub mod diff_engine;
+pub mod api;
 
 // Keep legacy modules for backward compatibility during transition.
 pub mod cas;
