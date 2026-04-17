@@ -7,3 +7,4 @@ pub mod refs;
 pub mod diff;
 pub mod upload;
 pub mod download;
+pub mod helpers;

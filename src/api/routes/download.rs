@@ -18,50 +18,13 @@ use crate::api::state::AppState;
 use crate::error::CasError;
 use crate::merkle::rehydrate;
 use crate::model::node::NodeKind;
-use crate::model::VersionId;
-use crate::store::traits::{ChunkStore, NodeStore, PathIndexRepo, RefRepo, VersionRepo};
+use crate::store::traits::{ChunkStore, NodeStore, PathIndexRepo};
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/version/{ref}/file/{*path}", get(download_file))
         .route("/version/{ref}/ls", get(list_root))
         .route("/version/{ref}/ls/{*path}", get(list_dir))
-}
-
-// ---------------------------------------------------------------------------
-// Version resolution: id / branch / tag
-// ---------------------------------------------------------------------------
-
-/// Resolve a ref string to a (version_id, root_hash) pair.
-///
-/// Tries in order: exact version id → branch → tag.
-fn resolve_version(
-    ref_str: &str,
-    meta: &(impl VersionRepo + RefRepo),
-) -> Result<(VersionId, blake3::Hash), ApiError> {
-    // 1. Try as literal version id.
-    let vid = VersionId::from(ref_str);
-    if let Some(v) = meta.get_version(&vid).map_err(ApiError::from)? {
-        return Ok((v.id, v.root));
-    }
-
-    // 2. Try as ref (branch or tag).
-    if let Some(r) = meta.get_ref(ref_str).map_err(ApiError::from)? {
-        let v = meta
-            .get_version(&r.target)
-            .map_err(ApiError::from)?
-            .ok_or_else(|| {
-                ApiError(CasError::NotFound(format!(
-                    "version '{}' (target of ref '{}') not found",
-                    r.target, ref_str
-                )))
-            })?;
-        return Ok((v.id, v.root));
-    }
-
-    Err(ApiError(CasError::NotFound(format!(
-        "version or ref '{ref_str}' not found"
-    ))))
 }
 
 // ---------------------------------------------------------------------------
@@ -72,7 +35,8 @@ async fn download_file(
     State(state): State<AppState>,
     Path((ref_str, file_path)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let (version_id, _root) = resolve_version(&ref_str, state.meta.as_ref())?;
+    let v = super::helpers::resolve_version_node(&ref_str, state.meta.as_ref())?;
+    let version_id = v.id;
 
     // Look up path in the path index.
     let entry = state
@@ -179,7 +143,10 @@ async fn list_dir_impl(
     ref_str: &str,
     dir_path: &str,
 ) -> ApiResult<Json<DirListingResponse>> {
-    let (version_id, _root) = resolve_version(ref_str, state.meta.as_ref())?;
+    let (version_id, _root) = {
+        let v = super::helpers::resolve_version_node(ref_str, state.meta.as_ref())?;
+        (v.id, v.root)
+    };
 
     // Verify the path is actually a directory (or root "").
     if !dir_path.is_empty() {

@@ -8,8 +8,6 @@ use crate::api::dto::{DiffEntryResponse, DiffRequest, DiffResponse};
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::state::AppState;
 use crate::diff_engine::diff_versions;
-use crate::model::VersionId;
-use crate::store::traits::VersionRepo;
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/", post(compute_diff))
@@ -19,27 +17,11 @@ async fn compute_diff(
     State(state): State<AppState>,
     Json(req): Json<DiffRequest>,
 ) -> ApiResult<Json<DiffResponse>> {
-    let old_version = state
-        .meta
-        .get_version(&VersionId::from(req.old_version.as_str()))
-        .map_err(ApiError::from)?
-        .ok_or_else(|| {
-            ApiError(crate::error::CasError::NotFound(format!(
-                "version '{}' not found",
-                req.old_version
-            )))
-        })?;
-
-    let new_version = state
-        .meta
-        .get_version(&VersionId::from(req.new_version.as_str()))
-        .map_err(ApiError::from)?
-        .ok_or_else(|| {
-            ApiError(crate::error::CasError::NotFound(format!(
-                "version '{}' not found",
-                req.new_version
-            )))
-        })?;
+    // Resolve old and new — accept version ids, branches, or tags.
+    let old_version =
+        super::helpers::resolve_version_node(&req.old_version, state.meta.as_ref())?;
+    let new_version =
+        super::helpers::resolve_version_node(&req.new_version, state.meta.as_ref())?;
 
     // The CAS store implements both NodeStore and TreeStore.
     let result = diff_versions(

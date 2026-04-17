@@ -53,6 +53,29 @@ pub struct VersionListResponse {
     pub versions: Vec<VersionResponse>,
 }
 
+/// Paginated version history response.
+#[derive(Serialize)]
+pub struct PaginatedVersionListResponse {
+    pub versions: Vec<VersionResponse>,
+    pub offset: usize,
+    pub limit: usize,
+    pub has_more: bool,
+}
+
+/// Node metadata for a path within a version.
+#[derive(Serialize)]
+pub struct NodeMetadataResponse {
+    pub version_id: String,
+    pub path: String,
+    pub hash: String,
+    pub is_directory: bool,
+    /// File size in bytes (0 for directories).
+    pub size: u64,
+    /// Child names (directories only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub children: Option<Vec<String>>,
+}
+
 // ---------------------------------------------------------------------------
 // Refs
 // ---------------------------------------------------------------------------
