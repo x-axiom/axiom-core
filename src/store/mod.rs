@@ -6,7 +6,7 @@ pub mod sqlite;
 pub use traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry};
 pub use memory::{
     InMemoryChunkStore, InMemoryTreeStore, InMemoryNodeStore,
-    InMemoryVersionRepo, InMemoryRefRepo, InMemoryCas,
+    InMemoryVersionRepo, InMemoryRefRepo, InMemoryPathIndex, InMemoryCas,
 };
 pub use rocksdb::RocksDbCasStore;
 pub use sqlite::SqliteMetadataStore;

@@ -4,90 +4,158 @@ Axiom is a next-generation high-performance, versioned, content-addressed large-
 
 # Axiom-core
 
-This repository contains the core Rust prototype for Axiom. It currently focuses on the foundational capabilities of a versioned, content-addressed large-object storage engine. The project is in the v0.1 POC infrastructure phase and already includes a unified domain model, in-memory storage abstractions, and a minimal end-to-end demo flow of chunk -> tree root -> version -> ref.
+This repository contains the core Rust prototype for Axiom — a versioned, content-addressed large-object storage engine. The v0.1 POC is complete, providing a fully functional single-node system with HTTP API, persistent storage, content-defined chunking, Merkle trees, version history, branching, tagging, diff, and streaming upload/download.
 
-## Current Status
+## Current Status — v0.1 POC Complete
 
-The project currently provides:
+The project provides:
 
-- BLAKE3-based content hashing and version ID modeling
-- Domain model decomposition for v0.1: chunk, tree, node, version, ref, and diff
-- In-memory repository and store abstractions: `ChunkStore`, `TreeStore`, `NodeStore`, `VersionRepo`, and `RefRepo`
-- **Persistent RocksDB CAS** (AXIOM-102): chunk, tree node, and directory node data are stored in separate column families on local disk, with idempotent writes and recovery after process restart
-- **SQLite metadata layer** (AXIOM-103): version, ref, and path index persistence with WAL mode, migration support, and `SqliteMetadataStore` implementing `VersionRepo`, `RefRepo`, and `PathIndexRepo`
-- **FastCDC content-defined chunking** (AXIOM-104): configurable chunk policy (16KB–256KB), streaming `chunk_and_persist()`, deduplication, and `reassemble()` for reconstruction
-- **File-level Merkle tree** (AXIOM-105): multi-level tree with configurable fan-out (default 64), `build_tree()` and `rehydrate()` for chunk-order recovery, persisted to RocksDB
-- **File and directory tree namespace** (AXIOM-106): `build_directory_tree()` from file paths, deterministic directory hashing, version-scoped `resolve_path()`, and SQLite path index integration
-- Basic branch and tag reference semantics, with tags non-overwritable by default
-- Compatibility with the transitional legacy `cas` and `version` modules
-- 90 automated tests covering domain model, RocksDB persistence, SQLite metadata, chunking, Merkle tree, and namespace operations
-
-Not implemented yet: version commit flow, branch/tag ref management, diff engine, HTTP API, and streaming upload/download.
+- **BLAKE3 content addressing** — all chunks, tree nodes, and directory nodes are hash-addressed
+- **Domain model** — chunk, tree, node, version, ref, and diff primitives
+- **RocksDB CAS** (AXIOM-102) — persistent chunk, tree node, and directory node storage with column families, idempotent writes, and crash recovery
+- **SQLite metadata** (AXIOM-103) — version, ref, and path index persistence with WAL mode and migration support
+- **FastCDC chunking** (AXIOM-104) — content-defined chunking (16KB–256KB), deduplication, and reassembly
+- **Merkle tree** (AXIOM-105) — multi-level tree with configurable fan-out (default 64), build and rehydrate operations
+- **Directory namespace** (AXIOM-106) — `build_directory_tree()`, deterministic directory hashing, path resolution, SQLite path index
+- **Commit service** (AXIOM-107) — version creation, branch/tag CRUD, history traversal, ref resolution
+- **Diff engine** (AXIOM-108) — directory-level and chunk-level diff with Merkle hash short-circuit for unchanged subtrees
+- **HTTP API** (AXIOM-109) — axum-based REST API with health, objects, versions, refs, diff, upload, and download routes
+- **Streaming upload** (AXIOM-110) — single-file (raw body) and multi-file (JSON+base64) upload with dedup statistics
+- **Streaming download** (AXIOM-111) — file download via Merkle rehydration and directory listing
+- **Query APIs** (AXIOM-112) — paginated version history, ref-aware version/diff resolution, node metadata endpoint
+- **E2E validation** (AXIOM-113) — 10 end-to-end tests, 6 benchmark scenarios, demo script, and known limitations documentation
+- **Immutable tags**, branch management, and ref-based navigation across all read endpoints
+- **158+ automated tests** covering all layers from domain model to HTTP API integration
 
 ## Quick Start
 
 Requirements:
 
-- Rust stable
+- Rust stable toolchain
 - Cargo
 
-Install dependencies and run the demo:
+### Start the Server
 
 ```bash
-cargo run
+cargo run --release
 ```
 
-Run tests:
+The server listens on `http://localhost:3000`.
+
+### Upload Files
+
+```bash
+# Single file
+curl -X POST 'http://localhost:3000/api/v1/upload/file?path=hello.txt&message=first+commit' \
+  --data-binary 'Hello, Axiom!'
+
+# Directory (multiple files)
+curl -X POST http://localhost:3000/api/v1/upload/directory \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "files": [
+      {"path": "src/main.rs", "content_base64": "Zm4gbWFpbigpIHt9"},
+      {"path": "README.md", "content_base64": "IyBIZWxsbw=="}
+    ],
+    "message": "initial commit"
+  }'
+```
+
+### Browse and Download
+
+```bash
+# List directory contents
+curl http://localhost:3000/api/v1/version/main/ls
+
+# Download a file
+curl http://localhost:3000/api/v1/version/main/file/hello.txt
+
+# View version history
+curl http://localhost:3000/api/v1/versions/main/history
+```
+
+### Diff Versions
+
+```bash
+curl -X POST http://localhost:3000/api/v1/diff \
+  -H 'Content-Type: application/json' \
+  -d '{"old_version": "v1.0", "new_version": "main"}'
+```
+
+### Run Tests
 
 ```bash
 cargo test
 ```
 
-Run benchmarks:
+### Run Benchmarks
 
 ```bash
-cargo bench
+cargo bench --bench poc_benchmark
 ```
 
-## What The Demo Does
+For the full demo walkthrough, see [docs/demo.md](docs/demo.md).
 
-`src/main.rs` contains two demo flows:
+## API Endpoints
 
-**InMemory Demo** - verifies domain model connectivity:
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check |
+| POST | `/api/v1/upload/file` | Single-file upload (raw body) |
+| POST | `/api/v1/upload/directory` | Multi-file upload (JSON) |
+| GET | `/api/v1/version/{ref}/file/{path}` | Download file content |
+| GET | `/api/v1/version/{ref}/ls` | List root directory |
+| GET | `/api/v1/version/{ref}/ls/{path}` | List subdirectory |
+| GET | `/api/v1/versions/{ref}` | Get version by ID, branch, or tag |
+| GET | `/api/v1/versions/{ref}/history` | Paginated version history |
+| GET | `/api/v1/versions/{ref}/path/{path}` | Node metadata (hash, size, type) |
+| POST | `/api/v1/versions` | Create version record |
+| GET | `/api/v1/refs` | List refs (filterable by kind) |
+| POST | `/api/v1/refs` | Create branch or tag |
+| GET | `/api/v1/refs/{name}` | Get ref details |
+| PUT | `/api/v1/refs/{name}` | Update branch target |
+| DELETE | `/api/v1/refs/{name}` | Delete branch |
+| GET | `/api/v1/refs/{name}/resolve` | Resolve ref to version |
+| POST | `/api/v1/diff` | Diff two versions (by ID, branch, or tag) |
+| GET | `/api/v1/objects/{hash}` | Get object info |
 
-1. Write raw bytes into `InMemoryChunkStore`
-2. Compute an object root hash from a list of chunk hashes
-3. Create a `VersionNode`
-4. Create a branch ref named `main`
-5. Resolve the ref to a version, then resolve the version to a root hash
-6. Read the original data back from the chunk store
+All `{ref}` parameters accept a version ID, branch name, or tag name.
 
-**RocksDB Persistence Demo** - verifies on-disk persistence:
+## Architecture
 
-1. Open a RocksDB instance at `.axiom/demo-cas`
-2. Write a chunk and verify idempotency by getting the same hash on repeated writes
-3. Write a tree node that references the chunk
-4. Close the store to simulate process exit
-5. Reopen the same path and verify that both the chunk and tree node are recovered
-
-After execution, a `.axiom/demo-cas/` data directory is created in the project root. It is already ignored by `.gitignore`.
+```
+┌─────────────────────────────────────────────┐
+│              HTTP API (axum)                 │
+│   upload · download · versions · refs · diff│
+├─────────────────────────────────────────────┤
+│           Service Layer                     │
+│   CommitService · DiffEngine · Namespace    │
+├──────────────────────┬──────────────────────┤
+│   RocksDB CAS        │   SQLite Metadata    │
+│   chunks · trees     │   versions · refs    │
+│   nodes              │   path index         │
+└──────────────────────┴──────────────────────┘
+```
 
 ## Design Principles
 
-- Assets are objects: content is represented through hashes and tree structures
-- Versions are declarations: version nodes are immutable, while refs provide names and movement
-- Storage is hash-addressed: chunks, trees, and nodes are all addressed by content hash
-- Abstractions come before implementations: the HTTP layer and RocksDB / SQLite persistence implementations are decoupled through traits, and higher-level code does not depend directly on storage details
+- **Content-addressed** — chunks, trees, and nodes are all addressed by BLAKE3 hash
+- **Immutable versions** — version nodes are never modified; branches provide mutable pointers
+- **Trait-based storage** — all storage accessed through traits; implementations are swappable
+- **Deduplication by default** — identical content is stored once across all versions
 
-## Next Steps
+## Documentation
 
-The planned implementation order is:
+- [Demo script](docs/demo.md) — step-by-step POC walkthrough
+- [Known limitations & v0.2 recommendations](docs/known-limitations.md)
+- [Architecture notes](docs/architecture.md)
 
-1. ~~Persistent RocksDB CAS~~ completed (AXIOM-102)
-2. ~~SQLite metadata layer~~ completed (AXIOM-103)
-3. ~~FastCDC chunking~~ completed (AXIOM-104)
-4. ~~File-level Merkle tree~~ completed (AXIOM-105)
-5. ~~File and directory tree namespace~~ completed (AXIOM-106)
-6. Version commit flow and branch/tag refs (AXIOM-107)
-7. Diff engine (AXIOM-108)
-8. axum HTTP API and streaming IO (AXIOM-109+)
+## Next Steps (v0.2)
+
+See [docs/known-limitations.md](docs/known-limitations.md) for the full list. Key priorities:
+
+1. Streaming upload with back-pressure for large files
+2. Persistent storage benchmarks (RocksDB + SQLite)
+3. Garbage collection for orphaned chunks
+4. Merge commit support
+5. CLI tool

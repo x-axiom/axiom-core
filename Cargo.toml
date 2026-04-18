@@ -27,3 +27,11 @@ futures-util = "0.3"
 tempfile = "3"
 reqwest = { version = "0.12", features = ["json"] }
 tokio-test = "0.4"
+
+[[bench]]
+name = "cas-benchmark"
+harness = false
+
+[[bench]]
+name = "poc_benchmark"
+harness = false

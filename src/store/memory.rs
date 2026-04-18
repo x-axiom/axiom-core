@@ -6,7 +6,7 @@ use crate::model::{
     ChunkHash, NodeEntry, Ref, RefKind, TreeNode, VersionId, VersionNode,
     hash_bytes, hash_children,
 };
-use super::traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo};
+use super::traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry};
 
 // ---------------------------------------------------------------------------
 // InMemoryChunkStore
@@ -187,6 +187,82 @@ impl RefRepo for InMemoryRefRepo {
 
 // ---------------------------------------------------------------------------
 // Backward-compatible combined store (bridges old CasStore API)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// InMemoryPathIndex
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+pub struct InMemoryPathIndex {
+    /// (version_id_str, path) -> PathEntry
+    entries: RwLock<HashMap<(String, String), PathEntry>>,
+}
+
+impl InMemoryPathIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl PathIndexRepo for InMemoryPathIndex {
+    fn put_path_entry(
+        &self,
+        version_id: &VersionId,
+        path: &str,
+        node_hash: &ChunkHash,
+        is_directory: bool,
+    ) -> CasResult<()> {
+        let key = (version_id.as_str().to_string(), path.to_string());
+        self.entries.write().insert(
+            key,
+            PathEntry {
+                path: path.to_string(),
+                node_hash: node_hash.clone(),
+                is_directory,
+            },
+        );
+        Ok(())
+    }
+
+    fn get_by_path(
+        &self,
+        version_id: &VersionId,
+        path: &str,
+    ) -> CasResult<Option<PathEntry>> {
+        let key = (version_id.as_str().to_string(), path.to_string());
+        Ok(self.entries.read().get(&key).cloned())
+    }
+
+    fn list_directory(
+        &self,
+        version_id: &VersionId,
+        dir_path: &str,
+    ) -> CasResult<Vec<PathEntry>> {
+        let vid = version_id.as_str().to_string();
+        let prefix = if dir_path.is_empty() {
+            String::new()
+        } else {
+            format!("{dir_path}/")
+        };
+        let guard = self.entries.read();
+        let results: Vec<PathEntry> = guard
+            .iter()
+            .filter(|((v, p), _)| {
+                v == &vid
+                    && if prefix.is_empty() {
+                        !p.contains('/')
+                    } else {
+                        p.starts_with(&prefix)
+                            && !p[prefix.len()..].contains('/')
+                    }
+            })
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        Ok(results)
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 /// Combined in-memory store that provides chunk + simple object support,
