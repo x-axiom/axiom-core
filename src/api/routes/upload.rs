@@ -21,7 +21,7 @@ use crate::merkle::{build_tree, DEFAULT_FAN_OUT};
 use crate::model::chunk::ChunkDescriptor;
 use crate::model::VersionId;
 use crate::namespace::{build_directory_tree, FileInput};
-use crate::store::traits::ChunkStore;
+use crate::store::traits::{ChunkStore, RefRepo};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -100,7 +100,7 @@ async fn upload_file(
     let message = query
         .message
         .unwrap_or_else(|| format!("upload {}", &query.path));
-    let parents: Vec<VersionId> = query
+    let mut parents: Vec<VersionId> = query
         .parents
         .map(|p| {
             p.split(',')
@@ -109,6 +109,13 @@ async fn upload_file(
                 .collect()
         })
         .unwrap_or_default();
+
+    // Auto-resolve branch head as parent if none provided.
+    if parents.is_empty() {
+        if let Some(r) = state.meta.get_ref(branch).map_err(ApiError::from)? {
+            parents.push(r.target);
+        }
+    }
 
     // 1. Chunk and persist with dedup tracking.
     let (descriptors, file_stats) =
@@ -196,7 +203,14 @@ async fn upload_directory(
     let message = req.message.unwrap_or_else(|| {
         format!("upload {} file(s)", req.files.len())
     });
-    let parents: Vec<VersionId> = req.parents.into_iter().map(VersionId::from).collect();
+    let mut parents: Vec<VersionId> = req.parents.into_iter().map(VersionId::from).collect();
+
+    // Auto-resolve branch head as parent if none provided.
+    if parents.is_empty() {
+        if let Some(r) = state.meta.get_ref(branch).map_err(ApiError::from)? {
+            parents.push(r.target);
+        }
+    }
 
     let engine = base64::engine::general_purpose::STANDARD;
 

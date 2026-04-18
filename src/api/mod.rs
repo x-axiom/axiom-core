@@ -9,12 +9,18 @@ pub mod dto;
 pub mod routes;
 
 use axum::Router;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use state::AppState;
 
 /// Build the full axum `Router` with all route groups and middleware.
 pub fn build_router(state: AppState) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     Router::new()
         .merge(routes::health::router())
         .nest("/api/v1/objects", routes::objects::router())
@@ -23,6 +29,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/v1/diff", routes::diff::router())
         .nest("/api/v1/upload", routes::upload::router())
         .nest("/api/v1", routes::download::router())
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
