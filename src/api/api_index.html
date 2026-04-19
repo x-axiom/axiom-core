@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Axiom Core — API Reference</title>
+  <style>
+    :root {
+      --bg: #0f172a; --bg2: #1e293b; --bg3: #334155;
+      --fg: #e2e8f0; --fg2: #94a3b8; --fg3: #64748b;
+      --accent: #38bdf8; --accent2: #818cf8;
+      --green: #6ee7b7; --green-bg: #064e3b;
+      --blue: #7dd3fc; --blue-bg: #1e3a5f;
+      --yellow: #fde68a; --yellow-bg: #713f12;
+      --red: #fca5a5; --red-bg: #7f1d1d;
+      --border: #1e293b; --radius: 8px;
+      --sidebar-w: 260px;
+      --mono: "SF Mono", "Fira Code", "Cascadia Code", "JetBrains Mono", monospace;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; scroll-padding-top: 5rem; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.65; }
+
+    /* Sidebar */
+    .sidebar {
+      position: fixed; top: 0; left: 0; width: var(--sidebar-w); height: 100vh;
+      background: var(--bg2); border-right: 1px solid var(--border);
+      overflow-y: auto; padding: 1.5rem 1rem; z-index: 100;
+    }
+    .sidebar-logo { font-size: 1.2rem; font-weight: 700; color: var(--accent); margin-bottom: .25rem; }
+    .sidebar-ver { font-size: .75rem; color: var(--fg3); margin-bottom: 1.25rem; }
+    .sidebar h3 { font-size: .7rem; text-transform: uppercase; letter-spacing: .08em; color: var(--fg3); margin: 1rem 0 .4rem; }
+    .sidebar a {
+      display: flex; align-items: center; gap: .5rem;
+      padding: .3rem .6rem; border-radius: 6px; text-decoration: none;
+      color: var(--fg2); font-size: .82rem; transition: all .15s;
+    }
+    .sidebar a:hover, .sidebar a.active { background: var(--bg); color: var(--fg); }
+    .sidebar a .m { font-size: .65rem; font-weight: 700; min-width: 2.8rem; text-align: center; padding: .1rem .3rem; border-radius: 3px; }
+
+    /* Main */
+    .main { margin-left: var(--sidebar-w); padding: 2rem 3rem 4rem; max-width: 900px; }
+
+    /* Hero */
+    .hero { margin-bottom: 2.5rem; }
+    .hero h1 { font-size: 2rem; color: #f8fafc; margin-bottom: .3rem; }
+    .hero p { color: var(--fg2); font-size: .95rem; max-width: 600px; }
+    .hero .badges { display: flex; gap: .5rem; margin-top: .75rem; flex-wrap: wrap; }
+    .hero .badge { font-size: .72rem; padding: .2rem .6rem; border-radius: 999px; background: var(--bg2); color: var(--fg2); border: 1px solid var(--border); }
+
+    /* Info cards */
+    .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: .75rem; margin-bottom: 2.5rem; }
+    .info-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.25rem; }
+    .info-card .label { font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--fg3); margin-bottom: .3rem; }
+    .info-card .value { font-size: .95rem; color: var(--fg); }
+    .info-card code { font-family: var(--mono); font-size: .85rem; color: var(--accent); }
+
+    /* Section title */
+    .section-title { font-size: 1.1rem; color: var(--accent); margin: 2.5rem 0 1rem; padding-bottom: .4rem; border-bottom: 1px solid var(--border); }
+
+    /* Endpoint card */
+    .endpoint {
+      background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+      margin-bottom: .75rem; overflow: hidden; transition: border-color .2s;
+    }
+    .endpoint:hover { border-color: var(--bg3); }
+    .ep-header {
+      display: flex; align-items: center; gap: .75rem; padding: .85rem 1.25rem;
+      cursor: pointer; user-select: none; position: relative;
+    }
+    .ep-header::after {
+      content: '\25B8'; position: absolute; right: 1.25rem; color: var(--fg3);
+      transition: transform .2s; font-size: .85rem;
+    }
+    .endpoint.open .ep-header::after { transform: rotate(90deg); }
+    .method {
+      font-weight: 700; font-size: .72rem; padding: .2rem .55rem; border-radius: 4px;
+      min-width: 3.5rem; text-align: center; font-family: var(--mono); letter-spacing: .03em;
+    }
+    .method.get    { background: var(--green-bg); color: var(--green); }
+    .method.post   { background: var(--blue-bg); color: var(--blue); }
+    .method.put    { background: var(--yellow-bg); color: var(--yellow); }
+    .method.delete { background: var(--red-bg); color: var(--red); }
+    .ep-path { font-family: var(--mono); font-size: .88rem; color: var(--fg); }
+    .ep-path .param { color: var(--accent2); }
+    .ep-desc { font-size: .82rem; color: var(--fg3); margin-left: auto; padding-right: 1.5rem; white-space: nowrap; }
+
+    .ep-body { display: none; padding: 0 1.25rem 1.25rem; }
+    .endpoint.open .ep-body { display: block; }
+    .ep-body p { font-size: .88rem; color: var(--fg2); margin-bottom: .75rem; line-height: 1.6; }
+
+    /* Param tables */
+    .param-table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; font-size: .84rem; }
+    .param-table th {
+      text-align: left; padding: .45rem .7rem; background: var(--bg); color: var(--fg3);
+      font-size: .72rem; text-transform: uppercase; letter-spacing: .05em; font-weight: 600;
+    }
+    .param-table td { padding: .45rem .7rem; border-bottom: 1px solid #1a2436; }
+    .param-table code { font-family: var(--mono); font-size: .82rem; color: var(--accent); }
+    .param-table .required { color: var(--red); font-size: .7rem; font-weight: 600; }
+    .param-table .optional { color: var(--fg3); font-size: .7rem; }
+
+    /* Code blocks */
+    .code-label { font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--fg3); margin-bottom: .35rem; font-weight: 600; }
+    .code-block {
+      position: relative; background: #0c1222; border: 1px solid #1a2436; border-radius: 6px;
+      padding: .85rem 1rem; margin-bottom: 1rem; overflow-x: auto;
+    }
+    .code-block pre { font-family: var(--mono); font-size: .8rem; line-height: 1.55; color: #c9d1d9; white-space: pre; }
+    .code-block .copy-btn {
+      position: absolute; top: .5rem; right: .5rem; background: var(--bg3); border: none;
+      color: var(--fg2); padding: .25rem .5rem; border-radius: 4px; cursor: pointer;
+      font-size: .68rem; opacity: 0; transition: opacity .15s;
+    }
+    .code-block:hover .copy-btn { opacity: 1; }
+    .code-block .copy-btn:active { background: var(--accent); color: var(--bg); }
+
+    /* JSON syntax */
+    .json-key { color: #7dd3fc; }
+    .json-str { color: #6ee7b7; }
+    .json-num { color: #fde68a; }
+    .json-bool { color: #c084fc; }
+    .json-null { color: #94a3b8; font-style: italic; }
+    .json-comment { color: #475569; font-style: italic; }
+
+    /* Tabs */
+    .tab-bar { display: flex; gap: 0; margin-bottom: 0; }
+    .tab-btn {
+      padding: .4rem .9rem; font-size: .78rem; background: var(--bg); color: var(--fg3);
+      border: 1px solid #1a2436; border-bottom: none; cursor: pointer; border-radius: 6px 6px 0 0;
+      transition: all .15s; font-family: inherit;
+    }
+    .tab-btn.active { background: #0c1222; color: var(--fg); border-color: #1a2436; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* Notes */
+    .note {
+      background: rgba(56, 189, 248, .07); border-left: 3px solid var(--accent);
+      padding: .6rem 1rem; border-radius: 0 6px 6px 0; margin-bottom: 1rem; font-size: .83rem; color: var(--fg2);
+    }
+    .note strong { color: var(--accent); }
+    .warn {
+      background: rgba(253, 230, 138, .07); border-left: 3px solid var(--yellow);
+      padding: .6rem 1rem; border-radius: 0 6px 6px 0; margin-bottom: 1rem; font-size: .83rem; color: var(--fg2);
+    }
+    .warn strong { color: var(--yellow); }
+
+    /* Responsive */
+    @media (max-width: 860px) {
+      .sidebar { display: none; }
+      .main { margin-left: 0; padding: 1.5rem 1rem; }
+      .ep-desc { display: none; }
+    }
+
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<!-- SIDEBAR -->
+<nav class="sidebar">
+  <div class="sidebar-logo">Axiom Core</div>
+  <div class="sidebar-ver">API v0.1</div>
+
+  <h3>Overview</h3>
+  <a href="#overview">Getting Started</a>
+  <a href="#conventions">Conventions</a>
+
+  <h3>Health</h3>
+  <a href="#get-health"><span class="m method get">GET</span> /health</a>
+
+  <h3>Objects</h3>
+  <a href="#get-object"><span class="m method get">GET</span> /objects/{hash}</a>
+
+  <h3>Versions</h3>
+  <a href="#post-version"><span class="m method post">POST</span> /versions/</a>
+  <a href="#get-version"><span class="m method get">GET</span> /versions/{id}</a>
+  <a href="#get-history"><span class="m method get">GET</span> .../history</a>
+  <a href="#get-path"><span class="m method get">GET</span> .../path/*</a>
+
+  <h3>Refs</h3>
+  <a href="#list-refs"><span class="m method get">GET</span> /refs/</a>
+  <a href="#create-ref"><span class="m method post">POST</span> /refs/</a>
+  <a href="#get-ref"><span class="m method get">GET</span> /refs/{name}</a>
+  <a href="#update-ref"><span class="m method put">PUT</span> /refs/{name}</a>
+  <a href="#delete-ref"><span class="m method delete">DEL</span> /refs/{name}</a>
+  <a href="#resolve-ref"><span class="m method get">GET</span> .../resolve</a>
+
+  <h3>Diff</h3>
+  <a href="#post-diff"><span class="m method post">POST</span> /diff/</a>
+
+  <h3>Upload</h3>
+  <a href="#upload-file"><span class="m method post">POST</span> /upload/file</a>
+  <a href="#upload-dir"><span class="m method post">POST</span> /upload/directory</a>
+
+  <h3>Download</h3>
+  <a href="#download-file"><span class="m method get">GET</span> .../file/*</a>
+  <a href="#ls-root"><span class="m method get">GET</span> .../ls</a>
+  <a href="#ls-path"><span class="m method get">GET</span> .../ls/*</a>
+</nav>
+
+<!-- MAIN -->
+<div class="main">
+
+  <!-- Hero -->
+  <div class="hero" id="overview">
+    <h1>Axiom Core API Reference</h1>
+    <p>Content-addressable, version-controlled large object storage. All endpoints accept and return JSON unless noted otherwise.</p>
+    <div class="badges">
+      <span class="badge">v0.1 POC</span>
+      <span class="badge">REST / JSON</span>
+      <span class="badge">BLAKE3 Hashing</span>
+      <span class="badge">Content Deduplication</span>
+      <span class="badge">18 Endpoints</span>
+    </div>
+  </div>
+
+  <!-- Quick info -->
+  <div class="info-grid">
+    <div class="info-card">
+      <div class="label">Base URL</div>
+      <div class="value"><code>http://localhost:3000</code></div>
+    </div>
+    <div class="info-card">
+      <div class="label">Content Type</div>
+      <div class="value"><code>application/json</code></div>
+    </div>
+    <div class="info-card">
+      <div class="label">Hash Algorithm</div>
+      <div class="value"><code>BLAKE3</code> (64-char hex)</div>
+    </div>
+    <div class="info-card">
+      <div class="label">CORS</div>
+      <div class="value">Open (all origins)</div>
+    </div>
+  </div>
+
+  <!-- Conventions -->
+  <h2 class="section-title" id="conventions">Conventions</h2>
+  <div class="note"><strong>Ref Resolution:</strong> Any path parameter that accepts a version (<code>{id}</code>, <code>{ref}</code>) will resolve in order: exact version ID &#8594; branch name &#8594; tag name.</div>
+  <div class="note"><strong>Hash Format:</strong> All hashes are BLAKE3, represented as 64-character lowercase hexadecimal strings.</div>
+  <div class="warn"><strong>Error Responses:</strong> All errors return JSON with <code>{"error": "message"}</code> and an appropriate HTTP status code (400, 404, 500).</div>
+
+  <!-- ==================== HEALTH ==================== -->
+  <h2 class="section-title">Health</h2>
+
+  <div class="endpoint" id="get-health">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method get">GET</span>
+      <span class="ep-path">/health</span>
+      <span class="ep-desc">Health check</span>
+    </div>
+    <div class="ep-body">
+      <p>Returns server health status and version. Use this to verify the service is running.</p>
+      <div class="code-label">Response &middot; 200 OK</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"status"</span>: <span class="json-str">"ok"</span>,
+  <span class="json-key">"version"</span>: <span class="json-str">"0.1.0"</span>
+}</pre></div>
+      <div class="code-label">cURL Example</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>curl http://localhost:3000/health</pre></div>
+    </div>
+  </div>
+
+  <!-- ==================== OBJECTS ==================== -->
+  <h2 class="section-title">Objects</h2>
+
+  <div class="endpoint" id="get-object">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method get">GET</span>
+      <span class="ep-path">/api/v1/objects/<span class="param">{hash}</span></span>
+      <span class="ep-desc">Get object info by hash</span>
+    </div>
+    <div class="ep-body">
+      <p>Check whether a content chunk exists in the CAS (content-addressable store) and retrieve its metadata.</p>
+      <div class="code-label">Path Parameters</div>
+      <table class="param-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>hash</code></td><td>string <span class="required">required</span></td><td>BLAKE3 hex hash (64 characters)</td></tr>
+        </tbody>
+      </table>
+      <div class="code-label">Response &middot; 200 OK</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"hash"</span>: <span class="json-str">"a1b2c3d4..."</span>,
+  <span class="json-key">"size"</span>: <span class="json-num">1024</span>,
+  <span class="json-key">"exists"</span>: <span class="json-bool">true</span>
+}</pre></div>
+      <div class="code-label">cURL Example</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>curl http://localhost:3000/api/v1/objects/a1b2c3d4e5f6...</pre></div>
+    </div>
+  </div>
+
+  <!-- ==================== VERSIONS ==================== -->
+  <h2 class="section-title">Versions</h2>
+
+  <div class="endpoint" id="post-version">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method post">POST</span>
+      <span class="ep-path">/api/v1/versions/</span>
+      <span class="ep-desc">Create a new version</span>
+    </div>
+    <div class="ep-body">
+      <p>Create a new version (commit) pointing to an existing root tree hash. Optionally updates a branch ref to point to the new version.</p>
+      <div class="code-label">Request Body</div>
+      <table class="param-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>root</code></td><td>string <span class="required">required</span></td><td>BLAKE3 hex of the root tree hash</td></tr>
+          <tr><td><code>parents</code></td><td>string[] <span class="required">required</span></td><td>Parent version IDs (empty array for initial commit)</td></tr>
+          <tr><td><code>message</code></td><td>string <span class="required">required</span></td><td>Commit message</td></tr>
+          <tr><td><code>branch</code></td><td>string <span class="optional">optional</span></td><td>Branch to auto-update (e.g. <code>"main"</code>)</td></tr>
+          <tr><td><code>metadata</code></td><td>object <span class="optional">optional</span></td><td>Key-value metadata pairs</td></tr>
+        </tbody>
+      </table>
+      <div class="tab-bar">
+        <button class="tab-btn active" onclick="switchTab(this, 'pv-req')">Request</button>
+        <button class="tab-btn" onclick="switchTab(this, 'pv-res')">Response</button>
+      </div>
+      <div class="tab-panel active" id="pv-req">
+        <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"root"</span>: <span class="json-str">"abc123def456..."</span>,
+  <span class="json-key">"parents"</span>: [],
+  <span class="json-key">"message"</span>: <span class="json-str">"initial commit"</span>,
+  <span class="json-key">"branch"</span>: <span class="json-str">"main"</span>,
+  <span class="json-key">"metadata"</span>: { <span class="json-key">"author"</span>: <span class="json-str">"alice"</span> }
+}</pre></div>
+      </div>
+      <div class="tab-panel" id="pv-res">
+        <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"id"</span>: <span class="json-str">"f8a9b1c2..."</span>,
+  <span class="json-key">"root"</span>: <span class="json-str">"abc123def456..."</span>,
+  <span class="json-key">"parents"</span>: [],
+  <span class="json-key">"message"</span>: <span class="json-str">"initial commit"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-num">1713500000</span>,
+  <span class="json-key">"metadata"</span>: { <span class="json-key">"author"</span>: <span class="json-str">"alice"</span> }
+}</pre></div>
+      </div>
+      <div class="code-label">cURL Example</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>curl -X POST http://localhost:3000/api/v1/versions/ \
+  -H "Content-Type: application/json" \
+  -d '{"root":"abc123...","parents":[],"message":"init","branch":"main"}'</pre></div>
+    </div>
+  </div>
+
+  <div class="endpoint" id="get-version">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method get">GET</span>
+      <span class="ep-path">/api/v1/versions/<span class="param">{id}</span></span>
+      <span class="ep-desc">Get version details</span>
+    </div>
+    <div class="ep-body">
+      <p>Retrieve a version by its ID, branch name, or tag name. Returns full version metadata.</p>
+      <table class="param-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>id</code></td><td>string <span class="required">required</span></td><td>Version ID, branch, or tag name</td></tr>
+        </tbody>
+      </table>
+      <div class="code-label">Response &middot; 200 OK</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"id"</span>: <span class="json-str">"f8a9b1c2..."</span>,
+  <span class="json-key">"root"</span>: <span class="json-str">"abc123..."</span>,
+  <span class="json-key">"parents"</span>: [<span class="json-str">"e7d6c5b4..."</span>],
+  <span class="json-key">"message"</span>: <span class="json-str">"update readme"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-num">1713500100</span>,
+  <span class="json-key">"metadata"</span>: {}
+}</pre></div>
+    </div>
+  </div>
+
+  <div class="endpoint" id="get-history">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method get">GET</span>
+      <span class="ep-path">/api/v1/versions/<span class="param">{id}</span>/history</span>
+      <span class="ep-desc">Get version history</span>
+    </div>
+    <div class="ep-body">
+      <p>Walk the parent chain from the given version and return a paginated list of ancestor versions (newest first).</p>
+      <div class="code-label">Path Parameters</div>
+      <table class="param-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>id</code></td><td>string <span class="required">required</span></td><td>Version ID, branch, or tag name</td></tr>
+        </tbody>
+      </table>
+      <div class="code-label">Query Parameters</div>
+      <table class="param-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>limit</code></td><td>integer <span class="optional">optional</span></td><td>50</td><td>Maximum versions per page</td></tr>
+          <tr><td><code>offset</code></td><td>integer <span class="optional">optional</span></td><td>0</td><td>Number of versions to skip</td></tr>
+        </tbody>
+      </table>
+      <div class="code-label">Response &middot; 200 OK</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"versions"</span>: [
+    { <span class="json-key">"id"</span>: <span class="json-str">"f8a9..."</span>, <span class="json-key">"message"</span>: <span class="json-str">"..."</span>, <span class="json-comment">/* ... */</span> }
+  ],
+  <span class="json-key">"offset"</span>: <span class="json-num">0</span>,
+  <span class="json-key">"limit"</span>: <span class="json-num">50</span>,
+  <span class="json-key">"has_more"</span>: <span class="json-bool">false</span>
+}</pre></div>
+      <div class="code-label">cURL Example</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>curl "http://localhost:3000/api/v1/versions/main/history?limit=10&amp;offset=0"</pre></div>
+    </div>
+  </div>
+
+  <div class="endpoint" id="get-path">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method get">GET</span>
+      <span class="ep-path">/api/v1/versions/<span class="param">{id}</span>/path/<span class="param">{*path}</span></span>
+      <span class="ep-desc">Node metadata by path</span>
+    </div>
+    <div class="ep-body">
+      <p>Look up a file or directory node within a version's tree by its path. Returns node metadata including hash, size, and children (for directories).</p>
+      <table class="param-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>id</code></td><td>string <span class="required">required</span></td><td>Version ID, branch, or tag</td></tr>
+          <tr><td><code>*path</code></td><td>string <span class="required">required</span></td><td>File or directory path (e.g. <code>src/main.rs</code>)</td></tr>
+        </tbody>
+      </table>
+      <div class="code-label">Response &middot; 200 OK</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"version_id"</span>: <span class="json-str">"f8a9..."</span>,
+  <span class="json-key">"path"</span>: <span class="json-str">"src/main.rs"</span>,
+  <span class="json-key">"hash"</span>: <span class="json-str">"def456..."</span>,
+  <span class="json-key">"is_directory"</span>: <span class="json-bool">false</span>,
+  <span class="json-key">"size"</span>: <span class="json-num">2048</span>,
+  <span class="json-key">"children"</span>: <span class="json-null">null</span>
+}</pre></div>
+    </div>
+  </div>
+
+  <!-- ==================== REFS ==================== -->
+  <h2 class="section-title">Refs (Branches &amp; Tags)</h2>
+
+  <div class="endpoint" id="list-refs">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method get">GET</span>
+      <span class="ep-path">/api/v1/refs/</span>
+      <span class="ep-desc">List all refs</span>
+    </div>
+    <div class="ep-body">
+      <p>List all branches and tags. Optionally filter by kind.</p>
+      <div class="code-label">Query Parameters</div>
+      <table class="param-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>kind</code></td><td>string <span class="optional">optional</span></td><td>Filter by <code>"branch"</code> or <code>"tag"</code>. Omit for all.</td></tr>
+        </tbody>
+      </table>
+      <div class="code-label">Response &middot; 200 OK</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"refs"</span>: [
+    { <span class="json-key">"name"</span>: <span class="json-str">"main"</span>, <span class="json-key">"kind"</span>: <span class="json-str">"branch"</span>, <span class="json-key">"target"</span>: <span class="json-str">"f8a9..."</span> },
+    { <span class="json-key">"name"</span>: <span class="json-str">"v1.0"</span>, <span class="json-key">"kind"</span>: <span class="json-str">"tag"</span>,    <span class="json-key">"target"</span>: <span class="json-str">"e7d6..."</span> }
+  ]
+}</pre></div>
+      <div class="code-label">cURL Example</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>curl "http://localhost:3000/api/v1/refs/?kind=branch"</pre></div>
+    </div>
+  </div>
+
+  <div class="endpoint" id="create-ref">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method post">POST</span>
+      <span class="ep-path">/api/v1/refs/</span>
+      <span class="ep-desc">Create a ref</span>
+    </div>
+    <div class="ep-body">
+      <p>Create a new branch or tag pointing to an existing version.</p>
+      <div class="code-label">Request Body</div>
+      <table class="param-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>name</code></td><td>string <span class="required">required</span></td><td>Ref name (e.g. <code>"main"</code>, <code>"v1.0"</code>)</td></tr>
+          <tr><td><code>kind</code></td><td>string <span class="required">required</span></td><td><code>"branch"</code> or <code>"tag"</code></td></tr>
+          <tr><td><code>target</code></td><td>string <span class="required">required</span></td><td>Target version ID</td></tr>
+        </tbody>
+      </table>
+      <div class="tab-bar">
+        <button class="tab-btn active" onclick="switchTab(this, 'cr-req')">Request</button>
+        <button class="tab-btn" onclick="switchTab(this, 'cr-res')">Response</button>
+      </div>
+      <div class="tab-panel active" id="cr-req">
+        <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"name"</span>: <span class="json-str">"main"</span>,
+  <span class="json-key">"kind"</span>: <span class="json-str">"branch"</span>,
+  <span class="json-key">"target"</span>: <span class="json-str">"f8a9b1c2..."</span>
+}</pre></div>
+      </div>
+      <div class="tab-panel" id="cr-res">
+        <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"name"</span>: <span class="json-str">"main"</span>,
+  <span class="json-key">"kind"</span>: <span class="json-str">"branch"</span>,
+  <span class="json-key">"target"</span>: <span class="json-str">"f8a9b1c2..."</span>
+}</pre></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint" id="get-ref">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method get">GET</span>
+      <span class="ep-path">/api/v1/refs/<span class="param">{name}</span></span>
+      <span class="ep-desc">Get ref by name</span>
+    </div>
+    <div class="ep-body">
+      <p>Retrieve a specific branch or tag by name.</p>
+      <table class="param-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>name</code></td><td>string <span class="required">required</span></td><td>Ref name</td></tr>
+        </tbody>
+      </table>
+      <div class="code-label">Response &middot; 200 OK</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{ <span class="json-key">"name"</span>: <span class="json-str">"main"</span>, <span class="json-key">"kind"</span>: <span class="json-str">"branch"</span>, <span class="json-key">"target"</span>: <span class="json-str">"f8a9..."</span> }</pre></div>
+    </div>
+  </div>
+
+  <div class="endpoint" id="update-ref">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method put">PUT</span>
+      <span class="ep-path">/api/v1/refs/<span class="param">{name}</span></span>
+      <span class="ep-desc">Update a branch</span>
+    </div>
+    <div class="ep-body">
+      <p>Update a branch to point to a new version. Only branches can be updated &#8212; tags are immutable.</p>
+      <div class="warn"><strong>Note:</strong> This only works for branches. Attempting to update a tag will return an error.</div>
+      <table class="param-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>target</code></td><td>string <span class="required">required</span></td><td>New target version ID</td></tr>
+        </tbody>
+      </table>
+      <div class="code-label">cURL Example</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>curl -X PUT http://localhost:3000/api/v1/refs/main \
+  -H "Content-Type: application/json" \
+  -d '{"target":"new_version_id..."}'</pre></div>
+    </div>
+  </div>
+
+  <div class="endpoint" id="delete-ref">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method delete">DELETE</span>
+      <span class="ep-path">/api/v1/refs/<span class="param">{name}</span></span>
+      <span class="ep-desc">Delete a branch</span>
+    </div>
+    <div class="ep-body">
+      <p>Delete a branch. Only branches can be deleted &#8212; tags are immutable.</p>
+      <div class="warn"><strong>Note:</strong> This only works for branches. The underlying versions are not deleted.</div>
+      <div class="code-label">Response &middot; 200 OK</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"deleted"</span>: <span class="json-str">"feature-branch"</span>
+}</pre></div>
+      <div class="code-label">cURL Example</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>curl -X DELETE http://localhost:3000/api/v1/refs/feature-branch</pre></div>
+    </div>
+  </div>
+
+  <div class="endpoint" id="resolve-ref">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method get">GET</span>
+      <span class="ep-path">/api/v1/refs/<span class="param">{name}</span>/resolve</span>
+      <span class="ep-desc">Resolve ref to version</span>
+    </div>
+    <div class="ep-body">
+      <p>Resolve a ref (branch or tag) to its target version and return the full version details.</p>
+      <div class="code-label">Response &middot; 200 OK</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre><span class="json-comment">// Returns a full VersionResponse</span>
+{
+  <span class="json-key">"id"</span>: <span class="json-str">"f8a9..."</span>,
+  <span class="json-key">"root"</span>: <span class="json-str">"abc123..."</span>,
+  <span class="json-key">"parents"</span>: [],
+  <span class="json-key">"message"</span>: <span class="json-str">"initial commit"</span>,
+  <span class="json-key">"timestamp"</span>: <span class="json-num">1713500000</span>,
+  <span class="json-key">"metadata"</span>: {}
+}</pre></div>
+    </div>
+  </div>
+
+  <!-- ==================== DIFF ==================== -->
+  <h2 class="section-title">Diff</h2>
+
+  <div class="endpoint" id="post-diff">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method post">POST</span>
+      <span class="ep-path">/api/v1/diff/</span>
+      <span class="ep-desc">Compute diff between versions</span>
+    </div>
+    <div class="ep-body">
+      <p>Compare two versions and produce a list of file-level changes (added, removed, modified) along with chunk-level deduplication statistics.</p>
+      <div class="code-label">Request Body</div>
+      <table class="param-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>old_version</code></td><td>string <span class="required">required</span></td><td>Old version ID, branch, or tag</td></tr>
+          <tr><td><code>new_version</code></td><td>string <span class="required">required</span></td><td>New version ID, branch, or tag</td></tr>
+        </tbody>
+      </table>
+      <div class="tab-bar">
+        <button class="tab-btn active" onclick="switchTab(this, 'df-req')">Request</button>
+        <button class="tab-btn" onclick="switchTab(this, 'df-res')">Response</button>
+      </div>
+      <div class="tab-panel active" id="df-req">
+        <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"old_version"</span>: <span class="json-str">"main~1"</span>,
+  <span class="json-key">"new_version"</span>: <span class="json-str">"main"</span>
+}</pre></div>
+      </div>
+      <div class="tab-panel" id="df-res">
+        <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"entries"</span>: [
+    {
+      <span class="json-key">"path"</span>: <span class="json-str">"src/lib.rs"</span>,
+      <span class="json-key">"kind"</span>: <span class="json-str">"modified"</span>,
+      <span class="json-key">"old_hash"</span>: <span class="json-str">"aaa..."</span>,
+      <span class="json-key">"new_hash"</span>: <span class="json-str">"bbb..."</span>
+    },
+    {
+      <span class="json-key">"path"</span>: <span class="json-str">"README.md"</span>,
+      <span class="json-key">"kind"</span>: <span class="json-str">"added"</span>,
+      <span class="json-key">"old_hash"</span>: <span class="json-null">null</span>,
+      <span class="json-key">"new_hash"</span>: <span class="json-str">"ccc..."</span>
+    }
+  ],
+  <span class="json-key">"added_files"</span>: <span class="json-num">1</span>,
+  <span class="json-key">"removed_files"</span>: <span class="json-num">0</span>,
+  <span class="json-key">"modified_files"</span>: <span class="json-num">1</span>,
+  <span class="json-key">"added_chunks"</span>: <span class="json-num">5</span>,
+  <span class="json-key">"removed_chunks"</span>: <span class="json-num">3</span>,
+  <span class="json-key">"unchanged_chunks"</span>: <span class="json-num">10</span>
+}</pre></div>
+      </div>
+      <div class="code-label">cURL Example</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>curl -X POST http://localhost:3000/api/v1/diff/ \
+  -H "Content-Type: application/json" \
+  -d '{"old_version":"main~1","new_version":"main"}'</pre></div>
+    </div>
+  </div>
+
+  <!-- ==================== UPLOAD ==================== -->
+  <h2 class="section-title">Upload</h2>
+
+  <div class="endpoint" id="upload-file">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method post">POST</span>
+      <span class="ep-path">/api/v1/upload/file</span>
+      <span class="ep-desc">Upload a single file</span>
+    </div>
+    <div class="ep-body">
+      <p>Upload a single file as raw bytes. The server chunks the file, deduplicates against existing content, builds a tree, creates a version, and optionally advances the branch.</p>
+      <div class="note"><strong>Content-Type:</strong> Send the raw file bytes as the request body (<code>application/octet-stream</code>). File path and options are passed as query parameters.</div>
+      <div class="code-label">Query Parameters</div>
+      <table class="param-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>path</code></td><td>string <span class="required">required</span></td><td>&#8212;</td><td>Relative file path (e.g. <code>src/main.rs</code>)</td></tr>
+          <tr><td><code>branch</code></td><td>string <span class="optional">optional</span></td><td><code>main</code></td><td>Branch to commit to</td></tr>
+          <tr><td><code>message</code></td><td>string <span class="optional">optional</span></td><td><code>upload {path}</code></td><td>Commit message</td></tr>
+          <tr><td><code>parents</code></td><td>string <span class="optional">optional</span></td><td>auto (HEAD)</td><td>Comma-separated parent version IDs</td></tr>
+        </tbody>
+      </table>
+      <div class="code-label">Response &middot; 200 OK</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"version_id"</span>: <span class="json-str">"abc123..."</span>,
+  <span class="json-key">"root"</span>: <span class="json-str">"def456..."</span>,
+  <span class="json-key">"branch"</span>: <span class="json-str">"main"</span>,
+  <span class="json-key">"stats"</span>: {
+    <span class="json-key">"total_files"</span>: <span class="json-num">1</span>,
+    <span class="json-key">"total_bytes"</span>: <span class="json-num">4096</span>,
+    <span class="json-key">"total_chunks"</span>: <span class="json-num">3</span>,
+    <span class="json-key">"new_chunks"</span>: <span class="json-num">2</span>,
+    <span class="json-key">"dedup_chunks"</span>: <span class="json-num">1</span>,
+    <span class="json-key">"dedup_bytes"</span>: <span class="json-num">1024</span>
+  }
+}</pre></div>
+      <div class="code-label">cURL Example</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>curl -X POST "http://localhost:3000/api/v1/upload/file?path=docs/readme.md&amp;branch=main" \
+  --data-binary @readme.md</pre></div>
+    </div>
+  </div>
+
+  <div class="endpoint" id="upload-dir">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method post">POST</span>
+      <span class="ep-path">/api/v1/upload/directory</span>
+      <span class="ep-desc">Upload multiple files</span>
+    </div>
+    <div class="ep-body">
+      <p>Upload multiple files in a single request as base64-encoded content. Creates one version (commit) containing all files.</p>
+      <div class="code-label">Request Body</div>
+      <table class="param-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>files</code></td><td>array <span class="required">required</span></td><td>Non-empty array of file entries</td></tr>
+          <tr><td><code>files[].path</code></td><td>string <span class="required">required</span></td><td>Relative file path</td></tr>
+          <tr><td><code>files[].content_base64</code></td><td>string <span class="required">required</span></td><td>File content, base64-encoded</td></tr>
+          <tr><td><code>branch</code></td><td>string <span class="optional">optional</span></td><td>Branch to commit to (default: <code>main</code>)</td></tr>
+          <tr><td><code>message</code></td><td>string <span class="optional">optional</span></td><td>Commit message (auto-generated if omitted)</td></tr>
+          <tr><td><code>parents</code></td><td>string[] <span class="optional">optional</span></td><td>Parent version IDs (auto-resolves HEAD)</td></tr>
+        </tbody>
+      </table>
+      <div class="tab-bar">
+        <button class="tab-btn active" onclick="switchTab(this, 'ud-req')">Request</button>
+        <button class="tab-btn" onclick="switchTab(this, 'ud-res')">Response</button>
+      </div>
+      <div class="tab-panel active" id="ud-req">
+        <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"files"</span>: [
+    {
+      <span class="json-key">"path"</span>: <span class="json-str">"src/main.rs"</span>,
+      <span class="json-key">"content_base64"</span>: <span class="json-str">"Zm4gbWFpbigpIHt9"</span>
+    },
+    {
+      <span class="json-key">"path"</span>: <span class="json-str">"Cargo.toml"</span>,
+      <span class="json-key">"content_base64"</span>: <span class="json-str">"W3BhY2thZ2Vd..."</span>
+    }
+  ],
+  <span class="json-key">"branch"</span>: <span class="json-str">"main"</span>,
+  <span class="json-key">"message"</span>: <span class="json-str">"upload project files"</span>
+}</pre></div>
+      </div>
+      <div class="tab-panel" id="ud-res">
+        <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"version_id"</span>: <span class="json-str">"abc123..."</span>,
+  <span class="json-key">"root"</span>: <span class="json-str">"def456..."</span>,
+  <span class="json-key">"branch"</span>: <span class="json-str">"main"</span>,
+  <span class="json-key">"stats"</span>: {
+    <span class="json-key">"total_files"</span>: <span class="json-num">2</span>,
+    <span class="json-key">"total_bytes"</span>: <span class="json-num">8192</span>,
+    <span class="json-key">"total_chunks"</span>: <span class="json-num">5</span>,
+    <span class="json-key">"new_chunks"</span>: <span class="json-num">4</span>,
+    <span class="json-key">"dedup_chunks"</span>: <span class="json-num">1</span>,
+    <span class="json-key">"dedup_bytes"</span>: <span class="json-num">2048</span>
+  }
+}</pre></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== DOWNLOAD ==================== -->
+  <h2 class="section-title">Download &amp; Browse</h2>
+
+  <div class="endpoint" id="download-file">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method get">GET</span>
+      <span class="ep-path">/api/v1/version/<span class="param">{ref}</span>/file/<span class="param">{*path}</span></span>
+      <span class="ep-desc">Download a file</span>
+    </div>
+    <div class="ep-body">
+      <p>Download a file's content as a binary stream. Reassembles chunks on-the-fly and streams the result.</p>
+      <div class="note"><strong>Response:</strong> Binary stream with <code>Content-Type: application/octet-stream</code>, <code>Content-Disposition: attachment</code>, and <code>Content-Length</code> header.</div>
+      <table class="param-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>ref</code></td><td>string <span class="required">required</span></td><td>Version ID, branch, or tag</td></tr>
+          <tr><td><code>*path</code></td><td>string <span class="required">required</span></td><td>File path within the version tree</td></tr>
+        </tbody>
+      </table>
+      <div class="code-label">cURL Example</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>curl -o output.rs http://localhost:3000/api/v1/version/main/file/src/main.rs</pre></div>
+    </div>
+  </div>
+
+  <div class="endpoint" id="ls-root">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method get">GET</span>
+      <span class="ep-path">/api/v1/version/<span class="param">{ref}</span>/ls</span>
+      <span class="ep-desc">List root directory</span>
+    </div>
+    <div class="ep-body">
+      <p>List files and directories at the root of a version's tree.</p>
+      <table class="param-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>ref</code></td><td>string <span class="required">required</span></td><td>Version ID, branch, or tag</td></tr>
+        </tbody>
+      </table>
+      <div class="code-label">Response &middot; 200 OK</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"version_id"</span>: <span class="json-str">"f8a9..."</span>,
+  <span class="json-key">"path"</span>: <span class="json-str">""</span>,
+  <span class="json-key">"entries"</span>: [
+    { <span class="json-key">"name"</span>: <span class="json-str">"src"</span>,       <span class="json-key">"is_directory"</span>: <span class="json-bool">true</span>,  <span class="json-key">"size"</span>: <span class="json-num">0</span>,    <span class="json-key">"hash"</span>: <span class="json-str">"aaa..."</span> },
+    { <span class="json-key">"name"</span>: <span class="json-str">"README.md"</span>, <span class="json-key">"is_directory"</span>: <span class="json-bool">false</span>, <span class="json-key">"size"</span>: <span class="json-num">1234</span>, <span class="json-key">"hash"</span>: <span class="json-str">"bbb..."</span> }
+  ]
+}</pre></div>
+      <div class="code-label">cURL Example</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>curl http://localhost:3000/api/v1/version/main/ls</pre></div>
+    </div>
+  </div>
+
+  <div class="endpoint" id="ls-path">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method get">GET</span>
+      <span class="ep-path">/api/v1/version/<span class="param">{ref}</span>/ls/<span class="param">{*path}</span></span>
+      <span class="ep-desc">List subdirectory</span>
+    </div>
+    <div class="ep-body">
+      <p>List files and directories at a specific path within a version's tree.</p>
+      <table class="param-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>ref</code></td><td>string <span class="required">required</span></td><td>Version ID, branch, or tag</td></tr>
+          <tr><td><code>*path</code></td><td>string <span class="required">required</span></td><td>Directory path to list</td></tr>
+        </tbody>
+      </table>
+      <div class="code-label">Response &middot; 200 OK</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>{
+  <span class="json-key">"version_id"</span>: <span class="json-str">"f8a9..."</span>,
+  <span class="json-key">"path"</span>: <span class="json-str">"src"</span>,
+  <span class="json-key">"entries"</span>: [
+    { <span class="json-key">"name"</span>: <span class="json-str">"main.rs"</span>, <span class="json-key">"is_directory"</span>: <span class="json-bool">false</span>, <span class="json-key">"size"</span>: <span class="json-num">2048</span>, <span class="json-key">"hash"</span>: <span class="json-str">"ccc..."</span> },
+    { <span class="json-key">"name"</span>: <span class="json-str">"lib.rs"</span>,  <span class="json-key">"is_directory"</span>: <span class="json-bool">false</span>, <span class="json-key">"size"</span>: <span class="json-num">512</span>,  <span class="json-key">"hash"</span>: <span class="json-str">"ddd..."</span> }
+  ]
+}</pre></div>
+      <div class="code-label">cURL Example</div>
+      <div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre>curl http://localhost:3000/api/v1/version/main/ls/src</pre></div>
+    </div>
+  </div>
+
+  <footer style="margin-top:3rem;color:#475569;font-size:.8rem;text-align:center;">
+    Axiom Core &middot; 18 endpoints &middot; <a href="#overview" style="color:var(--accent);text-decoration:none;">Back to top &#8593;</a>
+  </footer>
+
+</div>
+
+<script>
+  function toggle(header) {
+    header.parentElement.classList.toggle('open');
+  }
+
+  function switchTab(btn, panelId) {
+    var bar = btn.parentElement;
+    bar.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+    btn.classList.add('active');
+    var next = bar.nextElementSibling;
+    while (next && next.classList.contains('tab-panel')) {
+      next.classList.toggle('active', next.id === panelId);
+      next = next.nextElementSibling;
+    }
+  }
+
+  function copyCode(btn) {
+    var pre = btn.parentElement.querySelector('pre');
+    navigator.clipboard.writeText(pre.textContent).then(function() {
+      btn.textContent = 'Copied!';
+      setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
+    });
+  }
+
+  var observer = new IntersectionObserver(function(entries) {
+    entries.forEach(function(e) {
+      if (e.isIntersecting) {
+        document.querySelectorAll('.sidebar a').forEach(function(a) { a.classList.remove('active'); });
+        var link = document.querySelector('.sidebar a[href="#' + e.target.id + '"]');
+        if (link) link.classList.add('active');
+      }
+    });
+  }, { rootMargin: '0px 0px -85% 0px' });
+
+  document.querySelectorAll('.endpoint, [id="overview"], [id="conventions"]').forEach(function(el) { observer.observe(el); });
+</script>
+
+</body>
+</html>

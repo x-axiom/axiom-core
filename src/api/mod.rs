@@ -9,6 +9,8 @@ pub mod dto;
 pub mod routes;
 
 use axum::Router;
+use axum::response::Html;
+use axum::routing::get;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -29,7 +31,12 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/v1/diff", routes::diff::router())
         .nest("/api/v1/upload", routes::upload::router())
         .nest("/api/v1", routes::download::router())
+        .route("/api", get(api_index))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn api_index() -> Html<&'static str> {
+    Html(include_str!("api_index.html"))
 }
