@@ -13,8 +13,7 @@ use super::traits::{PathEntry, PathIndexRepo, RefRepo, VersionRepo};
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding new migrations.
-#[allow(dead_code)]
-const CURRENT_SCHEMA_VERSION: u32 = 1;
+const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Apply all pending migrations up to `CURRENT_SCHEMA_VERSION`.
 fn run_migrations(conn: &Connection) -> CasResult<()> {
@@ -33,11 +32,51 @@ fn run_migrations(conn: &Connection) -> CasResult<()> {
         )
         .map_err(|e| CasError::Store(e.to_string()))?;
 
-    if current < 1 {
-        migrate_v1(conn)?;
+    if current < CURRENT_SCHEMA_VERSION {
+        // Run all pending migrations inside a single transaction so a
+        // failure at any step rolls back the entire batch.
+        conn.execute_batch("BEGIN;")
+            .map_err(|e| CasError::Store(e.to_string()))?;
+
+        let result = (|| {
+            if current < 1 {
+                migrate_v1(conn)?;
+            }
+            if current < 2 {
+                migrate_v2(conn)?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT;")
+                    .map_err(|e| CasError::Store(e.to_string()))?;
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
     }
 
+    assert_eq!(
+        get_schema_version(conn)?,
+        CURRENT_SCHEMA_VERSION,
+        "schema_version mismatch after migrations",
+    );
+
     Ok(())
+}
+
+/// Read the current schema version from the database.
+fn get_schema_version(conn: &Connection) -> CasResult<u32> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|e| CasError::Store(e.to_string()))
 }
 
 /// Migration v1: initial schema.
@@ -111,6 +150,71 @@ fn migrate_v1(conn: &Connection) -> CasResult<()> {
         CREATE INDEX idx_refs_target ON refs(target);
 
         INSERT INTO schema_version (version) VALUES (1);
+        ",
+    )
+    .map_err(|e| CasError::Store(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Migration v2: SaaS multi-tenant tables.
+///
+/// Adds `workspaces`, `remotes`, `remote_refs`, and `sync_sessions` tables.
+/// Creates a "default" workspace for existing data.
+fn migrate_v2(conn: &Connection) -> CasResult<()> {
+    conn.execute_batch(
+        "
+        -- Workspace isolation
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            metadata    TEXT NOT NULL DEFAULT '{}'
+        );
+
+        -- Remote server endpoints for sync
+        CREATE TABLE IF NOT EXISTS remotes (
+            name        TEXT PRIMARY KEY,
+            url         TEXT NOT NULL,
+            auth_token  TEXT NOT NULL DEFAULT '',
+            created_at  INTEGER NOT NULL
+        );
+
+        -- Refs on remote servers (last-known state)
+        CREATE TABLE IF NOT EXISTS remote_refs (
+            remote_name TEXT NOT NULL,
+            ref_name    TEXT NOT NULL,
+            kind        TEXT NOT NULL CHECK (kind IN ('branch', 'tag')),
+            target      TEXT NOT NULL,
+            updated_at  INTEGER NOT NULL,
+            PRIMARY KEY (remote_name, ref_name),
+            FOREIGN KEY (remote_name) REFERENCES remotes(name)
+        );
+
+        -- Sync session log
+        CREATE TABLE IF NOT EXISTS sync_sessions (
+            id          TEXT PRIMARY KEY,
+            remote_name TEXT NOT NULL,
+            direction   TEXT NOT NULL CHECK (direction IN ('push', 'pull')),
+            status      TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+            started_at  INTEGER NOT NULL,
+            finished_at INTEGER,
+            objects_transferred INTEGER NOT NULL DEFAULT 0,
+            bytes_transferred   INTEGER NOT NULL DEFAULT 0,
+            error_message       TEXT,
+            FOREIGN KEY (remote_name) REFERENCES remotes(name)
+        );
+
+        -- Create default workspace for existing data
+        INSERT OR IGNORE INTO workspaces (id, name, created_at, metadata)
+        VALUES ('default', 'default', strftime('%s', 'now'), '{}');
+
+        -- Indexes
+        CREATE INDEX IF NOT EXISTS idx_remote_refs_remote ON remote_refs(remote_name);
+        CREATE INDEX IF NOT EXISTS idx_sync_sessions_remote ON sync_sessions(remote_name);
+
+        -- Advance schema version
+        UPDATE schema_version SET version = 2;
         ",
     )
     .map_err(|e| CasError::Store(e.to_string()))?;
