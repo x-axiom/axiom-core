@@ -18,7 +18,6 @@ use crate::api::state::AppState;
 use crate::error::CasError;
 use crate::merkle::rehydrate;
 use crate::model::node::NodeKind;
-use crate::store::traits::{ChunkStore, NodeStore, PathIndexRepo};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -35,12 +34,12 @@ async fn download_file(
     State(state): State<AppState>,
     Path((ref_str, file_path)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let v = super::helpers::resolve_version_node(&ref_str, state.meta.as_ref())?;
+    let v = super::helpers::resolve_version_node(&ref_str, state.versions.as_ref(), state.refs.as_ref())?;
     let version_id = v.id;
 
     // Look up path in the path index.
     let entry = state
-        .meta
+        .path_index
         .get_by_path(&version_id, &file_path)
         .map_err(ApiError::from)?
         .ok_or_else(|| {
@@ -59,7 +58,7 @@ async fn download_file(
 
     // Get the node to find the Merkle tree root.
     let node = state
-        .cas
+        .nodes
         .get_node(&entry.node_hash)
         .map_err(ApiError::from)?
         .ok_or_else(|| {
@@ -80,12 +79,12 @@ async fn download_file(
 
     // Rehydrate the Merkle tree to get ordered chunk hashes.
     let chunk_hashes =
-        rehydrate(&merkle_root, state.cas.as_ref()).map_err(ApiError::from)?;
+        rehydrate(&merkle_root, state.trees.as_ref()).map_err(ApiError::from)?;
 
     // Build a streaming response by reading chunks in order.
-    let cas = state.cas.clone();
+    let chunks = state.chunks.clone();
     let chunk_stream = stream::iter(chunk_hashes.into_iter().map(move |hash| {
-        cas.get_chunk(&hash)
+        chunks.get_chunk(&hash)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             .and_then(|opt| {
                 opt.ok_or_else(|| {
@@ -144,14 +143,14 @@ async fn list_dir_impl(
     dir_path: &str,
 ) -> ApiResult<Json<DirListingResponse>> {
     let (version_id, _root) = {
-        let v = super::helpers::resolve_version_node(ref_str, state.meta.as_ref())?;
+        let v = super::helpers::resolve_version_node(ref_str, state.versions.as_ref(), state.refs.as_ref())?;
         (v.id, v.root)
     };
 
     // Verify the path is actually a directory (or root "").
     if !dir_path.is_empty() {
         let entry = state
-            .meta
+            .path_index
             .get_by_path(&version_id, dir_path)
             .map_err(ApiError::from)?
             .ok_or_else(|| {
@@ -171,7 +170,7 @@ async fn list_dir_impl(
 
     // List children from path index.
     let children = state
-        .meta
+        .path_index
         .list_directory(&version_id, dir_path)
         .map_err(ApiError::from)?;
 
@@ -191,7 +190,7 @@ async fn list_dir_impl(
             } else {
                 // Try to get file size from node.
                 state
-                    .cas
+                    .nodes
                     .get_node(&pe.node_hash)
                     .ok()
                     .flatten()

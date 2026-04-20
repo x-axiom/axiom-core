@@ -14,7 +14,6 @@ use crate::api::state::AppState;
 use crate::commit::{CommitRequest, CommitService};
 use crate::model::node::NodeKind;
 use crate::model::VersionId;
-use crate::store::traits::{NodeStore, PathIndexRepo, VersionRepo};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -31,7 +30,7 @@ async fn create_version(
     let root = super::objects::parse_hash(&req.root)?;
     let parents: Vec<VersionId> = req.parents.into_iter().map(VersionId::from).collect();
 
-    let svc = CommitService::new(state.meta.clone(), state.meta.clone());
+    let svc = CommitService::new(state.versions.clone(), state.refs.clone());
     let version = svc
         .commit(CommitRequest {
             root,
@@ -49,7 +48,7 @@ async fn get_version(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<VersionResponse>> {
-    let v = super::helpers::resolve_version_node(&id, state.meta.as_ref())?;
+    let v = super::helpers::resolve_version_node(&id, state.versions.as_ref(), state.refs.as_ref())?;
     Ok(Json(version_to_dto(&v)))
 }
 
@@ -71,12 +70,12 @@ async fn get_history(
     Query(query): Query<HistoryQuery>,
 ) -> ApiResult<Json<PaginatedVersionListResponse>> {
     // Resolve id/branch/tag to a starting version.
-    let start = super::helpers::resolve_version_node(&id, state.meta.as_ref())?;
+    let start = super::helpers::resolve_version_node(&id, state.versions.as_ref(), state.refs.as_ref())?;
 
     // Fetch one more than limit+offset to determine has_more.
     let total_needed = query.offset + query.limit + 1;
     let all = state
-        .meta
+        .versions
         .list_history(&start.id, total_needed)
         .map_err(ApiError::from)?;
 
@@ -103,10 +102,10 @@ async fn get_node_metadata(
     State(state): State<AppState>,
     Path((id, file_path)): Path<(String, String)>,
 ) -> ApiResult<Json<NodeMetadataResponse>> {
-    let v = super::helpers::resolve_version_node(&id, state.meta.as_ref())?;
+    let v = super::helpers::resolve_version_node(&id, state.versions.as_ref(), state.refs.as_ref())?;
 
     let entry = state
-        .meta
+        .path_index
         .get_by_path(&v.id, &file_path)
         .map_err(ApiError::from)?
         .ok_or_else(|| {
@@ -118,7 +117,7 @@ async fn get_node_metadata(
 
     // Enrich with node data from CAS.
     let node = state
-        .cas
+        .nodes
         .get_node(&entry.node_hash)
         .map_err(ApiError::from)?;
 

@@ -39,7 +39,7 @@ pub struct FileInput {
 ///
 /// Returns an error if the file list is empty, a path is invalid, or
 /// persistence fails.
-pub fn build_directory_tree<N: NodeStore, P: PathIndexRepo>(
+pub fn build_directory_tree<N: NodeStore + ?Sized, P: PathIndexRepo + ?Sized>(
     files: &[FileInput],
     version_id: &VersionId,
     node_store: &N,
@@ -130,7 +130,7 @@ fn insert_path(
 }
 
 /// Recursively materialise a directory node from its build-tree children.
-fn materialise_dir<N: NodeStore, P: PathIndexRepo>(
+fn materialise_dir<N: NodeStore + ?Sized, P: PathIndexRepo + ?Sized>(
     children: &BTreeMap<String, DirBuildNode>,
     prefix: &str,
     version_id: &VersionId,

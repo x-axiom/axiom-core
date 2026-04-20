@@ -11,17 +11,18 @@ use crate::store::traits::{RefRepo, VersionRepo};
 /// Tries in order: exact version id → branch/tag ref.
 pub fn resolve_version_node(
     ref_str: &str,
-    meta: &(impl VersionRepo + RefRepo),
+    versions: &dyn VersionRepo,
+    refs: &dyn RefRepo,
 ) -> Result<VersionNode, ApiError> {
     // 1. Try as literal version id.
     let vid = VersionId::from(ref_str);
-    if let Some(v) = meta.get_version(&vid).map_err(ApiError::from)? {
+    if let Some(v) = versions.get_version(&vid).map_err(ApiError::from)? {
         return Ok(v);
     }
 
     // 2. Try as ref (branch or tag).
-    if let Some(r) = meta.get_ref(ref_str).map_err(ApiError::from)? {
-        let v = meta
+    if let Some(r) = refs.get_ref(ref_str).map_err(ApiError::from)? {
+        let v = versions
             .get_version(&r.target)
             .map_err(ApiError::from)?
             .ok_or_else(|| {

@@ -19,16 +19,15 @@ async fn compute_diff(
 ) -> ApiResult<Json<DiffResponse>> {
     // Resolve old and new — accept version ids, branches, or tags.
     let old_version =
-        super::helpers::resolve_version_node(&req.old_version, state.meta.as_ref())?;
+        super::helpers::resolve_version_node(&req.old_version, state.versions.as_ref(), state.refs.as_ref())?;
     let new_version =
-        super::helpers::resolve_version_node(&req.new_version, state.meta.as_ref())?;
+        super::helpers::resolve_version_node(&req.new_version, state.versions.as_ref(), state.refs.as_ref())?;
 
-    // The CAS store implements both NodeStore and TreeStore.
     let result = diff_versions(
         &old_version.root,
         &new_version.root,
-        &*state.cas,
-        &*state.cas,
+        &*state.nodes,
+        &*state.trees,
     )
     .map_err(ApiError::from)?;
 

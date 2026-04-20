@@ -10,7 +10,6 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::api::state::AppState;
 use crate::commit::CommitService;
 use crate::model::{RefKind, VersionId};
-use crate::store::traits::RefRepo;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -34,7 +33,7 @@ async fn list_refs(
         _ => None,
     };
 
-    let refs = state.meta.list_refs(kind).map_err(ApiError::from)?;
+    let refs = state.refs.list_refs(kind).map_err(ApiError::from)?;
 
     Ok(Json(RefListResponse {
         refs: refs.iter().map(ref_to_dto).collect(),
@@ -45,7 +44,7 @@ async fn create_ref(
     State(state): State<AppState>,
     Json(req): Json<CreateRefRequest>,
 ) -> ApiResult<Json<RefResponse>> {
-    let svc = CommitService::new(state.meta.clone(), state.meta.clone());
+    let svc = CommitService::new(state.versions.clone(), state.refs.clone());
     let target = VersionId::from(req.target.as_str());
 
     let r = match req.kind.as_str() {
@@ -66,7 +65,7 @@ async fn get_ref(
     Path(name): Path<String>,
 ) -> ApiResult<Json<RefResponse>> {
     let r = state
-        .meta
+        .refs
         .get_ref(&name)
         .map_err(ApiError::from)?
         .ok_or_else(|| {
@@ -88,7 +87,7 @@ async fn update_ref(
     Path(name): Path<String>,
     Json(req): Json<UpdateRefRequest>,
 ) -> ApiResult<Json<RefResponse>> {
-    let svc = CommitService::new(state.meta.clone(), state.meta.clone());
+    let svc = CommitService::new(state.versions.clone(), state.refs.clone());
     let target = VersionId::from(req.target.as_str());
 
     let r = svc.update_branch(&name, &target).map_err(ApiError::from)?;
@@ -99,7 +98,7 @@ async fn delete_ref(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let svc = CommitService::new(state.meta.clone(), state.meta.clone());
+    let svc = CommitService::new(state.versions.clone(), state.refs.clone());
     svc.delete_branch(&name).map_err(ApiError::from)?;
     Ok(Json(serde_json::json!({ "deleted": name })))
 }
@@ -108,7 +107,7 @@ async fn resolve_ref(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<VersionResponse>> {
-    let svc = CommitService::new(state.meta.clone(), state.meta.clone());
+    let svc = CommitService::new(state.versions.clone(), state.refs.clone());
     let version = svc
         .resolve_ref(&name)
         .map_err(ApiError::from)?

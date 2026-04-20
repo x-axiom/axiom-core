@@ -21,7 +21,7 @@ async fn main() {
     let cas = RocksDbCasStore::open(cas_path).expect("failed to open RocksDB CAS");
     let meta = SqliteMetadataStore::open(meta_path).expect("failed to open SQLite metadata");
 
-    let state = AppState::new(cas, meta);
+    let state = AppState::local(cas, meta);
     let app = build_router(state);
 
     let bind = "0.0.0.0:3000";

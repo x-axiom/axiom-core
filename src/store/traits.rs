@@ -133,7 +133,7 @@ pub trait SyncStore: Send + Sync {
 // Arc blanket impls — allows sharing a single store across multiple services
 // ---------------------------------------------------------------------------
 
-impl<T: VersionRepo> VersionRepo for Arc<T> {
+impl<T: VersionRepo + ?Sized> VersionRepo for Arc<T> {
     fn put_version(&self, version: &VersionNode) -> CasResult<()> {
         (**self).put_version(version)
     }
@@ -145,7 +145,7 @@ impl<T: VersionRepo> VersionRepo for Arc<T> {
     }
 }
 
-impl<T: RefRepo> RefRepo for Arc<T> {
+impl<T: RefRepo + ?Sized> RefRepo for Arc<T> {
     fn put_ref(&self, r: &Ref) -> CasResult<()> {
         (**self).put_ref(r)
     }
