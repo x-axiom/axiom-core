@@ -1,3 +1,4 @@
+#![cfg(feature = "local")]
 //! Integration tests for version history, refs, diff query APIs (AXIOM-112).
 
 use std::net::SocketAddr;

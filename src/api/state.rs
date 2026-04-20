@@ -27,6 +27,7 @@ pub struct AppState {
 impl AppState {
     /// Build an `AppState` backed by RocksDB (CAS) + SQLite (metadata)
     /// for local single-user operation.
+    #[cfg(feature = "local")]
     pub fn local(
         cas: crate::store::RocksDbCasStore,
         meta: crate::store::SqliteMetadataStore,

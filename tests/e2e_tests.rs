@@ -1,3 +1,4 @@
+#![cfg(feature = "local")]
 //! End-to-end validation tests for the complete POC workflow (AXIOM-113).
 //!
 //! Each test exercises a realistic multi-step scenario that spans upload,

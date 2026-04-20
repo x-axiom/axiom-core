@@ -1,3 +1,4 @@
+#![cfg(feature = "local")]
 //! HTTP API smoke tests.
 //!
 //! These tests spin up an in-process axum server on a random port, then

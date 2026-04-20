@@ -1,3 +1,4 @@
+#![cfg(feature = "local")]
 //! Integration tests for streaming upload API (AXIOM-110).
 
 use std::net::SocketAddr;

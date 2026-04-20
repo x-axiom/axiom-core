@@ -1,3 +1,5 @@
+#![cfg(feature = "local")]
+
 #[cfg(test)]
 mod tests {
     use axiom_core::model::*;

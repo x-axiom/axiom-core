@@ -1,5 +1,7 @@
 use axiom_core::api::{build_router, state::AppState};
+#[cfg(feature = "local")]
 use axiom_core::store::sqlite::SqliteMetadataStore;
+#[cfg(feature = "local")]
 use axiom_core::store::RocksDbCasStore;
 use tracing_subscriber::EnvFilter;
 
@@ -13,15 +15,23 @@ async fn main() {
         .init();
 
     // Open storage backends.
-    let cas_path = ".axiom/cas";
-    let meta_path = ".axiom/meta.db";
+    #[cfg(feature = "local")]
+    let state = {
+        let cas_path = ".axiom/cas";
+        let meta_path = ".axiom/meta.db";
 
-    std::fs::create_dir_all(".axiom").expect("failed to create .axiom directory");
+        std::fs::create_dir_all(".axiom").expect("failed to create .axiom directory");
 
-    let cas = RocksDbCasStore::open(cas_path).expect("failed to open RocksDB CAS");
-    let meta = SqliteMetadataStore::open(meta_path).expect("failed to open SQLite metadata");
+        let cas = RocksDbCasStore::open(cas_path).expect("failed to open RocksDB CAS");
+        let meta = SqliteMetadataStore::open(meta_path).expect("failed to open SQLite metadata");
 
-    let state = AppState::local(cas, meta);
+        AppState::local(cas, meta)
+    };
+    #[cfg(not(feature = "local"))]
+    let state = {
+        panic!("cloud mode is not yet implemented; build with --features local")
+    };
+
     let app = build_router(state);
 
     let bind = "0.0.0.0:3000";

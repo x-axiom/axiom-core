@@ -1,3 +1,4 @@
+#![cfg(feature = "local")]
 //! Integration tests for streaming download and directory listing (AXIOM-111).
 
 use std::net::SocketAddr;

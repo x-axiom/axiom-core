@@ -1,3 +1,5 @@
+#![cfg(feature = "local")]
+
 use std::collections::HashMap;
 
 use axiom_core::model::{hash_bytes, Ref, RefKind, VersionId, VersionNode};

@@ -409,6 +409,7 @@ fn test_branch_history_nonexistent_fails() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "local")]
 fn test_commit_with_sqlite_backend() {
     use axiom_core::store::sqlite::SqliteMetadataStore;
 
