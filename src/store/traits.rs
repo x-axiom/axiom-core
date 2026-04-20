@@ -23,6 +23,24 @@ pub trait ChunkStore: Send + Sync {
     fn get_chunk(&self, hash: &ChunkHash) -> CasResult<Option<Vec<u8>>>;
     /// Check whether a chunk exists.
     fn has_chunk(&self, hash: &ChunkHash) -> CasResult<bool>;
+
+    /// Store multiple chunks and return their content hashes. Idempotent.
+    /// Default implementation calls `put_chunk` for each item.
+    fn put_chunks(&self, chunks: Vec<Vec<u8>>) -> CasResult<Vec<ChunkHash>> {
+        chunks.into_iter().map(|data| self.put_chunk(data)).collect()
+    }
+
+    /// Retrieve multiple chunks by hash.
+    /// Default implementation calls `get_chunk` for each hash.
+    fn get_chunks(&self, hashes: &[ChunkHash]) -> CasResult<Vec<Option<Vec<u8>>>> {
+        hashes.iter().map(|h| self.get_chunk(h)).collect()
+    }
+
+    /// Check whether multiple chunks exist.
+    /// Default implementation calls `has_chunk` for each hash.
+    fn has_chunks(&self, hashes: &[ChunkHash]) -> CasResult<Vec<bool>> {
+        hashes.iter().map(|h| self.has_chunk(h)).collect()
+    }
 }
 
 /// Storage for Merkle Tree nodes (file-level tree structure).

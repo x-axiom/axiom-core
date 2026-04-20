@@ -42,6 +42,51 @@ mod tests {
         assert!(store.get_chunk(&missing).unwrap().is_none());
     }
 
+    // ── ChunkStore batch methods ────────────────────────────
+
+    #[test]
+    fn chunk_store_put_chunks() {
+        let store = InMemoryChunkStore::new();
+        let chunks = vec![b"aaa".to_vec(), b"bbb".to_vec(), b"ccc".to_vec()];
+        let hashes = store.put_chunks(chunks.clone()).unwrap();
+        assert_eq!(hashes.len(), 3);
+        for (data, hash) in chunks.iter().zip(&hashes) {
+            let got = store.get_chunk(hash).unwrap().unwrap();
+            assert_eq!(&got, data);
+        }
+    }
+
+    #[test]
+    fn chunk_store_get_chunks() {
+        let store = InMemoryChunkStore::new();
+        let h1 = store.put_chunk(b"x".to_vec()).unwrap();
+        let h2 = store.put_chunk(b"y".to_vec()).unwrap();
+        let missing = hash_bytes(b"missing");
+
+        let results = store.get_chunks(&[h1, missing, h2]).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_deref(), Some(b"x".as_slice()));
+        assert!(results[1].is_none());
+        assert_eq!(results[2].as_deref(), Some(b"y".as_slice()));
+    }
+
+    #[test]
+    fn chunk_store_has_chunks() {
+        let store = InMemoryChunkStore::new();
+        let h1 = store.put_chunk(b"exists".to_vec()).unwrap();
+        let missing = hash_bytes(b"nope");
+
+        let results = store.has_chunks(&[h1, missing]).unwrap();
+        assert_eq!(results, vec![true, false]);
+    }
+
+    #[test]
+    fn chunk_store_put_chunks_empty() {
+        let store = InMemoryChunkStore::new();
+        let hashes = store.put_chunks(vec![]).unwrap();
+        assert!(hashes.is_empty());
+    }
+
     // ── TreeStore ───────────────────────────────────────────
 
     #[test]
