@@ -2,6 +2,7 @@ use crate::error::CasResult;
 use crate::model::{
     ChunkHash, NodeEntry, Ref, RefKind, TreeNode, VersionId, VersionNode,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Metadata about a path entry in a specific version.
@@ -106,6 +107,26 @@ pub trait PathIndexRepo: Send + Sync {
         version_id: &VersionId,
         dir_path: &str,
     ) -> CasResult<Vec<PathEntry>>;
+}
+
+/// Set of all objects reachable from a given set of version roots.
+/// Used by the sync protocol to determine what needs to be transferred.
+#[derive(Clone, Debug, Default)]
+pub struct ReachableObjects {
+    pub versions: HashSet<VersionId>,
+    pub tree_hashes: HashSet<ChunkHash>,
+    pub node_hashes: HashSet<ChunkHash>,
+    pub chunk_hashes: HashSet<ChunkHash>,
+}
+
+/// Store operations needed for the sync protocol.
+pub trait SyncStore: Send + Sync {
+    /// Walk the object graph starting from `roots`, collecting all reachable
+    /// version, tree, node, and chunk hashes.
+    fn collect_reachable_objects(&self, roots: &[VersionId]) -> CasResult<ReachableObjects>;
+
+    /// Return every version id known to this store.
+    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>>;
 }
 
 // ---------------------------------------------------------------------------

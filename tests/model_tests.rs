@@ -378,4 +378,119 @@ mod tests {
         assert_eq!(deserialized.size, 1048576);
         assert_eq!(deserialized.chunk_count, 4);
     }
+
+    // ── SyncStore ───────────────────────────────────────────
+
+    #[test]
+    fn sync_store_list_all_version_ids_empty() {
+        let versions = std::sync::Arc::new(InMemoryVersionRepo::new());
+        let trees = std::sync::Arc::new(InMemoryTreeStore::new());
+        let nodes = std::sync::Arc::new(InMemoryNodeStore::new());
+        let sync = InMemorySyncStore::new(versions, trees, nodes);
+
+        let ids = sync.list_all_version_ids().unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn sync_store_collect_reachable_simple() {
+        use axiom_core::store::SyncStore;
+
+        let versions = std::sync::Arc::new(InMemoryVersionRepo::new());
+        let trees = std::sync::Arc::new(InMemoryTreeStore::new());
+        let nodes = std::sync::Arc::new(InMemoryNodeStore::new());
+        let chunks = InMemoryChunkStore::new();
+
+        // Create a chunk
+        let chunk_hash = chunks.put_chunk(b"hello".to_vec()).unwrap();
+
+        // Create a tree leaf pointing to the chunk
+        let tree_leaf = TreeNode {
+            hash: hash_bytes(b"tree-leaf"),
+            kind: TreeNodeKind::Leaf { chunk: chunk_hash },
+        };
+        trees.put_tree_node(&tree_leaf).unwrap();
+
+        // Create a file node pointing to the tree root
+        let file_node = NodeEntry {
+            hash: hash_bytes(b"file-node"),
+            kind: NodeKind::File { root: tree_leaf.hash, size: 5 },
+        };
+        nodes.put_node(&file_node).unwrap();
+
+        // Create a directory node containing the file
+        let mut children = std::collections::BTreeMap::new();
+        children.insert("hello.txt".to_string(), file_node.hash);
+        let dir_node = NodeEntry {
+            hash: hash_bytes(b"dir-node"),
+            kind: NodeKind::Directory { children },
+        };
+        nodes.put_node(&dir_node).unwrap();
+
+        // Create a version pointing to the dir as root
+        let version = VersionNode {
+            id: VersionId::from("v1"),
+            parents: vec![],
+            root: dir_node.hash,
+            message: "init".to_string(),
+            timestamp: 1000,
+            metadata: std::collections::HashMap::new(),
+        };
+        versions.put_version(&version).unwrap();
+
+        let sync = InMemorySyncStore::new(versions, trees, nodes);
+        let reachable = sync.collect_reachable_objects(&[VersionId::from("v1")]).unwrap();
+
+        assert!(reachable.versions.contains(&VersionId::from("v1")));
+        assert!(reachable.node_hashes.contains(&dir_node.hash));
+        assert!(reachable.node_hashes.contains(&file_node.hash));
+        assert!(reachable.tree_hashes.contains(&tree_leaf.hash));
+        assert!(reachable.chunk_hashes.contains(&chunk_hash));
+    }
+
+    #[test]
+    fn sync_store_collect_walks_parent_versions() {
+        use axiom_core::store::SyncStore;
+
+        let versions = std::sync::Arc::new(InMemoryVersionRepo::new());
+        let trees = std::sync::Arc::new(InMemoryTreeStore::new());
+        let nodes = std::sync::Arc::new(InMemoryNodeStore::new());
+
+        // Create an empty dir node for both versions
+        let dir_node = NodeEntry {
+            hash: hash_bytes(b"empty-dir"),
+            kind: NodeKind::Directory { children: std::collections::BTreeMap::new() },
+        };
+        nodes.put_node(&dir_node).unwrap();
+
+        let v1 = VersionNode {
+            id: VersionId::from("v1"),
+            parents: vec![],
+            root: dir_node.hash,
+            message: "first".to_string(),
+            timestamp: 1000,
+            metadata: std::collections::HashMap::new(),
+        };
+        let v2 = VersionNode {
+            id: VersionId::from("v2"),
+            parents: vec![VersionId::from("v1")],
+            root: dir_node.hash,
+            message: "second".to_string(),
+            timestamp: 2000,
+            metadata: std::collections::HashMap::new(),
+        };
+        versions.put_version(&v1).unwrap();
+        versions.put_version(&v2).unwrap();
+
+        let sync = InMemorySyncStore::new(versions.clone(), trees, nodes);
+
+        // Starting from v2 should also reach v1
+        let reachable = sync.collect_reachable_objects(&[VersionId::from("v2")]).unwrap();
+        assert!(reachable.versions.contains(&VersionId::from("v1")));
+        assert!(reachable.versions.contains(&VersionId::from("v2")));
+
+        // list_all_version_ids should return both
+        let all_ids = sync.list_all_version_ids().unwrap();
+        assert_eq!(all_ids.len(), 2);
+    }
 }

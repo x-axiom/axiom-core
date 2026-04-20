@@ -1,12 +1,12 @@
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::error::{CasError, CasResult};
 use crate::model::{
     ChunkHash, NodeEntry, Ref, RefKind, TreeNode, VersionId, VersionNode,
     hash_bytes, hash_children,
 };
-use super::traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry};
+use super::traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry, SyncStore, ReachableObjects};
 
 // ---------------------------------------------------------------------------
 // InMemoryChunkStore
@@ -297,5 +297,102 @@ impl InMemoryCas {
 
     pub fn get_object_chunks(&self, hash: &ChunkHash) -> Option<Vec<ChunkHash>> {
         self.objects.read().get(hash).cloned()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InMemorySyncStore
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+use crate::model::{NodeKind, TreeNodeKind};
+
+/// In-memory implementation of `SyncStore` that walks the object graph
+/// through the individual store traits.
+pub struct InMemorySyncStore {
+    pub versions: Arc<InMemoryVersionRepo>,
+    pub trees: Arc<InMemoryTreeStore>,
+    pub nodes: Arc<InMemoryNodeStore>,
+}
+
+impl InMemorySyncStore {
+    pub fn new(
+        versions: Arc<InMemoryVersionRepo>,
+        trees: Arc<InMemoryTreeStore>,
+        nodes: Arc<InMemoryNodeStore>,
+    ) -> Self {
+        Self { versions, trees, nodes }
+    }
+}
+
+impl SyncStore for InMemorySyncStore {
+    fn collect_reachable_objects(&self, roots: &[VersionId]) -> CasResult<ReachableObjects> {
+        let mut result = ReachableObjects::default();
+
+        // BFS over version DAG
+        let mut version_queue: VecDeque<VersionId> = roots.iter().cloned().collect();
+        while let Some(vid) = version_queue.pop_front() {
+            if !result.versions.insert(vid.clone()) {
+                continue;
+            }
+            if let Some(version) = self.versions.get_version(&vid)? {
+                // Enqueue parents
+                for parent in &version.parents {
+                    if !result.versions.contains(parent) {
+                        version_queue.push_back(parent.clone());
+                    }
+                }
+                // Walk the directory tree from root node
+                let mut node_queue: VecDeque<ChunkHash> = VecDeque::new();
+                node_queue.push_back(version.root.clone());
+
+                while let Some(node_hash) = node_queue.pop_front() {
+                    if !result.node_hashes.insert(node_hash.clone()) {
+                        continue;
+                    }
+                    if let Some(entry) = self.nodes.get_node(&node_hash)? {
+                        match &entry.kind {
+                            NodeKind::File { root, .. } => {
+                                // Walk merkle tree
+                                let mut tree_queue: VecDeque<ChunkHash> = VecDeque::new();
+                                tree_queue.push_back(root.clone());
+                                while let Some(th) = tree_queue.pop_front() {
+                                    if !result.tree_hashes.insert(th.clone()) {
+                                        continue;
+                                    }
+                                    if let Some(tree_node) = self.trees.get_tree_node(&th)? {
+                                        match &tree_node.kind {
+                                            TreeNodeKind::Leaf { chunk } => {
+                                                result.chunk_hashes.insert(chunk.clone());
+                                            }
+                                            TreeNodeKind::Internal { children } => {
+                                                for child in children {
+                                                    if !result.tree_hashes.contains(child) {
+                                                        tree_queue.push_back(child.clone());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            NodeKind::Directory { children } => {
+                                for child_hash in children.values() {
+                                    if !result.node_hashes.contains(child_hash) {
+                                        node_queue.push_back(child_hash.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
+        Ok(self.versions.versions.read().keys().cloned().collect())
     }
 }
