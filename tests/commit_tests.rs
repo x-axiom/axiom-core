@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axiom_core::commit::{CommitRequest, CommitService, DEFAULT_BRANCH};
 use axiom_core::error::CasError;
@@ -10,8 +11,8 @@ use axiom_core::store::{InMemoryRefRepo, InMemoryVersionRepo};
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn svc() -> CommitService<InMemoryVersionRepo, InMemoryRefRepo> {
-    CommitService::new(InMemoryVersionRepo::new(), InMemoryRefRepo::new())
+fn svc() -> CommitService {
+    CommitService::new(Arc::new(InMemoryVersionRepo::new()), Arc::new(InMemoryRefRepo::new()))
 }
 
 fn root(tag: &str) -> axiom_core::model::ChunkHash {
@@ -19,7 +20,7 @@ fn root(tag: &str) -> axiom_core::model::ChunkHash {
 }
 
 fn initial_commit(
-    svc: &CommitService<InMemoryVersionRepo, InMemoryRefRepo>,
+    svc: &CommitService,
     msg: &str,
 ) -> axiom_core::model::VersionNode {
     svc.commit(CommitRequest {

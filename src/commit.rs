@@ -6,6 +6,7 @@
 //! (`VersionRepo`, `RefRepo`) without depending on concrete storage.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::{CasError, CasResult};
 use crate::model::hash::{current_timestamp, ChunkHash, VersionId};
@@ -44,16 +45,15 @@ pub struct CommitRequest {
 
 /// High-level service for version commits and ref management.
 ///
-/// `V` is a `VersionRepo` implementation, `R` is a `RefRepo` implementation.
-/// Both may be backed by the same `SqliteMetadataStore` in production.
-pub struct CommitService<V, R> {
-    versions: V,
-    refs: R,
+/// Uses trait objects for storage backends, consistent with `AppState`.
+pub struct CommitService {
+    versions: Arc<dyn VersionRepo>,
+    refs: Arc<dyn RefRepo>,
 }
 
-impl<V: VersionRepo, R: RefRepo> CommitService<V, R> {
+impl CommitService {
     /// Create a new `CommitService` from repository implementations.
-    pub fn new(versions: V, refs: R) -> Self {
+    pub fn new(versions: Arc<dyn VersionRepo>, refs: Arc<dyn RefRepo>) -> Self {
         Self { versions, refs }
     }
 

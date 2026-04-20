@@ -17,7 +17,7 @@ use axiom_core::store::memory::{
     InMemoryChunkStore, InMemoryNodeStore, InMemoryPathIndex, InMemoryRefRepo, InMemoryTreeStore,
     InMemoryVersionRepo,
 };
-use axiom_core::store::traits::ChunkStore;
+use axiom_core::store::traits::{ChunkStore, RefRepo, VersionRepo};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 // ---------------------------------------------------------------------------
@@ -142,8 +142,8 @@ fn bench_rehydrate(c: &mut Criterion) {
 
 fn bench_commit(c: &mut Criterion) {
     c.bench_function("commit_create_version", |b| {
-        let versions = Arc::new(InMemoryVersionRepo::new());
-        let refs = Arc::new(InMemoryRefRepo::new());
+        let versions: Arc<dyn VersionRepo> = Arc::new(InMemoryVersionRepo::new());
+        let refs: Arc<dyn RefRepo> = Arc::new(InMemoryRefRepo::new());
         let svc = CommitService::new(versions, refs);
         let root = ChunkHash::from_bytes([42u8; 32]);
 
