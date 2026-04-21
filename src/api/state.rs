@@ -32,8 +32,17 @@ impl AppState {
         cas: crate::store::RocksDbCasStore,
         meta: crate::store::SqliteMetadataStore,
     ) -> Self {
-        let cas = Arc::new(cas);
-        let meta = Arc::new(meta);
+        Self::local_from_arcs(Arc::new(cas), Arc::new(meta))
+    }
+
+    /// Same as [`AppState::local`] but takes already-shared `Arc`s, so the
+    /// caller can keep its own handle on the underlying stores (e.g. for
+    /// repos that are not exposed through `AppState`).
+    #[cfg(feature = "local")]
+    pub fn local_from_arcs(
+        cas: Arc<crate::store::RocksDbCasStore>,
+        meta: Arc<crate::store::SqliteMetadataStore>,
+    ) -> Self {
         Self {
             chunks: cas.clone(),
             trees: cas.clone(),

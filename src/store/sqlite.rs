@@ -675,7 +675,67 @@ impl PathIndexRepo for SqliteMetadataStore {
 // We need the `optional` extension from rusqlite.
 use rusqlite::OptionalExtension;
 
-// We need `hex` for hash conversion. Since we already have blake3,
+// ---------------------------------------------------------------------------
+// WorkspaceRepo
+// ---------------------------------------------------------------------------
+
+impl crate::store::traits::WorkspaceRepo for SqliteMetadataStore {
+    fn create_workspace(&self, ws: &crate::store::traits::Workspace) -> CasResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at, metadata) VALUES (?1, ?2, ?3, ?4)",
+            params![ws.id, ws.name, ws.created_at, ws.metadata],
+        )
+        .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_workspace(&self, id: &str) -> CasResult<Option<crate::store::traits::Workspace>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT id, name, created_at, metadata FROM workspaces WHERE id = ?1")
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        stmt.query_row(params![id], |row| {
+            Ok(crate::store::traits::Workspace {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get::<_, i64>(2)? as u64,
+                metadata: row.get(3)?,
+            })
+        })
+        .optional()
+        .map_err(|e| CasError::Store(e.to_string()))
+    }
+
+    fn list_workspaces(&self) -> CasResult<Vec<crate::store::traits::Workspace>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT id, name, created_at, metadata FROM workspaces ORDER BY created_at ASC")
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::store::traits::Workspace {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at: row.get::<_, i64>(2)? as u64,
+                    metadata: row.get(3)?,
+                })
+            })
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| CasError::Store(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    fn delete_workspace(&self, id: &str) -> CasResult<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(())
+    }
+}
 // let's use a minimal inline hex decoder to avoid adding another dep.
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, String> {

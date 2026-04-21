@@ -129,6 +129,31 @@ pub trait SyncStore: Send + Sync {
     fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>>;
 }
 
+/// A workspace record. Workspaces are logical containers used by the SaaS
+/// product for multi-tenant isolation; in Phase 0 (single-user local mode)
+/// only the seeded `default` workspace is meaningful.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Workspace {
+    pub id: String,
+    pub name: String,
+    pub created_at: u64,
+    /// Free-form JSON metadata (e.g. description). Stored as a string so the
+    /// store layer does not need to depend on a JSON type.
+    pub metadata: String,
+}
+
+/// Repository for workspace records.
+pub trait WorkspaceRepo: Send + Sync {
+    /// Insert a workspace. Fails if the id already exists.
+    fn create_workspace(&self, ws: &Workspace) -> CasResult<()>;
+    /// Get a workspace by id.
+    fn get_workspace(&self, id: &str) -> CasResult<Option<Workspace>>;
+    /// List all workspaces ordered by `created_at` ascending.
+    fn list_workspaces(&self) -> CasResult<Vec<Workspace>>;
+    /// Delete a workspace by id. No-op if it does not exist.
+    fn delete_workspace(&self, id: &str) -> CasResult<()>;
+}
+
 // ---------------------------------------------------------------------------
 // Arc blanket impls — allows sharing a single store across multiple services
 // ---------------------------------------------------------------------------
@@ -157,5 +182,20 @@ impl<T: RefRepo + ?Sized> RefRepo for Arc<T> {
     }
     fn list_refs(&self, kind: Option<RefKind>) -> CasResult<Vec<Ref>> {
         (**self).list_refs(kind)
+    }
+}
+
+impl<T: WorkspaceRepo + ?Sized> WorkspaceRepo for Arc<T> {
+    fn create_workspace(&self, ws: &Workspace) -> CasResult<()> {
+        (**self).create_workspace(ws)
+    }
+    fn get_workspace(&self, id: &str) -> CasResult<Option<Workspace>> {
+        (**self).get_workspace(id)
+    }
+    fn list_workspaces(&self) -> CasResult<Vec<Workspace>> {
+        (**self).list_workspaces()
+    }
+    fn delete_workspace(&self, id: &str) -> CasResult<()> {
+        (**self).delete_workspace(id)
     }
 }
