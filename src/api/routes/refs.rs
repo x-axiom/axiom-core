@@ -52,12 +52,25 @@ async fn create_ref(
     State(state): State<AppState>,
     Json(req): Json<CreateRefRequest>,
 ) -> ApiResult<Json<RefResponse>> {
-    let svc = CommitService::new(state.versions.clone(), state.refs.clone());
-    let target = VersionId::from(req.target.as_str());
+    create_ref_service(&state, &req.name, &req.kind, &req.target).map(Json)
+}
 
-    let r = match req.kind.as_str() {
-        "branch" => svc.create_branch(&req.name, &target).map_err(ApiError::from)?,
-        "tag" => svc.create_tag(&req.name, &target).map_err(ApiError::from)?,
+/// Synchronous service for creating a branch or tag ref.
+///
+/// `kind` must be `"branch"` or `"tag"`. `target` is interpreted as a
+/// version id (no ref-resolution).
+pub fn create_ref_service(
+    state: &AppState,
+    name: &str,
+    kind: &str,
+    target: &str,
+) -> ApiResult<RefResponse> {
+    let svc = CommitService::new(state.versions.clone(), state.refs.clone());
+    let target = VersionId::from(target);
+
+    let r = match kind {
+        "branch" => svc.create_branch(name, &target).map_err(ApiError::from)?,
+        "tag" => svc.create_tag(name, &target).map_err(ApiError::from)?,
         other => {
             return Err(ApiError(crate::error::CasError::InvalidRef(format!(
                 "unknown ref kind: {other}"
@@ -65,7 +78,7 @@ async fn create_ref(
         }
     };
 
-    Ok(Json(ref_to_dto(&r)))
+    Ok(ref_to_dto(&r))
 }
 
 async fn get_ref(
@@ -106,9 +119,37 @@ async fn delete_ref(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let svc = CommitService::new(state.versions.clone(), state.refs.clone());
-    svc.delete_branch(&name).map_err(ApiError::from)?;
+    delete_ref_service(&state, &name)?;
     Ok(Json(serde_json::json!({ "deleted": name })))
+}
+
+/// Synchronous service for deleting a branch or tag ref by name.
+///
+/// Unlike `CommitService::delete_branch`, this also accepts tags so callers
+/// (notably the Tauri `delete_ref` IPC command) have a single uniform
+/// entry point.
+pub fn delete_ref_service(state: &AppState, name: &str) -> ApiResult<()> {
+    let existing = state
+        .refs
+        .get_ref(name)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError(crate::error::CasError::NotFound(format!(
+                "ref '{name}' not found"
+            )))
+        })?;
+
+    match existing.kind {
+        RefKind::Branch => {
+            let svc = CommitService::new(state.versions.clone(), state.refs.clone());
+            svc.delete_branch(name).map_err(ApiError::from)?;
+        }
+        RefKind::Tag => {
+            state.refs.delete_ref(name).map_err(ApiError::from)?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn resolve_ref(

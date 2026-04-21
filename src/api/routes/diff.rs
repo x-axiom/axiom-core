@@ -17,11 +17,24 @@ async fn compute_diff(
     State(state): State<AppState>,
     Json(req): Json<DiffRequest>,
 ) -> ApiResult<Json<DiffResponse>> {
-    // Resolve old and new — accept version ids, branches, or tags.
+    diff_versions_service(&state, &req.old_version, &req.new_version).map(Json)
+}
+
+/// Synchronous service that computes the diff between two refs/version ids.
+///
+/// Resolves each side via the ref index, then walks the Merkle tree-backed
+/// directory representation to compute file-level changes and chunk-level
+/// dedup statistics. Used by both the HTTP handler and the Tauri
+/// `diff_versions` IPC command.
+pub fn diff_versions_service(
+    state: &AppState,
+    old_ref: &str,
+    new_ref: &str,
+) -> ApiResult<DiffResponse> {
     let old_version =
-        super::helpers::resolve_version_node(&req.old_version, state.versions.as_ref(), state.refs.as_ref())?;
+        super::helpers::resolve_version_node(old_ref, state.versions.as_ref(), state.refs.as_ref())?;
     let new_version =
-        super::helpers::resolve_version_node(&req.new_version, state.versions.as_ref(), state.refs.as_ref())?;
+        super::helpers::resolve_version_node(new_ref, state.versions.as_ref(), state.refs.as_ref())?;
 
     let result = diff_versions(
         &old_version.root,
@@ -31,7 +44,7 @@ async fn compute_diff(
     )
     .map_err(ApiError::from)?;
 
-    Ok(Json(DiffResponse {
+    Ok(DiffResponse {
         entries: result
             .entries
             .iter()
@@ -48,5 +61,5 @@ async fn compute_diff(
         added_chunks: result.added_chunks,
         removed_chunks: result.removed_chunks,
         unchanged_chunks: result.unchanged_chunks,
-    }))
+    })
 }
