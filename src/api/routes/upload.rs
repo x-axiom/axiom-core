@@ -191,6 +191,17 @@ async fn upload_directory(
     State(state): State<AppState>,
     Json(req): Json<DirectoryUploadRequest>,
 ) -> ApiResult<Json<UploadResponse>> {
+    upload_directory_service(&state, req).map(Json)
+}
+
+/// Synchronous service backing `POST /directory`.
+///
+/// Exposed so non-HTTP callers (Tauri IPC, internal pipelines) can run the
+/// same chunk → tree → commit pipeline without going through axum.
+pub fn upload_directory_service(
+    state: &AppState,
+    req: DirectoryUploadRequest,
+) -> ApiResult<UploadResponse> {
     if req.files.is_empty() {
         return Err(ApiError(crate::error::CasError::InvalidObject(
             "file list must not be empty".into(),
@@ -280,7 +291,7 @@ async fn upload_directory(
         state.path_index.as_ref(),
     )?;
 
-    Ok(Json(UploadResponse {
+    Ok(UploadResponse {
         version_id: version.id.to_string(),
         root: root_entry.hash.to_hex().to_string(),
         branch: branch.to_string(),
@@ -292,7 +303,7 @@ async fn upload_directory(
             dedup_chunks,
             dedup_bytes,
         },
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------

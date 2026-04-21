@@ -69,29 +69,38 @@ async fn get_history(
     Path(id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> ApiResult<Json<PaginatedVersionListResponse>> {
-    // Resolve id/branch/tag to a starting version.
-    let start = super::helpers::resolve_version_node(&id, state.versions.as_ref(), state.refs.as_ref())?;
+    version_history_service(&state, &id, query.limit, query.offset).map(Json)
+}
+
+/// Synchronous service for paginated version history starting at a ref/id.
+pub fn version_history_service(
+    state: &AppState,
+    ref_str: &str,
+    limit: usize,
+    offset: usize,
+) -> ApiResult<PaginatedVersionListResponse> {
+    let start = super::helpers::resolve_version_node(ref_str, state.versions.as_ref(), state.refs.as_ref())?;
 
     // Fetch one more than limit+offset to determine has_more.
-    let total_needed = query.offset + query.limit + 1;
+    let total_needed = offset + limit + 1;
     let all = state
         .versions
         .list_history(&start.id, total_needed)
         .map_err(ApiError::from)?;
 
-    let has_more = all.len() > query.offset + query.limit;
+    let has_more = all.len() > offset + limit;
     let page = all
         .into_iter()
-        .skip(query.offset)
-        .take(query.limit)
+        .skip(offset)
+        .take(limit)
         .collect::<Vec<_>>();
 
-    Ok(Json(PaginatedVersionListResponse {
+    Ok(PaginatedVersionListResponse {
         versions: page.iter().map(version_to_dto).collect(),
-        offset: query.offset,
-        limit: query.limit,
+        offset,
+        limit,
         has_more,
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------

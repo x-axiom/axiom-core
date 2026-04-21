@@ -33,11 +33,19 @@ async fn list_refs(
         _ => None,
     };
 
+    list_refs_service(&state, kind).map(Json)
+}
+
+/// Synchronous service for listing refs, optionally filtered by kind.
+pub fn list_refs_service(
+    state: &AppState,
+    kind: Option<RefKind>,
+) -> ApiResult<RefListResponse> {
     let refs = state.refs.list_refs(kind).map_err(ApiError::from)?;
 
-    Ok(Json(RefListResponse {
+    Ok(RefListResponse {
         refs: refs.iter().map(ref_to_dto).collect(),
-    }))
+    })
 }
 
 async fn create_ref(

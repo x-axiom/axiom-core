@@ -142,6 +142,18 @@ async fn list_dir_impl(
     ref_str: &str,
     dir_path: &str,
 ) -> ApiResult<Json<DirListingResponse>> {
+    list_directory_service(state, ref_str, dir_path).map(Json)
+}
+
+/// Synchronous service for listing a directory at `(ref, path)`.
+///
+/// Used by both the HTTP handler and the Tauri `browse_directory` IPC
+/// command. Pass an empty `dir_path` to list the version root.
+pub fn list_directory_service(
+    state: &AppState,
+    ref_str: &str,
+    dir_path: &str,
+) -> ApiResult<DirListingResponse> {
     let (version_id, _root) = {
         let v = super::helpers::resolve_version_node(ref_str, state.versions.as_ref(), state.refs.as_ref())?;
         (v.id, v.root)
@@ -210,9 +222,81 @@ async fn list_dir_impl(
         })
         .collect();
 
-    Ok(Json(DirListingResponse {
+    Ok(DirListingResponse {
         version_id: version_id.to_string(),
         path: dir_path.to_string(),
         entries,
-    }))
+    })
+}
+
+/// Synchronous service that reassembles a file's full byte content.
+///
+/// Walks the path index → node → Merkle tree → chunks, returning the
+/// concatenated bytes. Used by the Tauri `download_file` IPC command;
+/// the HTTP handler streams chunks directly instead of buffering.
+pub fn read_file_service(
+    state: &AppState,
+    ref_str: &str,
+    file_path: &str,
+) -> ApiResult<Vec<u8>> {
+    let v = super::helpers::resolve_version_node(ref_str, state.versions.as_ref(), state.refs.as_ref())?;
+    let version_id = v.id;
+
+    let entry = state
+        .path_index
+        .get_by_path(&version_id, file_path)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError(CasError::NotFound(format!(
+                "path '{}' not found in version '{}'",
+                file_path, version_id
+            )))
+        })?;
+
+    if entry.is_directory {
+        return Err(ApiError(CasError::InvalidObject(format!(
+            "path '{}' is a directory, not a file",
+            file_path
+        ))));
+    }
+
+    let node = state
+        .nodes
+        .get_node(&entry.node_hash)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError(CasError::NotFound(format!(
+                "node '{}' not found",
+                entry.node_hash.to_hex()
+            )))
+        })?;
+
+    let merkle_root = match &node.kind {
+        NodeKind::File { root, .. } => *root,
+        NodeKind::Directory { .. } => {
+            return Err(ApiError(CasError::InvalidObject(
+                "expected file node".into(),
+            )));
+        }
+    };
+
+    let chunk_hashes =
+        rehydrate(&merkle_root, state.trees.as_ref()).map_err(ApiError::from)?;
+
+    let mut bytes = Vec::new();
+    for hash in chunk_hashes {
+        let chunk = state
+            .chunks
+            .get_chunk(&hash)
+            .map_err(ApiError::from)?
+            .ok_or_else(|| {
+                ApiError(CasError::NotFound(format!(
+                    "chunk {} missing",
+                    hash.to_hex()
+                )))
+            })?;
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(bytes)
 }
