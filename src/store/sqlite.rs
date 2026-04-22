@@ -736,6 +736,29 @@ impl crate::store::traits::WorkspaceRepo for SqliteMetadataStore {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// list_all_version_ids helper (used by LocalSyncStore)
+// ---------------------------------------------------------------------------
+
+impl SqliteMetadataStore {
+    /// Return every version id stored in this database.
+    pub fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM versions")
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        let ids = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                Ok(VersionId(id))
+            })
+            .map_err(|e| CasError::Store(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(ids)
+    }
+}
 // let's use a minimal inline hex decoder to avoid adding another dep.
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, String> {

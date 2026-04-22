@@ -199,3 +199,12 @@ impl<T: WorkspaceRepo + ?Sized> WorkspaceRepo for Arc<T> {
         (**self).delete_workspace(id)
     }
 }
+
+impl<T: SyncStore + ?Sized> SyncStore for Arc<T> {
+    fn collect_reachable_objects(&self, roots: &[VersionId]) -> CasResult<ReachableObjects> {
+        (**self).collect_reachable_objects(roots)
+    }
+    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
+        (**self).list_all_version_ids()
+    }
+}
