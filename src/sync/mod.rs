@@ -15,6 +15,10 @@ pub mod push_client;
 #[cfg(feature = "cloud")]
 pub mod push_server;
 
+/// Pull client — three-step gRPC pull protocol.
+#[cfg(feature = "cloud")]
+pub mod pull_client;
+
 /// AXPK pack format encoder / decoder (requires zstd — cloud only).
 #[cfg(feature = "cloud")]
 pub mod pack;
