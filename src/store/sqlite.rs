@@ -6,14 +6,14 @@ use rusqlite::{params, Connection};
 
 use crate::error::{CasError, CasResult};
 use crate::model::{ChunkHash, Ref, RefKind, VersionId, VersionNode};
-use super::traits::{PathEntry, PathIndexRepo, RefRepo, VersionRepo};
+use super::traits::{PathEntry, PathIndexRepo, RefRepo, Remote, RemoteRepo, VersionRepo};
 
 // ---------------------------------------------------------------------------
 // Schema migration
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding new migrations.
-const CURRENT_SCHEMA_VERSION: u32 = 2;
+const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Apply all pending migrations up to `CURRENT_SCHEMA_VERSION`.
 fn run_migrations(conn: &Connection) -> CasResult<()> {
@@ -44,6 +44,9 @@ fn run_migrations(conn: &Connection) -> CasResult<()> {
             }
             if current < 2 {
                 migrate_v2(conn)?;
+            }
+            if current < 3 {
+                migrate_v3(conn)?;
             }
             Ok(())
         })();
@@ -219,6 +222,19 @@ fn migrate_v2(conn: &Connection) -> CasResult<()> {
     )
     .map_err(|e| CasError::Store(e.to_string()))?;
 
+    Ok(())
+}
+
+/// Migration v3: add tenant_id / workspace_id columns to remotes.
+fn migrate_v3(conn: &Connection) -> CasResult<()> {
+    conn.execute_batch(
+        "
+        ALTER TABLE remotes ADD COLUMN tenant_id TEXT;
+        ALTER TABLE remotes ADD COLUMN workspace_id TEXT;
+        UPDATE schema_version SET version = 3;
+        ",
+    )
+    .map_err(|e| CasError::Store(e.to_string()))?;
     Ok(())
 }
 
@@ -734,6 +750,100 @@ impl crate::store::traits::WorkspaceRepo for SqliteMetadataStore {
         conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])
             .map_err(|e| CasError::Store(e.to_string()))?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RemoteRepo
+// ---------------------------------------------------------------------------
+
+impl RemoteRepo for SqliteMetadataStore {
+    fn add_remote(&self, remote: &Remote) -> CasResult<()> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "INSERT INTO remotes (name, url, auth_token, tenant_id, workspace_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    remote.name,
+                    remote.url,
+                    remote.auth_token,
+                    remote.tenant_id,
+                    remote.workspace_id,
+                    remote.created_at as i64,
+                ],
+            )
+            .map_err(|e| {
+                // SQLite UNIQUE constraint violation → AlreadyExists
+                if e.to_string().contains("UNIQUE") {
+                    CasError::AlreadyExists
+                } else {
+                    CasError::Store(e.to_string())
+                }
+            })?;
+        debug_assert_eq!(rows, 1);
+        Ok(())
+    }
+
+    fn remove_remote(&self, name: &str) -> CasResult<()> {
+        let conn = self.conn.lock();
+        // Cascade manually — remote_refs FK was created without ON DELETE CASCADE.
+        conn.execute("DELETE FROM sync_sessions WHERE remote_name = ?1", params![name])
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        conn.execute("DELETE FROM remote_refs WHERE remote_name = ?1", params![name])
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        conn.execute("DELETE FROM remotes WHERE name = ?1", params![name])
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_remote(&self, name: &str) -> CasResult<Option<Remote>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, url, auth_token, tenant_id, workspace_id, created_at
+                 FROM remotes WHERE name = ?1",
+            )
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        stmt.query_row(params![name], |row| {
+            Ok(Remote {
+                name: row.get(0)?,
+                url: row.get(1)?,
+                auth_token: row.get(2)?,
+                tenant_id: row.get(3)?,
+                workspace_id: row.get(4)?,
+                created_at: row.get::<_, i64>(5)? as u64,
+            })
+        })
+        .optional()
+        .map_err(|e| CasError::Store(e.to_string()))
+    }
+
+    fn list_remotes(&self) -> CasResult<Vec<Remote>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, url, auth_token, tenant_id, workspace_id, created_at
+                 FROM remotes ORDER BY created_at ASC",
+            )
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Remote {
+                    name: row.get(0)?,
+                    url: row.get(1)?,
+                    auth_token: row.get(2)?,
+                    tenant_id: row.get(3)?,
+                    workspace_id: row.get(4)?,
+                    created_at: row.get::<_, i64>(5)? as u64,
+                })
+            })
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| CasError::Store(e.to_string()))?);
+        }
+        Ok(out)
     }
 }
 

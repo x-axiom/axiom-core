@@ -1,6 +1,9 @@
 /// Reachable-object BFS algorithm (no gRPC deps, always compiled).
 pub mod reachable;
 
+/// Remote configuration management (CRUD for remote endpoints).
+pub mod remote;
+
 /// AXPK pack format encoder / decoder (requires zstd — cloud only).
 #[cfg(feature = "cloud")]
 pub mod pack;

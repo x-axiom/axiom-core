@@ -208,3 +208,47 @@ impl<T: SyncStore + ?Sized> SyncStore for Arc<T> {
         (**self).list_all_version_ids()
     }
 }
+
+/// A configured remote endpoint for sync.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Remote {
+    /// Unique short name (e.g. "origin").
+    pub name: String,
+    /// gRPC or HTTP endpoint URL.
+    pub url: String,
+    /// Bearer token or empty string when unauthenticated.
+    pub auth_token: String,
+    /// Optional SaaS tenant identifier.
+    pub tenant_id: Option<String>,
+    /// Optional remote workspace identifier to sync with.
+    pub workspace_id: Option<String>,
+    /// Unix timestamp (seconds) when this remote was added.
+    pub created_at: u64,
+}
+
+/// CRUD repository for remote configurations.
+pub trait RemoteRepo: Send + Sync {
+    /// Add a remote. Returns `CasError::AlreadyExists` if name is taken.
+    fn add_remote(&self, remote: &Remote) -> CasResult<()>;
+    /// Remove a remote and cascade-delete its remote_refs and sync_sessions.
+    fn remove_remote(&self, name: &str) -> CasResult<()>;
+    /// Get a remote by name.
+    fn get_remote(&self, name: &str) -> CasResult<Option<Remote>>;
+    /// List all remotes ordered by created_at ascending.
+    fn list_remotes(&self) -> CasResult<Vec<Remote>>;
+}
+
+impl<T: RemoteRepo + ?Sized> RemoteRepo for Arc<T> {
+    fn add_remote(&self, remote: &Remote) -> CasResult<()> {
+        (**self).add_remote(remote)
+    }
+    fn remove_remote(&self, name: &str) -> CasResult<()> {
+        (**self).remove_remote(name)
+    }
+    fn get_remote(&self, name: &str) -> CasResult<Option<Remote>> {
+        (**self).get_remote(name)
+    }
+    fn list_remotes(&self) -> CasResult<Vec<Remote>> {
+        (**self).list_remotes()
+    }
+}
