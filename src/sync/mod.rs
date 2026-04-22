@@ -19,6 +19,10 @@ pub mod push_server;
 #[cfg(feature = "cloud")]
 pub mod pull_client;
 
+/// Pull server — gRPC server-side handler for Pull RPCs.
+#[cfg(feature = "cloud")]
+pub mod pull_server;
+
 /// AXPK pack format encoder / decoder (requires zstd — cloud only).
 #[cfg(feature = "cloud")]
 pub mod pack;
