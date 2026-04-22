@@ -11,6 +11,10 @@ pub mod remote_refs;
 #[cfg(feature = "cloud")]
 pub mod push_client;
 
+/// Push server — gRPC server-side handler for Push RPCs.
+#[cfg(feature = "cloud")]
+pub mod push_server;
+
 /// AXPK pack format encoder / decoder (requires zstd — cloud only).
 #[cfg(feature = "cloud")]
 pub mod pack;
