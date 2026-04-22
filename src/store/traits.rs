@@ -252,3 +252,54 @@ impl<T: RemoteRepo + ?Sized> RemoteRepo for Arc<T> {
         (**self).list_remotes()
     }
 }
+
+/// Last-known state of a ref on a remote server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteRef {
+    /// The remote this tracking ref belongs to (e.g. "origin").
+    pub remote_name: String,
+    /// The ref name (e.g. "main", "v1.0").
+    pub ref_name: String,
+    /// Branch or tag.
+    pub kind: RefKind,
+    /// The version this ref pointed to when last synced.
+    pub target: VersionId,
+    /// Unix timestamp (seconds) of the last update.
+    pub updated_at: u64,
+}
+
+/// Ahead/behind counts comparing a local ref to a remote-tracking ref.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AheadBehind {
+    /// Commits reachable from local HEAD but not from the remote-tracking ref.
+    pub ahead: usize,
+    /// Commits reachable from the remote-tracking ref but not from local HEAD.
+    pub behind: usize,
+}
+
+/// Storage for remote-tracking refs (last-known remote state).
+pub trait RemoteTrackingRepo: Send + Sync {
+    /// Insert or replace a remote-tracking ref.
+    fn update_remote_ref(&self, r: &RemoteRef) -> CasResult<()>;
+    /// Get a remote-tracking ref by (remote_name, ref_name).
+    fn get_remote_ref(&self, remote_name: &str, ref_name: &str) -> CasResult<Option<RemoteRef>>;
+    /// List all remote-tracking refs for a given remote, ordered by ref_name.
+    fn list_remote_refs(&self, remote_name: &str) -> CasResult<Vec<RemoteRef>>;
+    /// Delete a single remote-tracking ref. No-op if it does not exist.
+    fn delete_remote_ref(&self, remote_name: &str, ref_name: &str) -> CasResult<()>;
+}
+
+impl<T: RemoteTrackingRepo + ?Sized> RemoteTrackingRepo for Arc<T> {
+    fn update_remote_ref(&self, r: &RemoteRef) -> CasResult<()> {
+        (**self).update_remote_ref(r)
+    }
+    fn get_remote_ref(&self, remote_name: &str, ref_name: &str) -> CasResult<Option<RemoteRef>> {
+        (**self).get_remote_ref(remote_name, ref_name)
+    }
+    fn list_remote_refs(&self, remote_name: &str) -> CasResult<Vec<RemoteRef>> {
+        (**self).list_remote_refs(remote_name)
+    }
+    fn delete_remote_ref(&self, remote_name: &str, ref_name: &str) -> CasResult<()> {
+        (**self).delete_remote_ref(remote_name, ref_name)
+    }
+}

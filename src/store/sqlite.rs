@@ -6,7 +6,7 @@ use rusqlite::{params, Connection};
 
 use crate::error::{CasError, CasResult};
 use crate::model::{ChunkHash, Ref, RefKind, VersionId, VersionNode};
-use super::traits::{PathEntry, PathIndexRepo, RefRepo, Remote, RemoteRepo, VersionRepo};
+use super::traits::{PathEntry, PathIndexRepo, RefRepo, Remote, RemoteRef, RemoteRepo, RemoteTrackingRepo, VersionRepo};
 
 // ---------------------------------------------------------------------------
 // Schema migration
@@ -844,6 +844,109 @@ impl RemoteRepo for SqliteMetadataStore {
             out.push(r.map_err(|e| CasError::Store(e.to_string()))?);
         }
         Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RemoteTrackingRepo
+// ---------------------------------------------------------------------------
+
+impl RemoteTrackingRepo for SqliteMetadataStore {
+    fn update_remote_ref(&self, r: &RemoteRef) -> CasResult<()> {
+        let conn = self.conn.lock();
+        let kind_str = match r.kind {
+            RefKind::Branch => "branch",
+            RefKind::Tag => "tag",
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO remote_refs
+             (remote_name, ref_name, kind, target, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![r.remote_name, r.ref_name, kind_str, r.target.as_str(), r.updated_at as i64],
+        )
+        .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_remote_ref(
+        &self,
+        remote_name: &str,
+        ref_name: &str,
+    ) -> CasResult<Option<RemoteRef>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT remote_name, ref_name, kind, target, updated_at
+                 FROM remote_refs WHERE remote_name = ?1 AND ref_name = ?2",
+            )
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        stmt.query_row(params![remote_name, ref_name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .optional()
+        .map_err(|e| CasError::Store(e.to_string()))?
+        .map(|(rn, rfn, kind_str, target, updated_at)| {
+            let kind = if kind_str == "tag" { RefKind::Tag } else { RefKind::Branch };
+            Ok(RemoteRef {
+                remote_name: rn,
+                ref_name: rfn,
+                kind,
+                target: VersionId(target),
+                updated_at: updated_at as u64,
+            })
+        })
+        .transpose()
+    }
+
+    fn list_remote_refs(&self, remote_name: &str) -> CasResult<Vec<RemoteRef>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT remote_name, ref_name, kind, target, updated_at
+                 FROM remote_refs WHERE remote_name = ?1 ORDER BY ref_name ASC",
+            )
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![remote_name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (rn, rfn, kind_str, target, updated_at) =
+                r.map_err(|e| CasError::Store(e.to_string()))?;
+            let kind = if kind_str == "tag" { RefKind::Tag } else { RefKind::Branch };
+            out.push(RemoteRef {
+                remote_name: rn,
+                ref_name: rfn,
+                kind,
+                target: VersionId(target),
+                updated_at: updated_at as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    fn delete_remote_ref(&self, remote_name: &str, ref_name: &str) -> CasResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM remote_refs WHERE remote_name = ?1 AND ref_name = ?2",
+            params![remote_name, ref_name],
+        )
+        .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(())
     }
 }
 

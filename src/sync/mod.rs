@@ -4,6 +4,9 @@ pub mod reachable;
 /// Remote configuration management (CRUD for remote endpoints).
 pub mod remote;
 
+/// Remote-tracking refs management.
+pub mod remote_refs;
+
 /// AXPK pack format encoder / decoder (requires zstd — cloud only).
 #[cfg(feature = "cloud")]
 pub mod pack;
