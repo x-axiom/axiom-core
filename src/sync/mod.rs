@@ -7,6 +7,10 @@ pub mod remote;
 /// Remote-tracking refs management.
 pub mod remote_refs;
 
+/// Push client — four-step gRPC push protocol.
+#[cfg(feature = "cloud")]
+pub mod push_client;
+
 /// AXPK pack format encoder / decoder (requires zstd — cloud only).
 #[cfg(feature = "cloud")]
 pub mod pack;
