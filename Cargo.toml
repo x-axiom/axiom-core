@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default = ["local"]
 local = ["dep:rocksdb", "dep:rusqlite"]
-cloud = ["dep:tonic", "dep:prost", "dep:prost-types"]
+cloud = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:zstd"]
 full = ["local", "cloud"]
 
 [dependencies]
@@ -32,6 +32,7 @@ clap = { version = "4", features = ["derive"] }
 tonic = { version = "0.12", optional = true }
 prost = { version = "0.13", optional = true }
 prost-types = { version = "0.13", optional = true }
+zstd = { version = "0.13", optional = true }
 
 [build-dependencies]
 tonic-build = "0.12"

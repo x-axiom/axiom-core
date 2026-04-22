@@ -3,5 +3,7 @@ pub mod proto {
     tonic::include_proto!("axiom.sync.v1");
 }
 
+pub mod pack;
+
 pub use proto::sync_service_client::SyncServiceClient;
 pub use proto::sync_service_server::{SyncService, SyncServiceServer};
