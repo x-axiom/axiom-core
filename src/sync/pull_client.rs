@@ -17,13 +17,17 @@ use tonic::{transport::Channel, Request};
 
 use crate::error::{CasError, CasResult};
 use crate::model::{NodeEntry, Ref, RefKind, TreeNode, VersionId, VersionNode, current_timestamp};
-use crate::store::traits::{ChunkStore, NodeStore, RefRepo, RemoteTrackingRepo, TreeStore, VersionRepo};
+use crate::store::traits::{
+    ChunkStore, NodeStore, RefRepo, RemoteTrackingRepo, SyncDirection, SyncSessionRepo,
+    TreeStore, VersionRepo,
+};
 use crate::sync::proto::{
     DownloadPackRequest, ListRefsRequest, NegotiatePullRequest, WantEntry,
     download_pack_response::Payload,
     sync_service_client::SyncServiceClient,
 };
 use crate::sync::remote_refs::RemoteRef;
+use crate::sync::session::{begin_session, complete_session, fail_session};
 
 // ─── Proto ObjectType constants ──────────────────────────────────────────────
 const PROTO_TYPE_CHUNK: i32 = 1;
@@ -108,6 +112,10 @@ impl PullClient {
     /// * `refs`      — local ref repository (read + write for fast-forward).
     /// * `tracking`  — remote-tracking ref repository (updated on success).
     /// * `chunks / trees / nodes / versions` — local object stores (write).
+    /// * `sessions`  — if `Some`, the pull lifecycle is recorded in the
+    ///                 sync-sessions table (begin/complete/fail). Bookkeeping
+    ///                 errors are intentionally swallowed so they cannot mask
+    ///                 a real pull error.
     /// * `progress`  — called at each protocol step and after every object.
     ///
     /// # Returns
@@ -123,8 +131,52 @@ impl PullClient {
         trees: &dyn TreeStore,
         nodes: &dyn NodeStore,
         versions: &dyn VersionRepo,
-        mut progress: impl FnMut(PullProgress),
+        sessions: Option<&dyn SyncSessionRepo>,
+        progress: impl FnMut(PullProgress),
     ) -> CasResult<Vec<PullResult>> {
+        let session_id = new_session_id("pull");
+        if let Some(repo) = sessions {
+            let _ = begin_session(
+                repo,
+                &session_id,
+                &config.remote_name,
+                SyncDirection::Pull,
+            );
+        }
+
+        let outcome = self
+            .pull_inner(
+                config, ref_names, refs, tracking, chunks, trees, nodes, versions, progress,
+            )
+            .await;
+
+        match (&outcome, sessions) {
+            (Ok((_, objs, bytes)), Some(repo)) => {
+                let _ = complete_session(repo, &session_id, *objs, *bytes);
+            }
+            (Err(e), Some(repo)) => {
+                let _ = fail_session(repo, &session_id, e.to_string());
+            }
+            _ => {}
+        }
+
+        outcome.map(|(results, _, _)| results)
+    }
+
+    /// Internal pull body. Returns `(per-ref results, total objects downloaded, bytes downloaded)`.
+    #[allow(clippy::too_many_arguments)]
+    async fn pull_inner(
+        &mut self,
+        config: &PullConfig,
+        ref_names: &[String],
+        refs: &dyn RefRepo,
+        tracking: &dyn RemoteTrackingRepo,
+        chunks: &dyn ChunkStore,
+        trees: &dyn TreeStore,
+        nodes: &dyn NodeStore,
+        versions: &dyn VersionRepo,
+        mut progress: impl FnMut(PullProgress),
+    ) -> CasResult<(Vec<PullResult>, u64, u64)> {
         // ── Step 1: ListRefs ──────────────────────────────────────────────
         progress(PullProgress {
             stage: PullStage::ListingRefs,
@@ -154,7 +206,7 @@ impl PullClient {
                 stage: PullStage::Done,
                 bytes_downloaded: 0,
             });
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0, 0));
         }
 
         // ── Build want/have list ──────────────────────────────────────────
@@ -286,8 +338,18 @@ impl PullClient {
             bytes_downloaded,
         });
 
-        Ok(results)
+        Ok((results, objects_done, bytes_downloaded))
     }
+}
+
+/// Generate a unique session id with the given short prefix.
+fn new_session_id(prefix: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{prefix}-{nanos:x}")
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

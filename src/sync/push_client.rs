@@ -15,7 +15,10 @@ use tonic::{transport::Channel, Request};
 
 use crate::error::{CasError, CasResult};
 use crate::model::{ChunkHash, RefKind, VersionId, current_timestamp};
-use crate::store::traits::{ChunkStore, NodeStore, RefRepo, RemoteTrackingRepo, TreeStore, VersionRepo};
+use crate::store::traits::{
+    ChunkStore, NodeStore, RefRepo, RemoteTrackingRepo, SyncDirection, SyncSessionRepo,
+    TreeStore, VersionRepo,
+};
 use crate::sync::proto::{
     FinalizeRefsRequest, ListRefsRequest, NegotiatePushRequest, ObjectId, ObjectList,
     PackEntry, PackHeader, RefUpdate, UploadPackRequest,
@@ -23,6 +26,7 @@ use crate::sync::proto::{
     upload_pack_request::Payload,
 };
 use crate::sync::remote_refs::RemoteRef;
+use crate::sync::session::{begin_session, complete_session, fail_session};
 
 // ─── Proto ObjectType constants ──────────────────────────────────────────────
 // Mirrors the proto enum values without importing the prost enum directly.
@@ -102,11 +106,16 @@ impl PushClient {
     /// * `chunks / trees / nodes / versions` — object stores for fetching data.
     /// * `tracking`   — if `Some`, remote-tracking refs are updated in-place
     ///                  for every ref that the server reports as `"ok"`.
+    /// * `sessions`   — if `Some`, the push lifecycle is recorded in the
+    ///                  sync-sessions table (begin/complete/fail). Bookkeeping
+    ///                  errors are intentionally swallowed so that they cannot
+    ///                  mask a real push error.
     /// * `progress`   — called at each protocol step and after every object.
     ///
     /// # Returns
     /// A map of `ref_name → status` string (`"ok"`, `"non-fast-forward"`,
     /// or `"error"`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn push(
         &mut self,
         config: &PushConfig,
@@ -117,8 +126,52 @@ impl PushClient {
         nodes: &dyn NodeStore,
         versions: &dyn VersionRepo,
         tracking: Option<&dyn RemoteTrackingRepo>,
-        mut progress: impl FnMut(SyncProgress),
+        sessions: Option<&dyn SyncSessionRepo>,
+        progress: impl FnMut(SyncProgress),
     ) -> CasResult<HashMap<String, String>> {
+        let session_id = new_session_id("push");
+        if let Some(repo) = sessions {
+            let _ = begin_session(
+                repo,
+                &session_id,
+                &config.remote_name,
+                SyncDirection::Push,
+            );
+        }
+
+        let outcome = self
+            .push_inner(
+                config, ref_names, refs, chunks, trees, nodes, versions, tracking, progress,
+            )
+            .await;
+
+        match (&outcome, sessions) {
+            (Ok((_, objs, bytes)), Some(repo)) => {
+                let _ = complete_session(repo, &session_id, *objs, *bytes);
+            }
+            (Err(e), Some(repo)) => {
+                let _ = fail_session(repo, &session_id, e.to_string());
+            }
+            _ => {}
+        }
+
+        outcome.map(|(results, _, _)| results)
+    }
+
+    /// Internal push body. Returns `(per-ref status map, total objects uploaded, bytes uploaded)`.
+    #[allow(clippy::too_many_arguments)]
+    async fn push_inner(
+        &mut self,
+        config: &PushConfig,
+        ref_names: &[String],
+        refs: &dyn RefRepo,
+        chunks: &dyn ChunkStore,
+        trees: &dyn TreeStore,
+        nodes: &dyn NodeStore,
+        versions: &dyn VersionRepo,
+        tracking: Option<&dyn RemoteTrackingRepo>,
+        mut progress: impl FnMut(SyncProgress),
+    ) -> CasResult<(HashMap<String, String>, u64, u64)> {
         // ── Step 1: ListRefs ──────────────────────────────────────────────
         progress(SyncProgress {
             stage: PushStage::ListingRefs,
@@ -158,7 +211,7 @@ impl PushClient {
                 stage: PushStage::Done,
                 bytes_uploaded: 0,
             });
-            return Ok(HashMap::new());
+            return Ok((HashMap::new(), 0, 0));
         }
 
         let ref_updates: Vec<RefUpdate> = to_push
@@ -331,8 +384,21 @@ impl PushClient {
             bytes_uploaded,
         });
 
-        Ok(results)
+        Ok((results, total_objects, bytes_uploaded))
     }
+}
+
+/// Generate a unique session id with the given short prefix.
+///
+/// The id encodes the current Unix nanos so it is monotonic enough for
+/// debug listing while remaining cheap (no extra deps).
+fn new_session_id(prefix: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{prefix}-{nanos:x}")
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

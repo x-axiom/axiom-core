@@ -30,8 +30,10 @@ use axiom_core::store::memory::{
     InMemoryVersionRepo,
 };
 use axiom_core::store::traits::{
-    ChunkStore, NodeStore, RefRepo, RemoteTrackingRepo, TreeStore, VersionRepo,
+    ChunkStore, NodeStore, RefRepo, Remote, RemoteRepo, RemoteTrackingRepo, SyncSessionRepo,
+    SyncSessionStatus, TreeStore, VersionRepo,
 };
+use axiom_core::store::sqlite::SqliteMetadataStore;
 use axiom_core::sync::SyncServiceServer;
 use axiom_core::sync::proto::{
     CloneDownloadRequest, CloneDownloadResponse, CloneInitRequest, CloneInitResponse,
@@ -352,6 +354,7 @@ async fn push_then_pull_roundtrip_byte_for_byte() {
             client_a.nodes.as_ref(),
             client_a.versions.as_ref(),
             Some(&tracking_a),
+            None,
             |_| {},
         )
         .await
@@ -375,6 +378,7 @@ async fn push_then_pull_roundtrip_byte_for_byte() {
             client_b.trees.as_ref(),
             client_b.nodes.as_ref(),
             client_b.versions.as_ref(),
+            None,
             |_| {},
         )
         .await
@@ -414,6 +418,7 @@ async fn empty_push_when_no_local_refs_is_noop() {
             client_a.nodes.as_ref(),
             client_a.versions.as_ref(),
             None,
+            None,
             |_| {},
         )
         .await
@@ -440,6 +445,7 @@ async fn non_fast_forward_push_is_rejected() {
             client_a.nodes.as_ref(),
             client_a.versions.as_ref(),
             None,
+            None,
             |_| {},
         )
         .await
@@ -461,6 +467,7 @@ async fn non_fast_forward_push_is_rejected() {
             client_b.trees.as_ref(),
             client_b.nodes.as_ref(),
             client_b.versions.as_ref(),
+            None,
             None,
             |_| {},
         )
@@ -488,6 +495,7 @@ async fn force_push_overrides_non_fast_forward() {
             client_a.nodes.as_ref(),
             client_a.versions.as_ref(),
             None,
+            None,
             |_| {},
         )
         .await
@@ -506,6 +514,7 @@ async fn force_push_overrides_non_fast_forward() {
             client_b.trees.as_ref(),
             client_b.nodes.as_ref(),
             client_b.versions.as_ref(),
+            None,
             None,
             |_| {},
         )
@@ -544,6 +553,7 @@ async fn progress_callback_invoked_for_push_and_pull() {
         client_a.nodes.as_ref(),
         client_a.versions.as_ref(),
         None,
+        None,
         move |p| {
             push_stages_clone
                 .lock()
@@ -578,6 +588,7 @@ async fn progress_callback_invoked_for_push_and_pull() {
         client_b.trees.as_ref(),
         client_b.nodes.as_ref(),
         client_b.versions.as_ref(),
+        None,
         move |p| {
             pull_stages_clone
                 .lock()
@@ -614,6 +625,7 @@ async fn push_updates_remote_tracking_refs() {
         client_a.nodes.as_ref(),
         client_a.versions.as_ref(),
         Some(&tracking),
+        None,
         |_| {},
     )
     .await
@@ -642,9 +654,158 @@ async fn pull_from_empty_remote_returns_no_refs() {
             client_b.trees.as_ref(),
             client_b.nodes.as_ref(),
             client_b.versions.as_ref(),
+            None,
             |_| {},
         )
         .await
         .unwrap();
     assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn push_and_pull_record_sync_sessions() {
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    // Shared SQLite session repo (in-memory) — also needs the remote row
+    // because `sync_sessions.remote_name` is a FK into `remotes`.
+    let session_db = SqliteMetadataStore::open_in_memory().expect("in-memory sqlite");
+    session_db
+        .add_remote(&Remote {
+            name: "origin".into(),
+            url: format!("http://{addr}"),
+            auth_token: String::new(),
+            tenant_id: None,
+            workspace_id: None,
+            created_at: 0,
+        })
+        .unwrap();
+
+    // ── Push with session tracking enabled ───────────────────────────────
+    let client_a = Backends::new();
+    seed_branch(&client_a, "main", b"session-test", vec![]);
+
+    let mut push = connect_push(addr).await;
+    push.push(
+        &cfg_push(false),
+        &[],
+        client_a.refs.as_ref(),
+        client_a.chunks.as_ref(),
+        client_a.trees.as_ref(),
+        client_a.nodes.as_ref(),
+        client_a.versions.as_ref(),
+        None,
+        Some(&session_db),
+        |_| {},
+    )
+    .await
+    .expect("push ok");
+
+    // Push session was recorded as Completed with non-zero counters.
+    let push_sessions = session_db.list_sync_sessions(Some("origin"), 10).unwrap();
+    let push_session = push_sessions
+        .iter()
+        .find(|s| s.id.starts_with("push-"))
+        .expect("push session row");
+    assert_eq!(push_session.status, SyncSessionStatus::Completed);
+    assert_eq!(push_session.remote_name, "origin");
+    assert!(push_session.finished_at.is_some());
+    assert!(push_session.objects_transferred > 0);
+    assert!(push_session.bytes_transferred > 0);
+    assert!(push_session.error_message.is_none());
+
+    // ── Pull with session tracking enabled ───────────────────────────────
+    let client_b = Backends::new();
+    let tracking_b = InMemoryRemoteTracking::default();
+    let mut pull = connect_pull(addr).await;
+    pull.pull(
+        &cfg_pull(),
+        &[],
+        client_b.refs.as_ref(),
+        &tracking_b,
+        client_b.chunks.as_ref(),
+        client_b.trees.as_ref(),
+        client_b.nodes.as_ref(),
+        client_b.versions.as_ref(),
+        Some(&session_db),
+        |_| {},
+    )
+    .await
+    .expect("pull ok");
+
+    let pull_sessions = session_db.list_sync_sessions(Some("origin"), 10).unwrap();
+    let pull_session = pull_sessions
+        .iter()
+        .find(|s| s.id.starts_with("pull-"))
+        .expect("pull session row");
+    assert_eq!(pull_session.status, SyncSessionStatus::Completed);
+    assert!(pull_session.objects_transferred > 0);
+    assert!(pull_session.bytes_transferred > 0);
+}
+
+#[tokio::test]
+async fn failed_push_records_failed_session() {
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    let session_db = SqliteMetadataStore::open_in_memory().expect("in-memory sqlite");
+    session_db
+        .add_remote(&Remote {
+            name: "origin".into(),
+            url: format!("http://{addr}"),
+            auth_token: String::new(),
+            tenant_id: None,
+            workspace_id: None,
+            created_at: 0,
+        })
+        .unwrap();
+
+    // Initial push by A succeeds (also recorded).
+    let client_a = Backends::new();
+    seed_branch(&client_a, "main", b"v1", vec![]);
+    let mut push_a = connect_push(addr).await;
+    push_a
+        .push(
+            &cfg_push(false),
+            &[],
+            client_a.refs.as_ref(),
+            client_a.chunks.as_ref(),
+            client_a.trees.as_ref(),
+            client_a.nodes.as_ref(),
+            client_a.versions.as_ref(),
+            None,
+            Some(&session_db),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+    // B pushes a forked tip without --force → server rejects → session = Failed.
+    let client_b = Backends::new();
+    seed_branch(&client_b, "main", b"v2-different", vec![]);
+    let mut push_b = connect_push(addr).await;
+    let _err = push_b
+        .push(
+            &cfg_push(false),
+            &[],
+            client_b.refs.as_ref(),
+            client_b.chunks.as_ref(),
+            client_b.trees.as_ref(),
+            client_b.nodes.as_ref(),
+            client_b.versions.as_ref(),
+            None,
+            Some(&session_db),
+            |_| {},
+        )
+        .await
+        .expect_err("push must be rejected");
+
+    let sessions = session_db.list_sync_sessions(Some("origin"), 10).unwrap();
+    let failed = sessions
+        .iter()
+        .find(|s| s.status == SyncSessionStatus::Failed)
+        .expect("failed session row");
+    assert!(failed.id.starts_with("push-"));
+    assert!(failed.error_message.is_some());
+    assert!(failed.finished_at.is_some());
 }
