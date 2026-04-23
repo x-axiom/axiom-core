@@ -12,8 +12,6 @@
 //!   is updated and the caller receives a `PullResult` with
 //!   `fast_forward = false` for that ref (user must merge/rebase manually).
 
-use std::collections::VecDeque;
-
 use futures_util::StreamExt;
 use tonic::{transport::Channel, Request};
 
@@ -360,7 +358,7 @@ fn try_fast_forward(
             if r.target == *new_tip {
                 return Ok(true); // already up-to-date
             }
-            is_ancestor_of(&r.target, new_tip, versions)?
+            crate::sync::fast_forward::is_fast_forward(&r.target, new_tip, versions)?
         }
     };
 
@@ -374,32 +372,4 @@ fn try_fast_forward(
     } else {
         Ok(false)
     }
-}
-
-/// Return `true` when `old_vid` is an ancestor of (or equal to) `new_vid`.
-///
-/// BFS from `new_vid` through version parents; returns `true` if `old_vid` is
-/// encountered.
-fn is_ancestor_of(
-    old_vid: &VersionId,
-    new_vid: &VersionId,
-    versions: &dyn VersionRepo,
-) -> CasResult<bool> {
-    let mut queue = VecDeque::new();
-    let mut visited = std::collections::HashSet::new();
-    queue.push_back(new_vid.clone());
-    while let Some(id) = queue.pop_front() {
-        if !visited.insert(id.clone()) {
-            continue;
-        }
-        if &id == old_vid {
-            return Ok(true);
-        }
-        if let Some(v) = versions.get_version(&id)? {
-            for parent in v.parents {
-                queue.push_back(parent);
-            }
-        }
-    }
-    Ok(false)
 }

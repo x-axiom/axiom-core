@@ -109,11 +109,8 @@ impl PushServiceHandler {
 
 // ─── Helper: fast-forward check ──────────────────────────────────────────────
 
-/// Return `true` when `old` is an ancestor of (or equal to) `new`, meaning
-/// advancing from `old` to `new` is a fast-forward.
-///
-/// Empty `old` (all-zero bytes / empty hex) means the ref is being created for
-/// the first time — always fast-forward.
+/// Wrapper around [`crate::sync::fast_forward::is_fast_forward`] that also
+/// honours the `--force` flag (force always allows the update).
 fn is_fast_forward_allowed(
     old_vid: &VersionId,
     new_vid: &VersionId,
@@ -123,30 +120,7 @@ fn is_fast_forward_allowed(
     if force {
         return Ok(true);
     }
-    if old_vid.as_str().is_empty() || old_vid.as_str() == &"0".repeat(64) {
-        return Ok(true); // creating a new ref
-    }
-    if old_vid == new_vid {
-        return Ok(true);
-    }
-    // BFS from new_vid looking for old_vid.
-    let mut queue = std::collections::VecDeque::new();
-    let mut visited = std::collections::HashSet::new();
-    queue.push_back(new_vid.clone());
-    while let Some(id) = queue.pop_front() {
-        if !visited.insert(id.clone()) {
-            continue;
-        }
-        if &id == old_vid {
-            return Ok(true);
-        }
-        if let Some(v) = versions.get_version(&id)? {
-            for parent in v.parents {
-                queue.push_back(parent);
-            }
-        }
-    }
-    Ok(false)
+    crate::sync::fast_forward::is_fast_forward(old_vid, new_vid, versions)
 }
 
 fn now_secs() -> u64 {

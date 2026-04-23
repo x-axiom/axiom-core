@@ -1,6 +1,9 @@
 /// Reachable-object BFS algorithm (no gRPC deps, always compiled).
 pub mod reachable;
 
+/// Fast-forward detection for ref updates (always compiled).
+pub mod fast_forward;
+
 /// Remote configuration management (CRUD for remote endpoints).
 pub mod remote;
 
