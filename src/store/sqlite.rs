@@ -13,7 +13,7 @@ use super::traits::{PathEntry, PathIndexRepo, RefRepo, Remote, RemoteRef, Remote
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding new migrations.
-const CURRENT_SCHEMA_VERSION: u32 = 3;
+const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Apply all pending migrations up to `CURRENT_SCHEMA_VERSION`.
 fn run_migrations(conn: &Connection) -> CasResult<()> {
@@ -47,6 +47,9 @@ fn run_migrations(conn: &Connection) -> CasResult<()> {
             }
             if current < 3 {
                 migrate_v3(conn)?;
+            }
+            if current < 4 {
+                migrate_v4(conn)?;
             }
             Ok(())
         })();
@@ -232,6 +235,64 @@ fn migrate_v3(conn: &Connection) -> CasResult<()> {
         ALTER TABLE remotes ADD COLUMN tenant_id TEXT;
         ALTER TABLE remotes ADD COLUMN workspace_id TEXT;
         UPDATE schema_version SET version = 3;
+        ",
+    )
+    .map_err(|e| CasError::Store(e.to_string()))?;
+    Ok(())
+}
+
+/// Migration v4: rebuild `remote_refs` and `sync_sessions` so their FK to
+/// `remotes(name)` declares `ON DELETE CASCADE`.
+///
+/// SQLite cannot modify foreign keys in place, so we follow the standard
+/// rebuild dance: rename old table → create new with corrected FK → copy
+/// data → drop old → recreate indexes. `PRAGMA foreign_keys` must be OFF
+/// during the rebuild (the entire migration runs inside the v1+ outer
+/// transaction; we wrap with `defer_foreign_keys` instead, which is the
+/// transaction-scoped equivalent and does not require leaving the txn).
+fn migrate_v4(conn: &Connection) -> CasResult<()> {
+    conn.execute_batch(
+        "
+        PRAGMA defer_foreign_keys = ON;
+
+        -- ── remote_refs ────────────────────────────────────────────────
+        CREATE TABLE remote_refs_new (
+            remote_name TEXT NOT NULL,
+            ref_name    TEXT NOT NULL,
+            kind        TEXT NOT NULL CHECK (kind IN ('branch', 'tag')),
+            target      TEXT NOT NULL,
+            updated_at  INTEGER NOT NULL,
+            PRIMARY KEY (remote_name, ref_name),
+            FOREIGN KEY (remote_name) REFERENCES remotes(name) ON DELETE CASCADE
+        );
+        INSERT INTO remote_refs_new
+            SELECT remote_name, ref_name, kind, target, updated_at FROM remote_refs;
+        DROP TABLE remote_refs;
+        ALTER TABLE remote_refs_new RENAME TO remote_refs;
+        CREATE INDEX IF NOT EXISTS idx_remote_refs_remote ON remote_refs(remote_name);
+
+        -- ── sync_sessions ──────────────────────────────────────────────
+        CREATE TABLE sync_sessions_new (
+            id          TEXT PRIMARY KEY,
+            remote_name TEXT NOT NULL,
+            direction   TEXT NOT NULL CHECK (direction IN ('push', 'pull')),
+            status      TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+            started_at  INTEGER NOT NULL,
+            finished_at INTEGER,
+            objects_transferred INTEGER NOT NULL DEFAULT 0,
+            bytes_transferred   INTEGER NOT NULL DEFAULT 0,
+            error_message       TEXT,
+            FOREIGN KEY (remote_name) REFERENCES remotes(name) ON DELETE CASCADE
+        );
+        INSERT INTO sync_sessions_new
+            SELECT id, remote_name, direction, status, started_at, finished_at,
+                   objects_transferred, bytes_transferred, error_message
+            FROM sync_sessions;
+        DROP TABLE sync_sessions;
+        ALTER TABLE sync_sessions_new RENAME TO sync_sessions;
+        CREATE INDEX IF NOT EXISTS idx_sync_sessions_remote ON sync_sessions(remote_name);
+
+        UPDATE schema_version SET version = 4;
         ",
     )
     .map_err(|e| CasError::Store(e.to_string()))?;
@@ -787,11 +848,9 @@ impl RemoteRepo for SqliteMetadataStore {
 
     fn remove_remote(&self, name: &str) -> CasResult<()> {
         let conn = self.conn.lock();
-        // Cascade manually — remote_refs FK was created without ON DELETE CASCADE.
-        conn.execute("DELETE FROM sync_sessions WHERE remote_name = ?1", params![name])
-            .map_err(|e| CasError::Store(e.to_string()))?;
-        conn.execute("DELETE FROM remote_refs WHERE remote_name = ?1", params![name])
-            .map_err(|e| CasError::Store(e.to_string()))?;
+        // FKs on remote_refs and sync_sessions are declared with
+        // ON DELETE CASCADE (schema v4), so a single delete on `remotes`
+        // is enough to clean both child tables.
         conn.execute("DELETE FROM remotes WHERE name = ?1", params![name])
             .map_err(|e| CasError::Store(e.to_string()))?;
         Ok(())

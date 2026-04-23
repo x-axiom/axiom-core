@@ -127,3 +127,38 @@ fn duplicate_create_fails() {
     let err = begin_session(&db, "dup", "origin", SyncDirection::Push).unwrap_err();
     matches!(err, axiom_core::error::CasError::AlreadyExists);
 }
+
+#[test]
+fn remove_remote_cascades_to_sessions_and_remote_refs() {
+    use axiom_core::store::traits::{RemoteRef, RemoteTrackingRepo};
+    use axiom_core::model::RefKind;
+
+    let db = store_with_remote("origin");
+
+    // Insert a session row.
+    begin_session(&db, "sess-cascade", "origin", SyncDirection::Push).unwrap();
+    complete_session(&db, "sess-cascade", 7, 42).unwrap();
+
+    // Insert a remote_refs row.
+    db.update_remote_ref(&RemoteRef {
+        remote_name: "origin".into(),
+        ref_name: "main".into(),
+        kind: RefKind::Branch,
+        target: "deadbeef".into(),
+        updated_at: 1,
+    })
+    .unwrap();
+
+    // Sanity: rows exist.
+    assert_eq!(db.list_sync_sessions(Some("origin"), 10).unwrap().len(), 1);
+    assert_eq!(db.list_remote_refs("origin").unwrap().len(), 1);
+
+    // Drop the remote — both child tables should be cascade-cleared.
+    db.remove_remote("origin").unwrap();
+
+    assert!(db.get_remote("origin").unwrap().is_none());
+    assert_eq!(db.list_sync_sessions(Some("origin"), 10).unwrap().len(), 0);
+    assert_eq!(db.list_remote_refs("origin").unwrap().len(), 0);
+    // Session lookup by id also gone.
+    assert!(db.get_session("sess-cascade").unwrap().is_none());
+}

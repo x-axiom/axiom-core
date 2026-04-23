@@ -125,7 +125,7 @@ fn test_migration_v0_to_v2_fresh_install() {
     let ver: u32 = conn
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(ver, 2);
+    assert!(ver >= 2, "schema version should be at least 2, got {ver}");
 
     // v2 tables exist
     let ws_count: u32 = conn
@@ -191,7 +191,7 @@ fn test_migration_v1_to_v2_preserves_data() {
     let ver: u32 = conn
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(ver, 2);
+    assert!(ver >= 2, "schema version should be at least 2, got {ver}");
 
     // Default workspace created.
     let ws_name: String = conn
@@ -222,7 +222,7 @@ fn test_migration_v2_idempotent_reopen() {
     let ver: u32 = conn
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(ver, 2);
+    assert!(ver >= 2, "schema version should be at least 2, got {ver}");
 
     // Still only one default workspace (INSERT OR IGNORE).
     let ws_count: u32 = conn
