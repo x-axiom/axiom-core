@@ -6,7 +6,7 @@ use rusqlite::{params, Connection};
 
 use crate::error::{CasError, CasResult};
 use crate::model::{ChunkHash, Ref, RefKind, VersionId, VersionNode};
-use super::traits::{PathEntry, PathIndexRepo, RefRepo, Remote, RemoteRef, RemoteRepo, RemoteTrackingRepo, VersionRepo};
+use super::traits::{PathEntry, PathIndexRepo, RefRepo, Remote, RemoteRef, RemoteRepo, RemoteTrackingRepo, SyncDirection, SyncSession, SyncSessionRepo, SyncSessionStatus, VersionRepo};
 
 // ---------------------------------------------------------------------------
 // Schema migration
@@ -947,6 +947,192 @@ impl RemoteTrackingRepo for SqliteMetadataStore {
         )
         .map_err(|e| CasError::Store(e.to_string()))?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SyncSessionRepo (E04-S06)
+// ---------------------------------------------------------------------------
+
+fn row_to_sync_session(
+    id: String,
+    remote_name: String,
+    direction: String,
+    status: String,
+    started_at: i64,
+    finished_at: Option<i64>,
+    objects_transferred: i64,
+    bytes_transferred: i64,
+    error_message: Option<String>,
+) -> CasResult<SyncSession> {
+    let direction = SyncDirection::parse(&direction)
+        .ok_or_else(|| CasError::Store(format!("invalid direction: {direction}")))?;
+    let status = SyncSessionStatus::parse(&status)
+        .ok_or_else(|| CasError::Store(format!("invalid status: {status}")))?;
+    Ok(SyncSession {
+        id,
+        remote_name,
+        direction,
+        status,
+        started_at: started_at as u64,
+        finished_at: finished_at.map(|v| v as u64),
+        objects_transferred: objects_transferred as u64,
+        bytes_transferred: bytes_transferred as u64,
+        error_message,
+    })
+}
+
+impl SyncSessionRepo for SqliteMetadataStore {
+    fn create_session(&self, session: &SyncSession) -> CasResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO sync_sessions
+             (id, remote_name, direction, status, started_at, finished_at,
+              objects_transferred, bytes_transferred, error_message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                session.id,
+                session.remote_name,
+                session.direction.as_str(),
+                session.status.as_str(),
+                session.started_at as i64,
+                session.finished_at.map(|v| v as i64),
+                session.objects_transferred as i64,
+                session.bytes_transferred as i64,
+                session.error_message,
+            ],
+        )
+        .map_err(|e| {
+            if e.to_string().contains("UNIQUE") {
+                CasError::AlreadyExists
+            } else {
+                CasError::Store(e.to_string())
+            }
+        })?;
+        Ok(())
+    }
+
+    fn update_session(&self, session: &SyncSession) -> CasResult<()> {
+        let conn = self.conn.lock();
+        let n = conn
+            .execute(
+                "UPDATE sync_sessions SET
+                    status = ?2,
+                    finished_at = ?3,
+                    objects_transferred = ?4,
+                    bytes_transferred = ?5,
+                    error_message = ?6
+                 WHERE id = ?1",
+                params![
+                    session.id,
+                    session.status.as_str(),
+                    session.finished_at.map(|v| v as i64),
+                    session.objects_transferred as i64,
+                    session.bytes_transferred as i64,
+                    session.error_message,
+                ],
+            )
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        if n == 0 {
+            return Err(CasError::NotFound(format!("sync session {}", session.id)));
+        }
+        Ok(())
+    }
+
+    fn get_session(&self, id: &str) -> CasResult<Option<SyncSession>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, remote_name, direction, status, started_at, finished_at,
+                        objects_transferred, bytes_transferred, error_message
+                 FROM sync_sessions WHERE id = ?1",
+            )
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        stmt.query_row(params![id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })
+        .optional()
+        .map_err(|e| CasError::Store(e.to_string()))?
+        .map(|(id, rn, dir, st, sa, fa, ot, bt, em)| {
+            row_to_sync_session(id, rn, dir, st, sa, fa, ot, bt, em)
+        })
+        .transpose()
+    }
+
+    fn list_sync_sessions(
+        &self,
+        remote: Option<&str>,
+        limit: usize,
+    ) -> CasResult<Vec<SyncSession>> {
+        let conn = self.conn.lock();
+        let limit_i64 = limit as i64;
+        let rows: Vec<_> = if let Some(r) = remote {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, remote_name, direction, status, started_at, finished_at,
+                            objects_transferred, bytes_transferred, error_message
+                     FROM sync_sessions WHERE remote_name = ?1
+                     ORDER BY started_at DESC LIMIT ?2",
+                )
+                .map_err(|e| CasError::Store(e.to_string()))?;
+            stmt.query_map(params![r, limit_i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(|e| CasError::Store(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| CasError::Store(e.to_string()))?
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, remote_name, direction, status, started_at, finished_at,
+                            objects_transferred, bytes_transferred, error_message
+                     FROM sync_sessions
+                     ORDER BY started_at DESC LIMIT ?1",
+                )
+                .map_err(|e| CasError::Store(e.to_string()))?;
+            stmt.query_map(params![limit_i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(|e| CasError::Store(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| CasError::Store(e.to_string()))?
+        };
+
+        rows.into_iter()
+            .map(|(id, rn, dir, st, sa, fa, ot, bt, em)| {
+                row_to_sync_session(id, rn, dir, st, sa, fa, ot, bt, em)
+            })
+            .collect()
     }
 }
 

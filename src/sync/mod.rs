@@ -4,6 +4,9 @@ pub mod reachable;
 /// Fast-forward detection for ref updates (always compiled).
 pub mod fast_forward;
 
+/// Sync session log helpers (always compiled — uses SQLite metadata store).
+pub mod session;
+
 /// Remote configuration management (CRUD for remote endpoints).
 pub mod remote;
 

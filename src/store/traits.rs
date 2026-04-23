@@ -303,3 +303,110 @@ impl<T: RemoteTrackingRepo + ?Sized> RemoteTrackingRepo for Arc<T> {
         (**self).delete_remote_ref(remote_name, ref_name)
     }
 }
+
+// ─── Sync session log (E04-S06) ──────────────────────────────────────────────
+
+/// Direction of a sync operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncDirection {
+    Push,
+    Pull,
+}
+
+impl SyncDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncDirection::Push => "push",
+            SyncDirection::Pull => "pull",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "push" => Some(Self::Push),
+            "pull" => Some(Self::Pull),
+            _ => None,
+        }
+    }
+}
+
+/// Lifecycle status of a sync session.
+///
+/// Mirrors the `sync_sessions.status` CHECK constraint in the SQLite schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncSessionStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+impl SyncSessionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncSessionStatus::Running => "running",
+            SyncSessionStatus::Completed => "completed",
+            SyncSessionStatus::Failed => "failed",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One row in the `sync_sessions` table.
+#[derive(Clone, Debug)]
+pub struct SyncSession {
+    pub id: String,
+    pub remote_name: String,
+    pub direction: SyncDirection,
+    pub status: SyncSessionStatus,
+    pub started_at: u64,
+    pub finished_at: Option<u64>,
+    pub objects_transferred: u64,
+    pub bytes_transferred: u64,
+    pub error_message: Option<String>,
+}
+
+/// Storage for sync session log entries.
+pub trait SyncSessionRepo: Send + Sync {
+    /// Insert a new session row (status defaults to `Running`).
+    fn create_session(&self, session: &SyncSession) -> CasResult<()>;
+
+    /// Update an existing session: status, finished_at, transferred counts,
+    /// and error message.
+    fn update_session(&self, session: &SyncSession) -> CasResult<()>;
+
+    /// Look up a session by id.
+    fn get_session(&self, id: &str) -> CasResult<Option<SyncSession>>;
+
+    /// List recent sessions, optionally filtered by remote name.
+    /// Most-recent first; `limit` caps the result count.
+    fn list_sync_sessions(
+        &self,
+        remote: Option<&str>,
+        limit: usize,
+    ) -> CasResult<Vec<SyncSession>>;
+}
+
+impl<T: SyncSessionRepo + ?Sized> SyncSessionRepo for Arc<T> {
+    fn create_session(&self, session: &SyncSession) -> CasResult<()> {
+        (**self).create_session(session)
+    }
+    fn update_session(&self, session: &SyncSession) -> CasResult<()> {
+        (**self).update_session(session)
+    }
+    fn get_session(&self, id: &str) -> CasResult<Option<SyncSession>> {
+        (**self).get_session(id)
+    }
+    fn list_sync_sessions(
+        &self,
+        remote: Option<&str>,
+        limit: usize,
+    ) -> CasResult<Vec<SyncSession>> {
+        (**self).list_sync_sessions(remote, limit)
+    }
+}
