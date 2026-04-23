@@ -1,0 +1,650 @@
+//! End-to-end integration tests for the Push / Pull sync protocol (E04-S07).
+//!
+//! ## Test architecture
+//! 1. Spin up a tonic gRPC server backed by in-memory stores on an ephemeral
+//!    TCP port (`127.0.0.1:0`).
+//! 2. Run [`PushClient`] against it from a "client A" with its own in-memory
+//!    stores.
+//! 3. Run [`PullClient`] against the same server from a "client B" with its
+//!    own in-memory stores.
+//! 4. Assert byte-for-byte equality of every chunk / tree / node / version
+//!    that travelled through the round-trip.
+//!
+//! All RPCs are dispatched through a `CombinedSyncHandler` that delegates the
+//! Push-side calls to [`PushServiceHandler`] and the Pull-side calls to
+//! [`PullServiceHandler`].
+
+#![cfg(feature = "cloud")]
+
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axiom_core::error::CasError;
+use axiom_core::model::{
+    NodeEntry, NodeKind, Ref, RefKind, TreeNode, TreeNodeKind, VersionId, VersionNode,
+};
+use axiom_core::store::memory::{
+    InMemoryChunkStore, InMemoryNodeStore, InMemoryRefRepo, InMemoryTreeStore,
+    InMemoryVersionRepo,
+};
+use axiom_core::store::traits::{
+    ChunkStore, NodeStore, RefRepo, RemoteTrackingRepo, TreeStore, VersionRepo,
+};
+use axiom_core::sync::SyncServiceServer;
+use axiom_core::sync::proto::{
+    CloneDownloadRequest, CloneDownloadResponse, CloneInitRequest, CloneInitResponse,
+    DownloadPackRequest, DownloadPackResponse, FinalizeRefsRequest, FinalizeRefsResponse,
+    ListRefsRequest, ListRefsResponse, NegotiatePullRequest, NegotiatePullResponse,
+    NegotiatePushRequest, NegotiatePushResponse, UploadPackRequest, UploadPackResponse,
+};
+use axiom_core::sync::proto::sync_service_server::SyncService;
+use axiom_core::sync::pull_client::{PullClient, PullConfig};
+use axiom_core::sync::pull_server::{PullServiceHandler, PullServiceState};
+use axiom_core::sync::push_client::{PushClient, PushConfig};
+use axiom_core::sync::push_server::{PushServiceHandler, PushServiceState};
+
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::{Endpoint, Server};
+use tonic::{Request, Response, Status};
+
+// ─── Combined SyncService handler ─────────────────────────────────────────────
+
+/// Routes Push RPCs to `PushServiceHandler` and Pull RPCs to
+/// `PullServiceHandler`.  Both handlers share the same backing stores via
+/// `Arc<dyn …>`, so the server appears as a single workspace to clients.
+struct CombinedSyncHandler {
+    push: PushServiceHandler,
+    pull: PullServiceHandler,
+}
+
+#[tonic::async_trait]
+impl SyncService for CombinedSyncHandler {
+    // ── Push side ─────────────────────────────────────────────────────────
+    async fn list_refs(
+        &self,
+        req: Request<ListRefsRequest>,
+    ) -> Result<Response<ListRefsResponse>, Status> {
+        self.push.list_refs(req).await
+    }
+
+    async fn negotiate_push(
+        &self,
+        req: Request<NegotiatePushRequest>,
+    ) -> Result<Response<NegotiatePushResponse>, Status> {
+        self.push.negotiate_push(req).await
+    }
+
+    async fn upload_pack(
+        &self,
+        req: tonic::Request<tonic::Streaming<UploadPackRequest>>,
+    ) -> Result<Response<UploadPackResponse>, Status> {
+        self.push.upload_pack(req).await
+    }
+
+    async fn finalize_refs(
+        &self,
+        req: Request<FinalizeRefsRequest>,
+    ) -> Result<Response<FinalizeRefsResponse>, Status> {
+        self.push.finalize_refs(req).await
+    }
+
+    // ── Pull side ─────────────────────────────────────────────────────────
+    async fn negotiate_pull(
+        &self,
+        req: Request<NegotiatePullRequest>,
+    ) -> Result<Response<NegotiatePullResponse>, Status> {
+        self.pull.negotiate_pull(req).await
+    }
+
+    type DownloadPackStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<DownloadPackResponse, Status>> + Send>>;
+
+    async fn download_pack(
+        &self,
+        req: Request<DownloadPackRequest>,
+    ) -> Result<Response<Self::DownloadPackStream>, Status> {
+        let resp = self.pull.download_pack(req).await?;
+        let inner = resp.into_inner();
+        let boxed: Self::DownloadPackStream = Box::pin(inner);
+        Ok(Response::new(boxed))
+    }
+
+    // ── Clone (unimplemented stubs) ───────────────────────────────────────
+    async fn clone_init(
+        &self,
+        _req: Request<CloneInitRequest>,
+    ) -> Result<Response<CloneInitResponse>, Status> {
+        Err(Status::unimplemented("clone not implemented"))
+    }
+
+    type CloneDownloadStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<CloneDownloadResponse, Status>> + Send>>;
+
+    async fn clone_download(
+        &self,
+        _req: Request<CloneDownloadRequest>,
+    ) -> Result<Response<Self::CloneDownloadStream>, Status> {
+        Err(Status::unimplemented("clone not implemented"))
+    }
+}
+
+// ─── Test harness ─────────────────────────────────────────────────────────────
+
+/// Bundle of the four object stores + ref repo used by both clients.
+#[derive(Clone)]
+struct Backends {
+    chunks: Arc<InMemoryChunkStore>,
+    trees: Arc<InMemoryTreeStore>,
+    nodes: Arc<InMemoryNodeStore>,
+    versions: Arc<InMemoryVersionRepo>,
+    refs: Arc<InMemoryRefRepo>,
+}
+
+impl Backends {
+    fn new() -> Self {
+        Self {
+            chunks: Arc::new(InMemoryChunkStore::default()),
+            trees: Arc::new(InMemoryTreeStore::default()),
+            nodes: Arc::new(InMemoryNodeStore::default()),
+            versions: Arc::new(InMemoryVersionRepo::new()),
+            refs: Arc::new(InMemoryRefRepo::default()),
+        }
+    }
+}
+
+/// In-memory remote-tracking repo for tests.
+#[derive(Default)]
+struct InMemoryRemoteTracking {
+    inner: parking_lot::RwLock<
+        HashMap<(String, String), axiom_core::store::traits::RemoteRef>,
+    >,
+}
+
+impl RemoteTrackingRepo for InMemoryRemoteTracking {
+    fn update_remote_ref(
+        &self,
+        r: &axiom_core::store::traits::RemoteRef,
+    ) -> Result<(), CasError> {
+        self.inner
+            .write()
+            .insert((r.remote_name.clone(), r.ref_name.clone()), r.clone());
+        Ok(())
+    }
+    fn get_remote_ref(
+        &self,
+        remote_name: &str,
+        ref_name: &str,
+    ) -> Result<Option<axiom_core::store::traits::RemoteRef>, CasError> {
+        Ok(self
+            .inner
+            .read()
+            .get(&(remote_name.to_string(), ref_name.to_string()))
+            .cloned())
+    }
+    fn list_remote_refs(
+        &self,
+        remote_name: &str,
+    ) -> Result<Vec<axiom_core::store::traits::RemoteRef>, CasError> {
+        Ok(self
+            .inner
+            .read()
+            .iter()
+            .filter(|((rn, _), _)| rn == remote_name)
+            .map(|(_, v)| v.clone())
+            .collect())
+    }
+    fn delete_remote_ref(&self, remote_name: &str, ref_name: &str) -> Result<(), CasError> {
+        self.inner
+            .write()
+            .remove(&(remote_name.to_string(), ref_name.to_string()));
+        Ok(())
+    }
+}
+
+/// Spawn an in-process gRPC server and return its TCP address.
+async fn spawn_server(server: Backends) -> std::net::SocketAddr {
+    let push_state = PushServiceState {
+        chunks: server.chunks.clone(),
+        trees: server.trees.clone(),
+        nodes: server.nodes.clone(),
+        versions: server.versions.clone(),
+        refs: server.refs.clone(),
+    };
+    let pull_state = PullServiceState {
+        chunks: server.chunks.clone(),
+        trees: server.trees.clone(),
+        nodes: server.nodes.clone(),
+        versions: server.versions.clone(),
+        refs: server.refs.clone(),
+    };
+    let handler = CombinedSyncHandler {
+        push: PushServiceHandler::new(push_state),
+        pull: PullServiceHandler::new(pull_state),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = TcpListenerStream::new(listener);
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(SyncServiceServer::new(handler))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    // Give the server a moment to start accepting connections.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
+async fn connect_push(addr: std::net::SocketAddr) -> PushClient {
+    let endpoint = Endpoint::from_shared(format!("http://{addr}")).unwrap();
+    PushClient::connect(endpoint).await.unwrap()
+}
+
+async fn connect_pull(addr: std::net::SocketAddr) -> PullClient {
+    let endpoint = Endpoint::from_shared(format!("http://{addr}")).unwrap();
+    PullClient::connect(endpoint).await.unwrap()
+}
+
+// ─── Fixture builders ─────────────────────────────────────────────────────────
+
+/// Insert a complete tiny version graph into `b`:
+/// - 1 chunk of `data`
+/// - 1 leaf tree node referencing that chunk
+/// - 1 file node entry referencing the tree
+/// - 1 version pointing at the node entry
+/// - 1 branch ref `main` pointing at the version
+///
+/// Returns the new version id (hex 64-char so it round-trips through the
+/// 32-byte proto envelope).
+fn seed_branch(b: &Backends, branch: &str, data: &[u8], parents: Vec<VersionId>) -> VersionId {
+    // Chunk
+    let chunk_hash = b.chunks.put_chunk(data.to_vec()).unwrap();
+
+    // Tree node (leaf)
+    let tree_hash = blake3::hash(&[chunk_hash.as_bytes().as_slice(), branch.as_bytes()].concat());
+    let tree = TreeNode {
+        hash: tree_hash,
+        kind: TreeNodeKind::Leaf { chunk: chunk_hash },
+    };
+    b.trees.put_tree_node(&tree).unwrap();
+
+    // Node entry — File variant
+    let entry_hash = blake3::hash(format!("entry-{branch}-{}", data.len()).as_bytes());
+    let entry = NodeEntry {
+        hash: entry_hash,
+        kind: NodeKind::File {
+            root: tree.hash,
+            size: data.len() as u64,
+        },
+    };
+    b.nodes.put_node(&entry).unwrap();
+
+    // Version (id = BLAKE3 hex of unique input → 64-char hex)
+    let vid_input = format!("{branch}-{}-{}", data.len(), parents.len());
+    let vid_hash = blake3::hash(vid_input.as_bytes());
+    let vid = VersionId(hex::encode(vid_hash.as_bytes()));
+    let v = VersionNode {
+        id: vid.clone(),
+        parents,
+        root: entry.hash,
+        message: format!("commit on {branch}"),
+        timestamp: 0,
+        metadata: HashMap::new(),
+    };
+    b.versions.put_version(&v).unwrap();
+
+    // Branch ref
+    b.refs
+        .put_ref(&Ref {
+            name: branch.into(),
+            kind: RefKind::Branch,
+            target: vid.clone(),
+        })
+        .unwrap();
+
+    vid
+}
+
+fn cfg_push(force: bool) -> PushConfig {
+    PushConfig {
+        remote_name: "origin".into(),
+        workspace_id: "default".into(),
+        tenant_id: "test".into(),
+        force,
+    }
+}
+
+fn cfg_pull() -> PullConfig {
+    PullConfig {
+        remote_name: "origin".into(),
+        workspace_id: "default".into(),
+        tenant_id: "test".into(),
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn push_then_pull_roundtrip_byte_for_byte() {
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    // Client A: seed + push.
+    let client_a = Backends::new();
+    let vid_a = seed_branch(&client_a, "main", b"hello world", vec![]);
+
+    let mut push = connect_push(addr).await;
+    let tracking_a = InMemoryRemoteTracking::default();
+    let results = push
+        .push(
+            &cfg_push(false),
+            &[],
+            client_a.refs.as_ref(),
+            client_a.chunks.as_ref(),
+            client_a.trees.as_ref(),
+            client_a.nodes.as_ref(),
+            client_a.versions.as_ref(),
+            Some(&tracking_a),
+            |_| {},
+        )
+        .await
+        .expect("push ok");
+
+    assert_eq!(results.get("main").map(String::as_str), Some("ok"));
+    assert!(server.refs.get_ref("main").unwrap().is_some());
+    assert_eq!(server.refs.get_ref("main").unwrap().unwrap().target, vid_a);
+
+    // Client B: pull into empty stores.
+    let client_b = Backends::new();
+    let tracking_b = InMemoryRemoteTracking::default();
+    let mut pull = connect_pull(addr).await;
+    let pulled = pull
+        .pull(
+            &cfg_pull(),
+            &[],
+            client_b.refs.as_ref(),
+            &tracking_b,
+            client_b.chunks.as_ref(),
+            client_b.trees.as_ref(),
+            client_b.nodes.as_ref(),
+            client_b.versions.as_ref(),
+            |_| {},
+        )
+        .await
+        .expect("pull ok");
+
+    assert_eq!(pulled.len(), 1);
+    assert_eq!(pulled[0].ref_name, "main");
+    assert_eq!(pulled[0].remote_tip, vid_a);
+    assert!(pulled[0].fast_forwarded);
+
+    // Local branch was fast-forwarded.
+    assert_eq!(client_b.refs.get_ref("main").unwrap().unwrap().target, vid_a);
+
+    // Byte-for-byte version content matches.
+    let v_a = client_a.versions.get_version(&vid_a).unwrap().unwrap();
+    let v_b = client_b.versions.get_version(&vid_a).unwrap().unwrap();
+    assert_eq!(v_a.id, v_b.id);
+    assert_eq!(v_a.root, v_b.root);
+    assert_eq!(v_a.message, v_b.message);
+    assert_eq!(v_a.parents, v_b.parents);
+}
+
+#[tokio::test]
+async fn empty_push_when_no_local_refs_is_noop() {
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    let client_a = Backends::new(); // no refs, no objects
+    let mut push = connect_push(addr).await;
+    let results = push
+        .push(
+            &cfg_push(false),
+            &[],
+            client_a.refs.as_ref(),
+            client_a.chunks.as_ref(),
+            client_a.trees.as_ref(),
+            client_a.nodes.as_ref(),
+            client_a.versions.as_ref(),
+            None,
+            |_| {},
+        )
+        .await
+        .expect("empty push ok");
+    assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn non_fast_forward_push_is_rejected() {
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    // Client A pushes initial commit.
+    let client_a = Backends::new();
+    seed_branch(&client_a, "main", b"v1", vec![]);
+    let mut push_a = connect_push(addr).await;
+    push_a
+        .push(
+            &cfg_push(false),
+            &[],
+            client_a.refs.as_ref(),
+            client_a.chunks.as_ref(),
+            client_a.trees.as_ref(),
+            client_a.nodes.as_ref(),
+            client_a.versions.as_ref(),
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+    // Client B has a different (forked) commit on main, also with empty parents,
+    // so its tip is NOT a descendant of A's tip → server must reject as
+    // non-fast-forward.
+    let client_b = Backends::new();
+    seed_branch(&client_b, "main", b"v2-different", vec![]);
+    let mut push_b = connect_push(addr).await;
+
+    let err = push_b
+        .push(
+            &cfg_push(false),
+            &[],
+            client_b.refs.as_ref(),
+            client_b.chunks.as_ref(),
+            client_b.trees.as_ref(),
+            client_b.nodes.as_ref(),
+            client_b.versions.as_ref(),
+            None,
+            |_| {},
+        )
+        .await
+        .expect_err("should reject");
+    assert!(matches!(err, CasError::NonFastForward(_)));
+}
+
+#[tokio::test]
+async fn force_push_overrides_non_fast_forward() {
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    // Client A pushes initial.
+    let client_a = Backends::new();
+    seed_branch(&client_a, "main", b"v1", vec![]);
+    let mut push_a = connect_push(addr).await;
+    push_a
+        .push(
+            &cfg_push(false),
+            &[],
+            client_a.refs.as_ref(),
+            client_a.chunks.as_ref(),
+            client_a.trees.as_ref(),
+            client_a.nodes.as_ref(),
+            client_a.versions.as_ref(),
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+    // Client B forks and force-pushes.
+    let client_b = Backends::new();
+    let vid_b = seed_branch(&client_b, "main", b"v2-forced", vec![]);
+    let mut push_b = connect_push(addr).await;
+    let results = push_b
+        .push(
+            &cfg_push(true), // force
+            &[],
+            client_b.refs.as_ref(),
+            client_b.chunks.as_ref(),
+            client_b.trees.as_ref(),
+            client_b.nodes.as_ref(),
+            client_b.versions.as_ref(),
+            None,
+            |_| {},
+        )
+        .await
+        .expect("force push ok");
+    assert_eq!(results.get("main").map(String::as_str), Some("ok"));
+
+    // Server now points at B's version.
+    assert_eq!(
+        server.refs.get_ref("main").unwrap().unwrap().target,
+        vid_b
+    );
+}
+
+#[tokio::test]
+async fn progress_callback_invoked_for_push_and_pull() {
+    use std::sync::Mutex;
+
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    let client_a = Backends::new();
+    seed_branch(&client_a, "main", b"hello", vec![]);
+
+    // Push: collect stages.
+    let push_stages = Arc::new(Mutex::new(Vec::new()));
+    let push_stages_clone = Arc::clone(&push_stages);
+
+    let mut push = connect_push(addr).await;
+    push.push(
+        &cfg_push(false),
+        &[],
+        client_a.refs.as_ref(),
+        client_a.chunks.as_ref(),
+        client_a.trees.as_ref(),
+        client_a.nodes.as_ref(),
+        client_a.versions.as_ref(),
+        None,
+        move |p| {
+            push_stages_clone
+                .lock()
+                .unwrap()
+                .push(format!("{:?}", p.stage));
+        },
+    )
+    .await
+    .unwrap();
+
+    let stages = push_stages.lock().unwrap();
+    assert!(stages.iter().any(|s| s.starts_with("ListingRefs")));
+    assert!(stages.iter().any(|s| s.starts_with("Negotiating")));
+    assert!(stages.iter().any(|s| s.starts_with("Uploading")));
+    assert!(stages.iter().any(|s| s.starts_with("Finalizing")));
+    assert!(stages.iter().any(|s| s.starts_with("Done")));
+    drop(stages);
+
+    // Pull: collect stages.
+    let client_b = Backends::new();
+    let tracking_b = InMemoryRemoteTracking::default();
+    let pull_stages = Arc::new(Mutex::new(Vec::new()));
+    let pull_stages_clone = Arc::clone(&pull_stages);
+
+    let mut pull = connect_pull(addr).await;
+    pull.pull(
+        &cfg_pull(),
+        &[],
+        client_b.refs.as_ref(),
+        &tracking_b,
+        client_b.chunks.as_ref(),
+        client_b.trees.as_ref(),
+        client_b.nodes.as_ref(),
+        client_b.versions.as_ref(),
+        move |p| {
+            pull_stages_clone
+                .lock()
+                .unwrap()
+                .push(format!("{:?}", p.stage));
+        },
+    )
+    .await
+    .unwrap();
+
+    let stages = pull_stages.lock().unwrap();
+    assert!(stages.iter().any(|s| s.starts_with("ListingRefs")));
+    assert!(stages.iter().any(|s| s.starts_with("Negotiating")));
+    assert!(stages.iter().any(|s| s.starts_with("Downloading")));
+    assert!(stages.iter().any(|s| s.starts_with("Done")));
+}
+
+#[tokio::test]
+async fn push_updates_remote_tracking_refs() {
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    let client_a = Backends::new();
+    let vid = seed_branch(&client_a, "main", b"track-me", vec![]);
+
+    let tracking = InMemoryRemoteTracking::default();
+    let mut push = connect_push(addr).await;
+    push.push(
+        &cfg_push(false),
+        &[],
+        client_a.refs.as_ref(),
+        client_a.chunks.as_ref(),
+        client_a.trees.as_ref(),
+        client_a.nodes.as_ref(),
+        client_a.versions.as_ref(),
+        Some(&tracking),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    let rr = tracking.get_remote_ref("origin", "main").unwrap().unwrap();
+    assert_eq!(rr.target, vid);
+    assert_eq!(rr.remote_name, "origin");
+}
+
+#[tokio::test]
+async fn pull_from_empty_remote_returns_no_refs() {
+    let server = Backends::new(); // no refs at all
+    let addr = spawn_server(server.clone()).await;
+
+    let client_b = Backends::new();
+    let tracking_b = InMemoryRemoteTracking::default();
+    let mut pull = connect_pull(addr).await;
+    let results = pull
+        .pull(
+            &cfg_pull(),
+            &[],
+            client_b.refs.as_ref(),
+            &tracking_b,
+            client_b.chunks.as_ref(),
+            client_b.trees.as_ref(),
+            client_b.nodes.as_ref(),
+            client_b.versions.as_ref(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+    assert!(results.is_empty());
+}
