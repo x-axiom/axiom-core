@@ -16,13 +16,24 @@
 //! For the purposes of this implementation the session map lives in-process.
 //! A production deployment would use a distributed lock (e.g. FoundationDB
 //! CAS) — see the design doc for details.
+//!
+//! ### Known limitation: ref-update race
+//! `FinalizeRefs` performs `get_ref → fast-forward check → put_ref` without
+//! a CAS primitive on `RefRepo`, so two concurrent finalizations on the same
+//! ref can both observe the old tip and both call `put_ref` (last writer
+//! silently wins). The fix requires `RefRepo::compare_and_swap_ref` backed
+//! by an atomic backend op (FDB transaction). Tracked under E06-S02 and the
+//! deferral note on E04-S07. Do not patch around it with an in-process
+//! Mutex — that hides the race rather than detecting it.
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
+use parking_lot::Mutex;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::error::{CasError, CasResult};
@@ -133,13 +144,24 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Monotonic counter to disambiguate session IDs minted within the same
+/// nanosecond. Combined with full-precision wall-clock nanoseconds it gives
+/// collision-free session IDs even under high concurrency.
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn new_session_id() -> String {
-    // Deterministic-enough for in-process use: BLAKE3 of current nanos.
-    let ns = SystemTime::now()
+    // Use full-precision (u128) wall-clock nanoseconds plus a process-wide
+    // monotonic counter. Hashing both into BLAKE3 yields a fixed-width hex
+    // session id that is collision-free in practice.
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    hex::encode(blake3::hash(&ns.to_le_bytes()).as_bytes())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut buf = [0u8; 24];
+    buf[..16].copy_from_slice(&nanos.to_le_bytes());
+    buf[16..].copy_from_slice(&counter.to_le_bytes());
+    hex::encode(blake3::hash(&buf).as_bytes())
 }
 
 /// Extract a VersionId from the `hash` bytes of a proto `ObjectId`.
@@ -371,7 +393,7 @@ impl SyncService for PushServiceHandler {
         // ③ Create session.
         let session_id = new_session_id();
         {
-            let mut sessions = self.sessions.lock().unwrap();
+            let mut sessions = self.sessions.lock();
             sessions.insert(
                 session_id.clone(),
                 PushSession {
@@ -406,6 +428,18 @@ impl SyncService for PushServiceHandler {
             let msg = msg.map_err(|e| Status::internal(e.to_string()))?;
             match msg.payload {
                 Some(Payload::Header(hdr)) => {
+                    // Validate the session_id refers to a live NegotiatePush.
+                    // Without this check, any client could push raw objects
+                    // bypassing negotiation and the per-session quota.
+                    {
+                        let sessions = self.sessions.lock();
+                        if !sessions.contains_key(&hdr.session_id) {
+                            return Err(Status::not_found(format!(
+                                "unknown push session '{}'",
+                                hdr.session_id
+                            )));
+                        }
+                    }
                     session_id = hdr.session_id.clone();
                 }
                 Some(Payload::Entry(entry)) => {
@@ -522,11 +556,16 @@ impl SyncService for PushServiceHandler {
     ) -> Result<Response<FinalizeRefsResponse>, Status> {
         let req = request.into_inner();
 
-        // Look up (and remove) the push session.
+        // Look up (and remove) the push session. A missing session means the
+        // client never called NegotiatePush — reject so the per-session
+        // mismatch / quota guards below are never bypassed.
         let session = {
-            let mut sessions = self.sessions.lock().unwrap();
+            let mut sessions = self.sessions.lock();
             sessions.remove(&req.session_id)
-        };
+        }
+        .ok_or_else(|| {
+            Status::not_found(format!("unknown push session '{}'", req.session_id))
+        })?;
 
         // Per-ref result accumulator.
         let mut results: Vec<RefUpdateResult> = Vec::new();
@@ -540,16 +579,23 @@ impl SyncService for PushServiceHandler {
             );
 
             // Verify the session recorded this update (guards against TOCTOU).
-            let session_update = session.as_ref().and_then(|s| s.ref_updates.get(&upd.ref_name));
-            if let Some(su) = session_update {
-                if su.new_target != new_vid {
-                    results.push(RefUpdateResult {
-                        ref_name: upd.ref_name.clone(),
-                        status: "error".into(),
-                        message: "session target mismatch".into(),
-                    });
-                    continue;
-                }
+            // The ref must have been declared in NegotiatePush, otherwise the
+            // client is trying to advance a ref the server never validated.
+            let Some(su) = session.ref_updates.get(&upd.ref_name) else {
+                results.push(RefUpdateResult {
+                    ref_name: upd.ref_name.clone(),
+                    status: "error".into(),
+                    message: "ref not declared in NegotiatePush".into(),
+                });
+                continue;
+            };
+            if su.new_target != new_vid {
+                results.push(RefUpdateResult {
+                    ref_name: upd.ref_name.clone(),
+                    status: "error".into(),
+                    message: "session target mismatch".into(),
+                });
+                continue;
             }
 
             // Re-check fast-forward (server state may have changed since NegotiatePush).

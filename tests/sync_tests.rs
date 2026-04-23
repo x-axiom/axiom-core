@@ -817,3 +817,65 @@ async fn failed_push_records_failed_session() {
     assert!(failed.error_message.is_some());
     assert!(failed.finished_at.is_some());
 }
+
+// ─── Server-side safety guards (B2 / B3 regressions) ─────────────────────────
+
+#[tokio::test]
+async fn upload_pack_rejects_unknown_session_id() {
+    use axiom_core::sync::SyncServiceClient;
+    use axiom_core::sync::proto::{PackHeader, upload_pack_request::Payload};
+
+    let server = Backends::new();
+    let addr = spawn_server(server).await;
+
+    let endpoint = Endpoint::from_shared(format!("http://{addr}")).unwrap();
+    let mut client = SyncServiceClient::connect(endpoint).await.unwrap();
+
+    // Stream a single Header carrying a fabricated session_id that the server
+    // never minted. Handler must refuse at the header stage — before accepting
+    // any object entries — otherwise raw objects could be written bypassing
+    // NegotiatePush's quota / ref validation.
+    let stream = tokio_stream::iter(vec![UploadPackRequest {
+        payload: Some(Payload::Header(PackHeader {
+            object_count: 0,
+            estimated_bytes: 0,
+            session_id: "never-negotiated".into(),
+        })),
+    }]);
+    let err = client
+        .upload_pack(Request::new(stream))
+        .await
+        .expect_err("upload without valid session must fail");
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "expected NotFound, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn finalize_refs_rejects_unknown_session_id() {
+    use axiom_core::sync::SyncServiceClient;
+
+    let server = Backends::new();
+    let addr = spawn_server(server).await;
+
+    let endpoint = Endpoint::from_shared(format!("http://{addr}")).unwrap();
+    let mut client = SyncServiceClient::connect(endpoint).await.unwrap();
+
+    // Call FinalizeRefs with a session_id that was never created.
+    let err = client
+        .finalize_refs(Request::new(FinalizeRefsRequest {
+            session_id: "bogus-session".into(),
+            workspace_id: String::new(),
+            tenant_id: String::new(),
+            ref_updates: vec![],
+        }))
+        .await
+        .expect_err("finalize with unknown session must fail");
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "expected NotFound, got: {err:?}"
+    );
+}

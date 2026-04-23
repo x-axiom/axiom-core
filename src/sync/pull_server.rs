@@ -13,10 +13,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
+use parking_lot::Mutex;
 use tonic::{Request, Response, Status};
 
 use crate::error::{CasError, CasResult};
@@ -89,12 +91,20 @@ impl PullServiceHandler {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Monotonic counter to disambiguate session IDs minted within the same
+/// nanosecond. See [`crate::sync::push_server`] for rationale.
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn new_session_id() -> String {
-    let ns = SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    hex::encode(blake3::hash(&ns.to_le_bytes()).as_bytes())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut buf = [0u8; 24];
+    buf[..16].copy_from_slice(&nanos.to_le_bytes());
+    buf[16..].copy_from_slice(&counter.to_le_bytes());
+    hex::encode(blake3::hash(&buf).as_bytes())
 }
 
 fn cas_err_to_status(e: CasError) -> Status {
@@ -179,7 +189,7 @@ impl SyncService for PullServiceHandler {
         if want_vids.is_empty() {
             let session_id = new_session_id();
             {
-                let mut sessions = self.sessions.lock().unwrap();
+                let mut sessions = self.sessions.lock();
                 sessions.insert(session_id.clone(), PullSession { objects: vec![] });
             }
             return Ok(Response::new(NegotiatePullResponse {
@@ -223,7 +233,7 @@ impl SyncService for PullServiceHandler {
 
         let session_id = new_session_id();
         {
-            let mut sessions = self.sessions.lock().unwrap();
+            let mut sessions = self.sessions.lock();
             sessions.insert(session_id.clone(), PullSession { objects });
         }
 
@@ -245,7 +255,7 @@ impl SyncService for PullServiceHandler {
         let req = request.into_inner();
 
         let session = {
-            let mut sessions = self.sessions.lock().unwrap();
+            let mut sessions = self.sessions.lock();
             sessions.remove(&req.session_id)
         }
         .ok_or_else(|| Status::not_found(format!("session '{}' not found", req.session_id)))?;
