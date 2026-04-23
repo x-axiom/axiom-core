@@ -21,7 +21,7 @@ use tonic::{Request, Response, Status};
 
 use crate::error::{CasError, CasResult};
 use crate::model::{NodeEntry, TreeNode, VersionId, VersionNode};
-use crate::store::traits::{ChunkStore, NodeStore, RefRepo, TreeStore, VersionRepo};
+use crate::store::traits::{ChunkStore, NodeStore, RefRepo, SyncStore, TreeStore, VersionRepo};
 use crate::sync::proto::{
     CloneDownloadRequest, CloneDownloadResponse, CloneInitRequest, CloneInitResponse,
     DownloadPackRequest, DownloadPackResponse, FinalizeRefsRequest, FinalizeRefsResponse,
@@ -31,7 +31,6 @@ use crate::sync::proto::{
     download_pack_response::Payload,
 };
 use crate::sync::proto::sync_service_server::SyncService;
-use crate::sync::reachable::{CancelToken, collect_reachable};
 
 // ─── Proto ObjectType constants ──────────────────────────────────────────────
 const PROTO_TYPE_CHUNK: i32 = 1;
@@ -61,6 +60,9 @@ pub struct PullServiceState {
     pub nodes: Arc<dyn NodeStore>,
     pub versions: Arc<dyn VersionRepo>,
     pub refs: Arc<dyn RefRepo>,
+    /// Sync graph walker. Used by `NegotiatePull` to compute the diff between
+    /// `want` and the client's `have` set.
+    pub sync: Arc<dyn SyncStore>,
 }
 
 // ─── PullServiceHandler ──────────────────────────────────────────────────────
@@ -188,15 +190,11 @@ impl SyncService for PullServiceHandler {
         }
 
         // BFS to collect all objects the client is missing.
-        let reachable = collect_reachable(
-            &want_vids,
-            &have_vids,
-            self.state.versions.as_ref(),
-            self.state.trees.as_ref(),
-            self.state.nodes.as_ref(),
-            &CancelToken::new(),
-        )
-        .map_err(cas_err_to_status)?;
+        let reachable = self
+            .state
+            .sync
+            .collect_reachable_with_have(&want_vids, &have_vids)
+            .map_err(cas_err_to_status)?;
 
         // Build ordered object list: versions → tree nodes → node entries → chunks.
         // This ordering means the client can store objects in receive-order

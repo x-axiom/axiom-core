@@ -326,70 +326,21 @@ impl InMemorySyncStore {
 }
 
 impl SyncStore for InMemorySyncStore {
-    fn collect_reachable_objects(&self, roots: &[VersionId]) -> CasResult<ReachableObjects> {
-        let mut result = ReachableObjects::default();
+    fn collect_reachable_with_have(
+        &self,
+        want: &[VersionId],
+        have: &std::collections::HashSet<VersionId>,
+    ) -> CasResult<ReachableObjects> {
+        use crate::sync::reachable::{CancelToken, collect_reachable};
 
-        // BFS over version DAG
-        let mut version_queue: VecDeque<VersionId> = roots.iter().cloned().collect();
-        while let Some(vid) = version_queue.pop_front() {
-            if !result.versions.insert(vid.clone()) {
-                continue;
-            }
-            if let Some(version) = self.versions.get_version(&vid)? {
-                // Enqueue parents
-                for parent in &version.parents {
-                    if !result.versions.contains(parent) {
-                        version_queue.push_back(parent.clone());
-                    }
-                }
-                // Walk the directory tree from root node
-                let mut node_queue: VecDeque<ChunkHash> = VecDeque::new();
-                node_queue.push_back(version.root.clone());
-
-                while let Some(node_hash) = node_queue.pop_front() {
-                    if !result.node_hashes.insert(node_hash.clone()) {
-                        continue;
-                    }
-                    if let Some(entry) = self.nodes.get_node(&node_hash)? {
-                        match &entry.kind {
-                            NodeKind::File { root, .. } => {
-                                // Walk merkle tree
-                                let mut tree_queue: VecDeque<ChunkHash> = VecDeque::new();
-                                tree_queue.push_back(root.clone());
-                                while let Some(th) = tree_queue.pop_front() {
-                                    if !result.tree_hashes.insert(th.clone()) {
-                                        continue;
-                                    }
-                                    if let Some(tree_node) = self.trees.get_tree_node(&th)? {
-                                        match &tree_node.kind {
-                                            TreeNodeKind::Leaf { chunk } => {
-                                                result.chunk_hashes.insert(chunk.clone());
-                                            }
-                                            TreeNodeKind::Internal { children } => {
-                                                for child in children {
-                                                    if !result.tree_hashes.contains(child) {
-                                                        tree_queue.push_back(child.clone());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            NodeKind::Directory { children } => {
-                                for child_hash in children.values() {
-                                    if !result.node_hashes.contains(child_hash) {
-                                        node_queue.push_back(child_hash.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(result)
+        collect_reachable(
+            want,
+            have,
+            self.versions.as_ref(),
+            self.trees.as_ref(),
+            self.nodes.as_ref(),
+            &CancelToken::new(),
+        )
     }
 
     fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {

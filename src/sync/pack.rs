@@ -1,5 +1,18 @@
 //! AXPK — binary pack format encoder / decoder.
 //!
+//! ## Scope (post-E04 review, 2026-04)
+//!
+//! AXPK is **not** used on the live push/pull streaming path; that path
+//! frames objects directly inside `UploadPackRequest` / `DownloadPackResponse`
+//! gRPC messages (per-object zstd, per-object hash). AXPK is reserved for:
+//!
+//! * E05-S01 Clone bulk download — pre-built single-file pack distributed
+//!   via blob storage / CDN, client downloads once and verifies as a unit.
+//! * Offline import/export tooling (`axiom export --pack` / `axiom import`).
+//! * Future E11 GC pack rewrite — repack cold objects into AXPK archives.
+//!
+//! Do not reintroduce AXPK on the streaming push/pull path.
+//!
 //! ## Wire layout
 //!
 //! ```text

@@ -38,16 +38,16 @@ impl LocalSyncStore {
 
 #[cfg(feature = "local")]
 impl SyncStore for LocalSyncStore {
-    fn collect_reachable_objects(
+    fn collect_reachable_with_have(
         &self,
-        roots: &[crate::model::VersionId],
+        want: &[crate::model::VersionId],
+        have: &std::collections::HashSet<crate::model::VersionId>,
     ) -> crate::error::CasResult<ReachableObjects> {
-        use std::collections::HashSet;
         use crate::sync::reachable::{CancelToken, collect_reachable};
 
         collect_reachable(
-            roots,
-            &HashSet::new(),
+            want,
+            have,
             self.meta.as_ref(),
             self.cas.as_ref(),
             self.cas.as_ref(),

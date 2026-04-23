@@ -27,7 +27,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::error::{CasError, CasResult};
 use crate::model::{ChunkHash, NodeEntry, RefKind, TreeNode, VersionId, VersionNode};
-use crate::store::traits::{ChunkStore, NodeStore, RefRepo, TreeStore, VersionRepo};
+use crate::store::traits::{ChunkStore, NodeStore, RefRepo, SyncStore, TreeStore, VersionRepo};
 use crate::sync::proto::{
     FinalizeRefsRequest, FinalizeRefsResponse, ListRefsRequest, ListRefsResponse,
     NegotiatePushRequest, NegotiatePushResponse, ObjectId, ObjectList,
@@ -84,6 +84,9 @@ pub struct PushServiceState {
     pub nodes: Arc<dyn NodeStore>,
     pub versions: Arc<dyn VersionRepo>,
     pub refs: Arc<dyn RefRepo>,
+    /// Sync graph walker. Used by `NegotiatePush` to compute reachable
+    /// objects without depending on the concrete `collect_reachable` helper.
+    pub sync: Arc<dyn SyncStore>,
 }
 
 // ─── PushServiceHandler ──────────────────────────────────────────────────────
@@ -266,7 +269,6 @@ impl SyncService for PushServiceHandler {
         // server does not already have.
         {
             use std::collections::HashSet;
-            use crate::sync::reachable::{CancelToken, collect_reachable};
 
             let want_vids: Vec<VersionId> = req
                 .local_versions
@@ -280,15 +282,11 @@ impl SyncService for PushServiceHandler {
                 all_refs.into_iter().map(|r| r.target).collect()
             };
 
-            let reachable = collect_reachable(
-                &want_vids,
-                &server_have,
-                self.state.versions.as_ref(),
-                self.state.trees.as_ref(),
-                self.state.nodes.as_ref(),
-                &CancelToken::new(),
-            )
-            .map_err(cas_err_to_status)?;
+            let reachable = self
+                .state
+                .sync
+                .collect_reachable_with_have(&want_vids, &server_have)
+                .map_err(cas_err_to_status)?;
 
             for h in &reachable.chunk_hashes {
                 if !self

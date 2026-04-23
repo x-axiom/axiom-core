@@ -121,9 +121,25 @@ pub struct ReachableObjects {
 
 /// Store operations needed for the sync protocol.
 pub trait SyncStore: Send + Sync {
+    /// Walk the object graph starting from every id in `want`, stopping
+    /// whenever a version in `have` is reached. The result contains every
+    /// reachable object that is **not** transitively covered by `have`.
+    ///
+    /// Servers use this with a non-empty `have` set (the client's "I already
+    /// have these tips" boundary) so the response only contains the diff;
+    /// callers that want the full reachable closure should pass an empty
+    /// `have` set or use [`collect_reachable_objects`].
+    fn collect_reachable_with_have(
+        &self,
+        want: &[VersionId],
+        have: &HashSet<VersionId>,
+    ) -> CasResult<ReachableObjects>;
+
     /// Walk the object graph starting from `roots`, collecting all reachable
-    /// version, tree, node, and chunk hashes.
-    fn collect_reachable_objects(&self, roots: &[VersionId]) -> CasResult<ReachableObjects>;
+    /// version, tree, node, and chunk hashes (no `have` boundary).
+    fn collect_reachable_objects(&self, roots: &[VersionId]) -> CasResult<ReachableObjects> {
+        self.collect_reachable_with_have(roots, &HashSet::new())
+    }
 
     /// Return every version id known to this store.
     fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>>;
@@ -201,6 +217,13 @@ impl<T: WorkspaceRepo + ?Sized> WorkspaceRepo for Arc<T> {
 }
 
 impl<T: SyncStore + ?Sized> SyncStore for Arc<T> {
+    fn collect_reachable_with_have(
+        &self,
+        want: &[VersionId],
+        have: &HashSet<VersionId>,
+    ) -> CasResult<ReachableObjects> {
+        (**self).collect_reachable_with_have(want, have)
+    }
     fn collect_reachable_objects(&self, roots: &[VersionId]) -> CasResult<ReachableObjects> {
         (**self).collect_reachable_objects(roots)
     }

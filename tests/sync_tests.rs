@@ -208,12 +208,19 @@ impl RemoteTrackingRepo for InMemoryRemoteTracking {
 
 /// Spawn an in-process gRPC server and return its TCP address.
 async fn spawn_server(server: Backends) -> std::net::SocketAddr {
+    let sync_store: Arc<dyn axiom_core::store::traits::SyncStore> =
+        Arc::new(axiom_core::store::InMemorySyncStore::new(
+            server.versions.clone(),
+            server.trees.clone(),
+            server.nodes.clone(),
+        ));
     let push_state = PushServiceState {
         chunks: server.chunks.clone(),
         trees: server.trees.clone(),
         nodes: server.nodes.clone(),
         versions: server.versions.clone(),
         refs: server.refs.clone(),
+        sync: sync_store.clone(),
     };
     let pull_state = PullServiceState {
         chunks: server.chunks.clone(),
@@ -221,6 +228,7 @@ async fn spawn_server(server: Backends) -> std::net::SocketAddr {
         nodes: server.nodes.clone(),
         versions: server.versions.clone(),
         refs: server.refs.clone(),
+        sync: sync_store,
     };
     let handler = CombinedSyncHandler {
         push: PushServiceHandler::new(push_state),
