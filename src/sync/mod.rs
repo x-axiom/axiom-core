@@ -33,6 +33,10 @@ pub mod pull_server;
 #[cfg(feature = "cloud")]
 pub mod pack;
 
+/// Clone client — first-time full repository clone (E05-S01).
+#[cfg(feature = "cloud")]
+pub mod clone_client;
+
 /// Generated gRPC types and service traits for `axiom.sync.v1`.
 #[cfg(feature = "cloud")]
 pub mod proto {

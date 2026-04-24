@@ -30,8 +30,8 @@ use axiom_core::store::memory::{
     InMemoryVersionRepo,
 };
 use axiom_core::store::traits::{
-    ChunkStore, NodeStore, RefRepo, Remote, RemoteRepo, RemoteTrackingRepo, SyncSessionRepo,
-    SyncSessionStatus, TreeStore, VersionRepo,
+    ChunkStore, NodeStore, PathIndexRepo, RefRepo, Remote, RemoteRepo, RemoteTrackingRepo,
+    SyncSessionRepo, SyncSessionStatus, TreeStore, VersionRepo,
 };
 use axiom_core::store::sqlite::SqliteMetadataStore;
 use axiom_core::sync::SyncServiceServer;
@@ -42,6 +42,8 @@ use axiom_core::sync::proto::{
     NegotiatePushRequest, NegotiatePushResponse, UploadPackRequest, UploadPackResponse,
 };
 use axiom_core::sync::proto::sync_service_server::SyncService;
+use axiom_core::store::memory::InMemoryPathIndex;
+use axiom_core::sync::clone_client::{CloneClient, CloneConfig};
 use axiom_core::sync::pull_client::{PullClient, PullConfig};
 use axiom_core::sync::pull_server::{PullServiceHandler, PullServiceState};
 use axiom_core::sync::push_client::{PushClient, PushConfig};
@@ -878,4 +880,115 @@ async fn finalize_refs_rejects_unknown_session_id() {
         tonic::Code::NotFound,
         "expected NotFound, got: {err:?}"
     );
+}
+
+// ─── Clone tests (E05-S01) ────────────────────────────────────────────────────
+
+fn cfg_clone() -> CloneConfig {
+    CloneConfig {
+        remote_name: "origin".into(),
+        workspace_id: "default".into(),
+        tenant_id: "test".into(),
+    }
+}
+
+async fn connect_clone(addr: std::net::SocketAddr) -> CloneClient {
+    let endpoint = Endpoint::from_shared(format!("http://{addr}")).unwrap();
+    CloneClient::connect(endpoint).await.unwrap()
+}
+
+#[tokio::test]
+async fn clone_empty_remote_succeeds() {
+    // Server has no refs — clone should return an empty result, not an error.
+    let server = Backends::new();
+    let addr = spawn_server(server).await;
+
+    let client = Backends::new();
+    let mut clone = connect_clone(addr).await;
+    let results = clone
+        .clone(
+            &cfg_clone(),
+            &[],
+            client.refs.as_ref(),
+            client.chunks.as_ref(),
+            client.trees.as_ref(),
+            client.nodes.as_ref(),
+            client.versions.as_ref(),
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("clone of empty remote must not error");
+
+    assert!(results.is_empty());
+    assert!(client.refs.list_refs(None).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn clone_with_history_rebuilds_refs_and_path_index() {
+    // Client A pushes data, then client B clones from the same server into
+    // empty stores.  After the clone:
+    // 1. client B has a local `main` branch ref pointing at A's tip.
+    // 2. client B can read back the cloned VersionNode.
+    // 3. The path index has an entry for the root path of that version.
+    let server = Backends::new();
+    let addr = spawn_server(server).await;
+
+    // Client A: seed + push.
+    let client_a = Backends::new();
+    let vid_a = seed_branch(&client_a, "main", b"clone-test-data", vec![]);
+    let mut push = connect_push(addr).await;
+    push.push(
+        &cfg_push(false),
+        &[],
+        client_a.refs.as_ref(),
+        client_a.chunks.as_ref(),
+        client_a.trees.as_ref(),
+        client_a.nodes.as_ref(),
+        client_a.versions.as_ref(),
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("push ok");
+
+    // Client B: clone into empty stores with a path index.
+    let client_b = Backends::new();
+    let path_index = Arc::new(InMemoryPathIndex::default());
+    let mut clone = connect_clone(addr).await;
+    let results = clone
+        .clone(
+            &cfg_clone(),
+            &[],
+            client_b.refs.as_ref(),
+            client_b.chunks.as_ref(),
+            client_b.trees.as_ref(),
+            client_b.nodes.as_ref(),
+            client_b.versions.as_ref(),
+            Some(path_index.as_ref()),
+            None,
+            |_| {},
+        )
+        .await
+        .expect("clone ok");
+
+    // (1) One result for "main".
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].ref_name, "main");
+    assert_eq!(results[0].tip, vid_a);
+    assert!(results[0].objects_received > 0);
+
+    // (2) Local branch ref was created.
+    let local_main = client_b.refs.get_ref("main").unwrap().unwrap();
+    assert_eq!(local_main.target, vid_a);
+
+    // (3) VersionNode is readable.
+    let v = client_b.versions.get_version(&vid_a).unwrap().unwrap();
+    assert_eq!(v.id, vid_a);
+
+    // (4) Path index was populated for the cloned version (root entry).
+    let root_entry = path_index.get_by_path(&vid_a, "").unwrap();
+    assert!(root_entry.is_some(), "path index root entry must exist after clone");
 }
