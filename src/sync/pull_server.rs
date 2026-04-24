@@ -50,6 +50,8 @@ const PROTO_TYPE_VERSION: i32 = 4;
 #[derive(Clone, Debug)]
 struct PullSession {
     objects: Vec<(i32, [u8; 32])>,
+    /// Unix timestamp (seconds) when this session was created.
+    created_at: u64,
 }
 
 /// Clone session — same payload shape as [`PullSession`] but keyed separately
@@ -57,6 +59,8 @@ struct PullSession {
 #[derive(Clone, Debug)]
 struct CloneSession {
     objects: Vec<(i32, [u8; 32])>,
+    /// Unix timestamp (seconds) when this session was created.
+    created_at: u64,
 }
 
 // ─── PullServiceState ─────────────────────────────────────────────────────────
@@ -75,6 +79,12 @@ pub struct PullServiceState {
     /// Sync graph walker. Used by `NegotiatePull` to compute the diff between
     /// `want` and the client's `have` set.
     pub sync: Arc<dyn SyncStore>,
+    /// How long (seconds) to keep an incomplete session alive after creation.
+    /// Default: 3600 (1 hour).
+    pub session_ttl_secs: u64,
+    /// How often (seconds) the reaper task wakes up.
+    /// Default: 300 (5 minutes).
+    pub cleanup_interval_secs: u64,
 }
 
 // ─── PullServiceHandler ──────────────────────────────────────────────────────
@@ -89,19 +99,72 @@ pub struct PullServiceHandler {
     state: Arc<PullServiceState>,
     sessions: Arc<Mutex<HashMap<String, PullSession>>>,
     clone_sessions: Arc<Mutex<HashMap<String, CloneSession>>>,
+    /// Background reaper task — aborted on drop.
+    _reaper: tokio::task::AbortHandle,
 }
 
 impl PullServiceHandler {
     pub fn new(state: PullServiceState) -> Self {
+        let sessions: Arc<Mutex<HashMap<String, PullSession>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let clone_sessions: Arc<Mutex<HashMap<String, CloneSession>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let ttl = state.session_ttl_secs;
+        let interval = state.cleanup_interval_secs;
+        let sessions_ref = Arc::clone(&sessions);
+        let clone_sessions_ref = Arc::clone(&clone_sessions);
+
+        let reaper = tokio::spawn(async move {
+            let interval_dur =
+                std::time::Duration::from_secs(interval.max(1));
+            loop {
+                tokio::time::sleep(interval_dur).await;
+                let now = now_secs();
+                {
+                    let mut map = sessions_ref.lock();
+                    let before = map.len();
+                    map.retain(|_, s| now.saturating_sub(s.created_at) < ttl);
+                    let expired = before - map.len();
+                    if expired > 0 {
+                        tracing::info!(n_expired = expired, "reaped stale pull sessions");
+                    }
+                }
+                {
+                    let mut map = clone_sessions_ref.lock();
+                    let before = map.len();
+                    map.retain(|_, s| now.saturating_sub(s.created_at) < ttl);
+                    let expired = before - map.len();
+                    if expired > 0 {
+                        tracing::info!(n_expired = expired, "reaped stale clone sessions");
+                    }
+                }
+            }
+        });
+
         Self {
             state: Arc::new(state),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            clone_sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions,
+            clone_sessions,
+            _reaper: reaper.abort_handle(),
         }
     }
 }
 
+impl Drop for PullServiceHandler {
+    fn drop(&mut self) {
+        self._reaper.abort();
+    }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 /// Monotonic counter to disambiguate session IDs minted within the same
 /// nanosecond. See [`crate::sync::push_server`] for rationale.
@@ -202,7 +265,7 @@ impl SyncService for PullServiceHandler {
             let session_id = new_session_id();
             {
                 let mut sessions = self.sessions.lock();
-                sessions.insert(session_id.clone(), PullSession { objects: vec![] });
+                sessions.insert(session_id.clone(), PullSession { objects: vec![], created_at: now_secs() });
             }
             return Ok(Response::new(NegotiatePullResponse {
                 session_id,
@@ -257,7 +320,7 @@ impl SyncService for PullServiceHandler {
         let session_id = new_session_id();
         {
             let mut sessions = self.sessions.lock();
-            sessions.insert(session_id.clone(), PullSession { objects });
+            sessions.insert(session_id.clone(), PullSession { objects, created_at: now_secs() });
         }
 
         Ok(Response::new(NegotiatePullResponse {
@@ -434,7 +497,7 @@ impl SyncService for PullServiceHandler {
         let session_id = new_session_id();
         {
             let mut sessions = self.clone_sessions.lock();
-            sessions.insert(session_id.clone(), CloneSession { objects });
+            sessions.insert(session_id.clone(), CloneSession { objects, created_at: now_secs() });
         }
 
         // Build proto RefInfo list.

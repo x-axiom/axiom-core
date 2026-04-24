@@ -229,6 +229,8 @@ async fn spawn_server(server: Backends) -> std::net::SocketAddr {
         versions: server.versions.clone(),
         refs: server.refs.clone(),
         sync: sync_store.clone(),
+        session_ttl_secs: 3600,
+        cleanup_interval_secs: 300,
     };
     let pull_state = PullServiceState {
         chunks: server.chunks.clone(),
@@ -237,6 +239,8 @@ async fn spawn_server(server: Backends) -> std::net::SocketAddr {
         versions: server.versions.clone(),
         refs: server.refs.clone(),
         sync: sync_store,
+        session_ttl_secs: 3600,
+        cleanup_interval_secs: 300,
     };
     let handler = CombinedSyncHandler {
         push: PushServiceHandler::new(push_state),
@@ -1871,4 +1875,169 @@ async fn initial_push_inventory_is_authoritative() {
         server.chunks.has_chunk(&chunk_hash).unwrap(),
         "server must hold the content chunk after initial push"
     );
+}
+
+// ─── E05-S08: session TTL reaper ─────────────────────────────────────────────
+
+/// Spawn a server whose sessions expire in 1 second; cleanup runs every 500ms.
+/// `negotiate_push` → sleep 2 s → `finalize_refs` must get NotFound.
+async fn spawn_server_short_ttl(server: Backends) -> std::net::SocketAddr {
+    let sync_store: Arc<dyn axiom_core::store::traits::SyncStore> =
+        Arc::new(axiom_core::store::InMemorySyncStore::new(
+            server.versions.clone(),
+            server.trees.clone(),
+            server.nodes.clone(),
+        ));
+    let push_state = PushServiceState {
+        chunks: server.chunks.clone(),
+        trees: server.trees.clone(),
+        nodes: server.nodes.clone(),
+        versions: server.versions.clone(),
+        refs: server.refs.clone(),
+        sync: sync_store.clone(),
+        session_ttl_secs: 1,
+        cleanup_interval_secs: 1,
+    };
+    let pull_state = PullServiceState {
+        chunks: server.chunks.clone(),
+        trees: server.trees.clone(),
+        nodes: server.nodes.clone(),
+        versions: server.versions.clone(),
+        refs: server.refs.clone(),
+        sync: sync_store,
+        session_ttl_secs: 1,
+        cleanup_interval_secs: 1,
+    };
+    let handler = CombinedSyncHandler {
+        push: PushServiceHandler::new(push_state),
+        pull: PullServiceHandler::new(pull_state),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = TcpListenerStream::new(listener);
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(SyncServiceServer::new(handler))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
+/// Negotiate a push session, wait longer than the TTL, then attempt to
+/// finalize — the server must respond with NotFound (session was reaped).
+#[tokio::test]
+async fn push_session_is_reaped_after_ttl() {
+    let server = Backends::new();
+    let addr = spawn_server_short_ttl(server.clone()).await;
+
+    let client = Backends::new();
+    seed_branch(&client, "main", b"ttl test data", vec![]);
+
+    // Run NegotiatePush manually so we can grab the session_id before the
+    // full push pipeline finalises it.
+    let endpoint = Endpoint::from_shared(format!("http://{addr}")).unwrap();
+    let mut svc = axiom_core::sync::SyncServiceClient::connect(
+        endpoint,
+    )
+    .await
+    .unwrap();
+
+    // ListRefs to get the current empty state.
+    let refs_resp = svc
+        .list_refs(Request::new(axiom_core::sync::proto::ListRefsRequest {
+            workspace_id: "default".into(),
+            tenant_id: "test".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(refs_resp.refs.is_empty());
+
+    // NegotiatePush — ask for a push session.
+    let vid = client.refs.get_ref("main").unwrap().unwrap().target;
+    let vid_bytes = hex::decode(vid.as_str()).unwrap();
+    let neg_resp = svc
+        .negotiate_push(Request::new(NegotiatePushRequest {
+            workspace_id: "default".into(),
+            tenant_id: "test".into(),
+            ref_updates: vec![axiom_core::sync::proto::RefUpdate {
+                ref_name: "main".into(),
+                old_target: None,
+                new_target: Some(axiom_core::sync::proto::ObjectId {
+                    hash: vid_bytes.clone(),
+                }),
+                force: false,
+            }],
+            local_versions: vec![axiom_core::sync::proto::ObjectId { hash: vid_bytes }],
+            client_inventory: vec![],
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(neg_resp.accepted, "negotiate_push should be accepted");
+    let session_id = neg_resp.session_id.clone();
+
+    // Wait long enough for the reaper to have run (TTL=1s, interval=1s → 3s is safe).
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    // Now try to FinalizeRefs with the stale session id.
+    let finalize_result = svc
+        .finalize_refs(Request::new(axiom_core::sync::proto::FinalizeRefsRequest {
+            session_id,
+            workspace_id: "default".into(),
+            tenant_id: "test".into(),
+            ref_updates: vec![],
+        }))
+        .await;
+
+    assert!(
+        finalize_result.is_err(),
+        "finalize_refs must fail for a reaped session"
+    );
+    let status = finalize_result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::NotFound,
+        "expected NotFound, got: {status}"
+    );
+}
+
+/// After a normal push completes, no stale session remains for existing tests.
+/// This test just verifies the reaper doesn't interfere with a fast push.
+#[tokio::test]
+async fn push_session_reaper_does_not_interfere_with_normal_push() {
+    let server = Backends::new();
+    // Use default TTL — reaper should never fire during a fast push.
+    let addr = spawn_server(server.clone()).await;
+
+    let client = Backends::new();
+    seed_branch(&client, "main", b"reaper compat data", vec![]);
+
+    let mut push = connect_push(addr).await;
+    let results = push
+        .push(
+            &cfg_push(false),
+            &[],
+            client.refs.as_ref(),
+            client.chunks.as_ref(),
+            client.trees.as_ref(),
+            client.nodes.as_ref(),
+            client.versions.as_ref(),
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("push ok");
+
+    assert_eq!(results.get("main").map(String::as_str), Some("ok"));
+    assert!(server.refs.get_ref("main").unwrap().is_some());
 }

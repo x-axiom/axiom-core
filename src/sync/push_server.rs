@@ -98,6 +98,13 @@ pub struct PushServiceState {
     /// Sync graph walker. Used by `NegotiatePush` to compute reachable
     /// objects without depending on the concrete `collect_reachable` helper.
     pub sync: Arc<dyn SyncStore>,
+    /// How long (seconds) to keep an incomplete session alive after creation.
+    /// Sessions not finalised within this window will be reaped.
+    /// Default: 3600 (1 hour).
+    pub session_ttl_secs: u64,
+    /// How often (seconds) the reaper task wakes up to scan for expired sessions.
+    /// Default: 300 (5 minutes).
+    pub cleanup_interval_secs: u64,
 }
 
 // ─── PushServiceHandler ──────────────────────────────────────────────────────
@@ -110,14 +117,46 @@ pub struct PushServiceHandler {
     state: PushServiceState,
     /// In-flight push sessions keyed by session_id.
     sessions: Arc<Mutex<HashMap<String, PushSession>>>,
+    /// Background reaper task — aborted on drop.
+    _reaper: tokio::task::AbortHandle,
 }
 
 impl PushServiceHandler {
     pub fn new(state: PushServiceState) -> Self {
+        let sessions: Arc<Mutex<HashMap<String, PushSession>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let ttl = state.session_ttl_secs;
+        let interval = state.cleanup_interval_secs;
+        let sessions_ref = Arc::clone(&sessions);
+
+        let reaper = tokio::spawn(async move {
+            let interval_dur =
+                std::time::Duration::from_secs(interval.max(1));
+            loop {
+                tokio::time::sleep(interval_dur).await;
+                let now = now_secs();
+                let mut map = sessions_ref.lock();
+                let before = map.len();
+                map.retain(|_, s| now.saturating_sub(s.created_at) < ttl);
+                let expired = before - map.len();
+                if expired > 0 {
+                    tracing::info!(n_expired = expired, "reaped stale push sessions");
+                }
+            }
+        });
+
         Self {
             state,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions,
+            _reaper: reaper.abort_handle(),
         }
+    }
+}
+
+impl Drop for PushServiceHandler {
+    fn drop(&mut self) {
+        self._reaper.abort();
     }
 }
 
