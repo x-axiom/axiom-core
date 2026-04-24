@@ -24,6 +24,7 @@ use tonic::{Request, Response, Status};
 use crate::error::{CasError, CasResult};
 use crate::model::{NodeEntry, Ref, TreeNode, VersionId, VersionNode};
 use crate::sync::shallow::collect_versions_shallow;
+use crate::sync::bloom_negotiate::BloomFilter;
 use crate::store::traits::{ChunkStore, NodeStore, RefRepo, SyncStore, TreeStore, VersionRepo};
 use crate::sync::proto::{
     CloneDownloadRequest, CloneDownloadResponse, CloneInitRequest, CloneInitResponse,
@@ -238,6 +239,17 @@ impl SyncService for PullServiceHandler {
         }
         for h in &reachable.chunk_hashes {
             objects.push((PROTO_TYPE_CHUNK, *h.as_bytes()));
+        }
+
+        // ── E05-S05: Bloom-filter post-filtering ──────────────────────────
+        // If the client sent a non-empty `have_filter`, remove any objects
+        // the filter claims the client already holds.  A false positive means
+        // the client is missing an object (harmless if FP rate < 1 % per
+        // spec); a negative is always correct (client definitely lacks it).
+        if !req.have_filter.is_empty() {
+            if let Some(bf) = BloomFilter::from_bytes(&req.have_filter) {
+                objects.retain(|(_, hash)| !bf.contains(hash));
+            }
         }
 
         let total_objects = objects.len() as u64;

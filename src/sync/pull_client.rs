@@ -29,6 +29,7 @@ use crate::sync::proto::{
 use crate::sync::remote_refs::RemoteRef;
 use crate::sync::resume::{ResumeSet, cleanup_stale_sessions, find_resumable};
 use crate::sync::session::{begin_session, complete_session, fail_session};
+use crate::sync::bloom_negotiate::{BloomFilter, should_use_bloom};
 
 // ─── Proto ObjectType constants ──────────────────────────────────────────────
 const PROTO_TYPE_CHUNK: i32 = 1;
@@ -67,6 +68,14 @@ pub struct PullConfig {
     pub workspace_id: String,
     /// SaaS tenant identifier.
     pub tenant_id: String,
+    /// Override the auto-computed Bloom filter sent as `have_filter` in
+    /// [`NegotiatePullRequest`].
+    ///
+    /// When `None` (default), the client automatically builds a Bloom filter
+    /// from all locally-known version IDs when the count exceeds
+    /// [`crate::sync::bloom_negotiate::SWITCH_THRESHOLD`].  Pass `Some(bytes)`
+    /// to inject a pre-built filter — primarily useful for testing.
+    pub have_filter_override: Option<Vec<u8>>,
 }
 
 /// Per-ref result returned by [`PullClient::pull`].
@@ -282,13 +291,22 @@ impl PullClient {
             bytes_downloaded: 0,
         });
 
+        // Build (or use the override) Bloom filter of local have-versions so the
+        // server can post-filter the download list and skip sending objects the
+        // client already holds (E05-S05).
+        let have_filter = if let Some(ref override_bytes) = config.have_filter_override {
+            override_bytes.clone()
+        } else {
+            build_have_filter(refs, versions)?
+        };
+
         let neg_resp = self
             .inner
             .negotiate_pull(Request::new(NegotiatePullRequest {
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
                 wants,
-                have_filter: Vec::new(), // Bloom filter optional — not used yet
+                have_filter,
             }))
             .await
             .map_err(|e| CasError::SyncError(format!("negotiate_pull: {e}")))?
@@ -405,6 +423,62 @@ fn new_session_id(prefix: &str) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{prefix}-{nanos:x}")
+}
+
+/// Build a Bloom filter of all locally-known version IDs for use as the
+/// `have_filter` in `NegotiatePullRequest`.
+///
+/// Returns an empty `Vec` when the local have-set is below
+/// [`SWITCH_THRESHOLD`] (the full have-list from `WantEntry` is sufficient
+/// in that case and uses less space than the filter).
+///
+/// When the set is large enough, enumerates all reachable version IDs via
+/// BFS from local ref tips and encodes them into a Bloom filter at 1 %
+/// false-positive rate.
+fn build_have_filter(
+    refs: &dyn crate::store::traits::RefRepo,
+    versions: &dyn VersionRepo,
+) -> CasResult<Vec<u8>> {
+    use std::collections::VecDeque;
+
+    // BFS from every local ref tip to collect all locally-reachable version IDs.
+    let mut visited: std::collections::HashSet<VersionId> = std::collections::HashSet::new();
+    let mut queue: VecDeque<VersionId> = VecDeque::new();
+
+    for r in refs.list_refs(None)? {
+        queue.push_back(r.target);
+    }
+
+    let mut hashes: Vec<[u8; 32]> = Vec::new();
+
+    while let Some(vid) = queue.pop_front() {
+        if !visited.insert(vid.clone()) {
+            continue;
+        }
+        // Decode the hex VersionId to raw bytes.
+        if let Ok(bytes) = hex::decode(vid.as_str()) {
+            if bytes.len() == 32 {
+                let arr: [u8; 32] = bytes.try_into().unwrap();
+                hashes.push(arr);
+                // Walk parents to collect older versions.
+                if let Some(v) = versions.get_version(&vid)? {
+                    for parent in v.parents {
+                        queue.push_back(parent);
+                    }
+                }
+            }
+        }
+    }
+
+    if !should_use_bloom(hashes.len()) {
+        return Ok(Vec::new());
+    }
+
+    let mut bf = BloomFilter::with_capacity(hashes.len(), 0.01);
+    for h in &hashes {
+        bf.insert(h);
+    }
+    Ok(bf.to_bytes())
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

@@ -49,6 +49,10 @@ pub mod resume;
 #[cfg(feature = "cloud")]
 pub mod parallel;
 
+/// Bloom-filter–based have-set encoding for pull negotiation (E05-S05).
+#[cfg(feature = "cloud")]
+pub mod bloom_negotiate;
+
 /// Generated gRPC types and service traits for `axiom.sync.v1`.
 #[cfg(feature = "cloud")]
 pub mod proto {

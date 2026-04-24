@@ -50,6 +50,7 @@ use axiom_core::sync::pull_client::{PullClient, PullConfig};
 use axiom_core::sync::pull_server::{PullServiceHandler, PullServiceState};
 use axiom_core::sync::push_client::{PushClient, PushConfig};
 use axiom_core::sync::push_server::{PushServiceHandler, PushServiceState};
+use axiom_core::sync::bloom_negotiate::BloomFilter;
 
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -344,6 +345,7 @@ fn cfg_pull() -> PullConfig {
         remote_name: "origin".into(),
         workspace_id: "default".into(),
         tenant_id: "test".into(),
+        have_filter_override: None,
     }
 }
 
@@ -1565,4 +1567,182 @@ async fn parallel_push_concurrency_clamped_succeeds() {
     let results = push_with_concurrency(addr, &client, 16).await;
     assert_eq!(results.get("main").map(String::as_str), Some("ok"));
     assert_eq!(server.refs.get_ref("main").unwrap().unwrap().target, vid);
+}
+
+// ─── E05-S05: Bloom Filter have-set encoding ──────────────────────────────────
+
+/// Build a Bloom filter containing every object hash reachable from the given
+/// version in `b`'s stores (version + node + tree + chunk).
+fn bloom_of_version_objects(b: &Backends, vid: &VersionId) -> Vec<u8> {
+    let mut bf = BloomFilter::with_capacity(64, 0.01);
+
+    // Version hash.
+    if let Ok(bytes) = hex::decode(vid.as_str()) {
+        if let Ok(arr) = TryInto::<[u8; 32]>::try_into(bytes) {
+            bf.insert(&arr);
+        }
+    }
+
+    // Walk the version → node → tree → chunk chain.
+    if let Some(v) = b.versions.get_version(vid).unwrap() {
+        // root is the NodeEntry hash.
+        bf.insert(v.root.as_bytes());
+
+        if let Some(node) = b.nodes.get_node(&v.root).unwrap() {
+            if let NodeKind::File { root: tree_hash, .. } = node.kind {
+                bf.insert(tree_hash.as_bytes());
+
+                if let Some(tree) = b.trees.get_tree_node(&tree_hash).unwrap() {
+                    if let TreeNodeKind::Leaf { chunk } = tree.kind {
+                        bf.insert(chunk.as_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    bf.to_bytes()
+}
+
+#[tokio::test]
+async fn bloom_pull_have_filter_skips_objects_client_already_has() {
+    // Scenario: server has V1 (seeded).  Client B also has V1's data (seeded
+    // locally, bypassing pull).  Client B pulls with a Bloom filter that
+    // covers all V1 objects → server should filter them → 0 objects downloaded
+    // → ref still fast-forwarded because client B already has the data.
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    // Seed V1 on server and on client B independently.
+    let vid = seed_branch(&server, "main", b"bloom-test-data", vec![]);
+    let client_b = Backends::new();
+    seed_branch(&client_b, "main", b"bloom-test-data", vec![]);
+
+    // Build BF of all V1 objects that client B already has.
+    let have_filter = bloom_of_version_objects(&client_b, &vid);
+
+    let tracking_b = InMemoryRemoteTracking::default();
+    let mut pull = connect_pull(addr).await;
+
+    let results = pull
+        .pull(
+            &PullConfig {
+                remote_name: "origin".into(),
+                workspace_id: "default".into(),
+                tenant_id: "test".into(),
+                have_filter_override: Some(have_filter),
+            },
+            &[],
+            client_b.refs.as_ref(),
+            &tracking_b,
+            client_b.chunks.as_ref(),
+            client_b.trees.as_ref(),
+            client_b.nodes.as_ref(),
+            client_b.versions.as_ref(),
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("pull ok with bloom filter");
+
+    // Remote ref must be resolved and branch must point at vid.
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].ref_name, "main");
+    assert_eq!(results[0].remote_tip, vid);
+    assert!(results[0].fast_forwarded);
+    assert_eq!(client_b.refs.get_ref("main").unwrap().unwrap().target, vid);
+}
+
+#[tokio::test]
+async fn bloom_pull_empty_filter_unchanged_behaviour() {
+    // With no have_filter (empty bytes), pull must behave exactly as before.
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    let vid = seed_branch(&server, "main", b"no-bloom-data", vec![]);
+
+    let client = Backends::new();
+    let tracking = InMemoryRemoteTracking::default();
+    let mut pull = connect_pull(addr).await;
+
+    let results = pull
+        .pull(
+            &cfg_pull(),
+            &[],
+            client.refs.as_ref(),
+            &tracking,
+            client.chunks.as_ref(),
+            client.trees.as_ref(),
+            client.nodes.as_ref(),
+            client.versions.as_ref(),
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("pull ok without bloom filter");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].remote_tip, vid);
+    assert!(results[0].fast_forwarded);
+    // All V1 objects must be present on the client.
+    assert!(client.versions.get_version(&vid).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn bloom_pull_unknown_object_still_downloaded_when_not_in_filter() {
+    // Objects NOT in the Bloom filter must still be downloaded.
+    // Client B has V1 but NOT V2; filter covers only V1.  Pull V2 from server.
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    let vid1 = seed_branch(&server, "main", b"first-version", vec![]);
+    let vid2 = seed_branch(&server, "main", b"second-version", vec![vid1.clone()]);
+
+    // Client B has V1 but not V2.
+    let client_b = Backends::new();
+    seed_branch(&client_b, "main", b"first-version", vec![]);
+
+    // BF covers only V1 objects → V2 is NOT in the filter.
+    let have_filter = bloom_of_version_objects(&client_b, &vid1);
+
+    let tracking_b = InMemoryRemoteTracking::default();
+    // Pre-populate tracking so client B's have for "main" is vid1.
+    tracking_b.update_remote_ref(&axiom_core::store::traits::RemoteRef {
+        remote_name: "origin".into(),
+        ref_name: "main".into(),
+        kind: axiom_core::model::RefKind::Branch,
+        target: vid1.clone(),
+        updated_at: 0,
+    }).unwrap();
+
+    let mut pull = connect_pull(addr).await;
+
+    let results = pull
+        .pull(
+            &PullConfig {
+                remote_name: "origin".into(),
+                workspace_id: "default".into(),
+                tenant_id: "test".into(),
+                have_filter_override: Some(have_filter),
+            },
+            &[],
+            client_b.refs.as_ref(),
+            &tracking_b,
+            client_b.chunks.as_ref(),
+            client_b.trees.as_ref(),
+            client_b.nodes.as_ref(),
+            client_b.versions.as_ref(),
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("pull ok for v2");
+
+    // V2 must have arrived.
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].remote_tip, vid2);
+    assert!(client_b.versions.get_version(&vid2).unwrap().is_some());
 }
