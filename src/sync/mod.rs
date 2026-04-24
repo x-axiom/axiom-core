@@ -45,6 +45,10 @@ pub mod shallow;
 #[cfg(feature = "cloud")]
 pub mod resume;
 
+/// Parallel upload helpers for multi-stream push (E05-S04).
+#[cfg(feature = "cloud")]
+pub mod parallel;
+
 /// Generated gRPC types and service traits for `axiom.sync.v1`.
 #[cfg(feature = "cloud")]
 pub mod proto {

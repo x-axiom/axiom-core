@@ -73,6 +73,13 @@ pub struct PushConfig {
     pub tenant_id: String,
     /// If `true`, allow non-fast-forward ref updates (force-push).
     pub force: bool,
+    /// Number of concurrent `UploadPack` gRPC streams (1–16).
+    ///
+    /// Values outside the range are clamped.  `1` (default) uses a single
+    /// serial stream identical to the pre-E05-S04 behaviour.  Higher values
+    /// shard objects by `hash[0] % N` and transmit each shard in parallel,
+    /// which improves throughput when network bandwidth is the bottleneck.
+    pub concurrency: u8,
 }
 
 // ─── PushClient ───────────────────────────────────────────────────────────────
@@ -334,64 +341,122 @@ impl PushClient {
             .sum();
 
         // ── Step 3: UploadPack ────────────────────────────────────────────
-        // Build the full message list up front (header + one message per object),
-        // then send as a single client-streaming RPC call.
-        let mut messages: Vec<UploadPackRequest> =
-            Vec::with_capacity(total_objects as usize + 1);
+        // Dispatch to the parallel or serial upload path based on `concurrency`.
+        let concurrency = config.concurrency.clamp(1, 16) as usize;
 
-        // First message: pack header.
-        messages.push(UploadPackRequest {
-            payload: Some(Payload::Header(PackHeader {
-                object_count: total_objects,
-                estimated_bytes: 0,
-                session_id: server_session_id.clone(),
-            })),
-        });
+        let (objects_done, bytes_uploaded, uploaded_hexes) = if concurrency > 1 {
+            // ── Parallel: shard by hash[0] % N, N concurrent streams ──────────
+            use futures_util::future::join_all;
 
-        let mut objects_done: u64 = 0;
-        let mut bytes_uploaded: u64 = 0;
-        let mut uploaded_hexes: Vec<String> = Vec::new();
+            progress(SyncProgress {
+                stage: PushStage::Uploading { objects_done: 0, objects_total: total_objects },
+                bytes_uploaded: 0,
+            });
 
-        for obj_list in &augmented_need_objects {
-            let proto_type = obj_list.r#type;
-            for oid in &obj_list.hashes {
-                let raw = fetch_object(proto_type, &oid.hash, chunks, trees, nodes, versions)?;
-                let compressed = zstd::bulk::compress(&raw, 3)
-                    .map_err(|e| CasError::SyncError(format!("zstd compress: {e}")))?;
+            let shards = crate::sync::parallel::shard_object_lists(
+                augmented_need_objects,
+                concurrency,
+            );
+            let non_empty: Vec<_> = shards.into_iter().filter(|s| !s.is_empty()).collect();
 
-                bytes_uploaded += compressed.len() as u64;
-                objects_done += 1;
-                uploaded_hexes.push(hex::encode(&oid.hash));
+            let futs: Vec<_> = non_empty
+                .into_iter()
+                .map(|shard| {
+                    upload_shard(
+                        self.inner.clone(),
+                        server_session_id.clone(),
+                        shard,
+                        chunks,
+                        trees,
+                        nodes,
+                        versions,
+                    )
+                })
+                .collect();
 
-                messages.push(UploadPackRequest {
-                    payload: Some(Payload::Entry(PackEntry {
-                        r#type: proto_type,
-                        hash: Some(ObjectId { hash: oid.hash.clone() }),
-                        data: compressed,
-                    })),
-                });
-
-                progress(SyncProgress {
-                    stage: PushStage::Uploading {
-                        objects_done,
-                        objects_total: total_objects,
-                    },
-                    bytes_uploaded,
-                });
+            let mut obj = 0u64;
+            let mut bytes = 0u64;
+            let mut hexes = Vec::<String>::new();
+            for res in join_all(futs).await {
+                let (o, b, h) = res?;
+                obj += o;
+                bytes += b;
+                hexes.extend(h);
             }
-        }
 
-        self.inner
-            .upload_pack(Request::new(stream::iter(messages)))
-            .await
-            .map_err(|e| CasError::SyncError(format!("upload_pack: {e}")))?;
+            progress(SyncProgress {
+                stage: PushStage::Uploading {
+                    objects_done: obj,
+                    objects_total: total_objects,
+                },
+                bytes_uploaded: bytes,
+            });
+
+            (obj, bytes, hexes)
+        } else {
+            // ── Serial: single UploadPack stream ──────────────────────────────
+            // Build the full message list up front (header + one message per
+            // object), then send as a single client-streaming RPC call.
+            let mut messages: Vec<UploadPackRequest> =
+                Vec::with_capacity(total_objects as usize + 1);
+
+            // First message: pack header.
+            messages.push(UploadPackRequest {
+                payload: Some(Payload::Header(PackHeader {
+                    object_count: total_objects,
+                    estimated_bytes: 0,
+                    session_id: server_session_id.clone(),
+                })),
+            });
+
+            let mut objects_done = 0u64;
+            let mut bytes_uploaded = 0u64;
+            let mut uploaded_hexes = Vec::<String>::new();
+
+            for obj_list in &augmented_need_objects {
+                let proto_type = obj_list.r#type;
+                for oid in &obj_list.hashes {
+                    let raw =
+                        fetch_object(proto_type, &oid.hash, chunks, trees, nodes, versions)?;
+                    let compressed = zstd::bulk::compress(&raw, 3)
+                        .map_err(|e| CasError::SyncError(format!("zstd compress: {e}")))?;
+
+                    bytes_uploaded += compressed.len() as u64;
+                    objects_done += 1;
+                    uploaded_hexes.push(hex::encode(&oid.hash));
+
+                    messages.push(UploadPackRequest {
+                        payload: Some(Payload::Entry(PackEntry {
+                            r#type: proto_type,
+                            hash: Some(ObjectId { hash: oid.hash.clone() }),
+                            data: compressed,
+                        })),
+                    });
+
+                    progress(SyncProgress {
+                        stage: PushStage::Uploading {
+                            objects_done,
+                            objects_total: total_objects,
+                        },
+                        bytes_uploaded,
+                    });
+                }
+            }
+
+            self.inner
+                .upload_pack(Request::new(stream::iter(messages)))
+                .await
+                .map_err(|e| CasError::SyncError(format!("upload_pack: {e}")))?;
+
+            (objects_done, bytes_uploaded, uploaded_hexes)
+        };
 
         // Checkpoint the uploaded objects for potential future resume.
         if let Some(mfst) = manifests {
             if !uploaded_hexes.is_empty() {
                 let _ = mfst.manifest_append(session_id, &uploaded_hexes);
             }
-}
+        }
 
         // ── Step 4: FinalizeRefs ──────────────────────────────────────────
         progress(SyncProgress {
@@ -440,6 +505,65 @@ impl PushClient {
 
         Ok((results, total_objects, bytes_uploaded))
     }
+}
+
+/// Send a single shard of objects in one `UploadPack` RPC call.
+///
+/// Takes an **owned** `SyncServiceClient` (cheap clone of a shared channel)
+/// so callers can dispatch multiple shards concurrently with
+/// `futures_util::future::join_all` without borrow-checker conflicts.
+///
+/// Returns `(objects_sent, compressed_bytes, hex_hashes)`.
+async fn upload_shard(
+    mut client: SyncServiceClient<Channel>,
+    server_session_id: String,
+    shard: Vec<ObjectList>,
+    chunks: &dyn ChunkStore,
+    trees: &dyn TreeStore,
+    nodes: &dyn NodeStore,
+    versions: &dyn VersionRepo,
+) -> CasResult<(u64, u64, Vec<String>)> {
+    let shard_total: u64 = shard.iter().map(|l| l.hashes.len() as u64).sum();
+    if shard_total == 0 {
+        return Ok((0, 0, vec![]));
+    }
+
+    let mut messages: Vec<UploadPackRequest> = Vec::with_capacity(shard_total as usize + 1);
+    messages.push(UploadPackRequest {
+        payload: Some(Payload::Header(PackHeader {
+            object_count: shard_total,
+            estimated_bytes: 0,
+            session_id: server_session_id,
+        })),
+    });
+
+    let mut bytes: u64 = 0;
+    let mut hexes: Vec<String> = Vec::with_capacity(shard_total as usize);
+
+    for obj_list in &shard {
+        let proto_type = obj_list.r#type;
+        for oid in &obj_list.hashes {
+            let raw = fetch_object(proto_type, &oid.hash, chunks, trees, nodes, versions)?;
+            let compressed = zstd::bulk::compress(&raw, 3)
+                .map_err(|e| CasError::SyncError(format!("zstd compress: {e}")))?;
+            bytes += compressed.len() as u64;
+            hexes.push(hex::encode(&oid.hash));
+            messages.push(UploadPackRequest {
+                payload: Some(Payload::Entry(PackEntry {
+                    r#type: proto_type,
+                    hash: Some(ObjectId { hash: oid.hash.clone() }),
+                    data: compressed,
+                })),
+            });
+        }
+    }
+
+    client
+        .upload_pack(Request::new(stream::iter(messages)))
+        .await
+        .map_err(|e| CasError::SyncError(format!("upload_pack shard: {e}")))?;
+
+    Ok((shard_total, bytes, hexes))
 }
 
 /// Generate a unique session id with the given short prefix.

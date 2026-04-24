@@ -335,6 +335,7 @@ fn cfg_push(force: bool) -> PushConfig {
         workspace_id: "default".into(),
         tenant_id: "test".into(),
         force,
+        concurrency: 1,
     }
 }
 
@@ -1448,4 +1449,120 @@ async fn resume_pull_skips_manifested_versions_via_have_hints() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].ref_name, "main");
     assert_eq!(results[0].remote_tip, vid);
+}
+
+// ─── E05-S04: Parallel chunked transfer ──────────────────────────────────────
+
+/// Helper: push with a specific concurrency value.
+async fn push_with_concurrency(
+    addr: std::net::SocketAddr,
+    client: &Backends,
+    concurrency: u8,
+) -> HashMap<String, String> {
+    let mut push = connect_push(addr).await;
+    push.push(
+        &PushConfig {
+            remote_name: "origin".into(),
+            workspace_id: "default".into(),
+            tenant_id: "test".into(),
+            force: false,
+            concurrency,
+        },
+        &[],
+        client.refs.as_ref(),
+        client.chunks.as_ref(),
+        client.trees.as_ref(),
+        client.nodes.as_ref(),
+        client.versions.as_ref(),
+        None,
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("parallel push ok")
+}
+
+#[tokio::test]
+async fn parallel_push_4_branches_concurrency_4_all_objects_transferred() {
+    // Seed 4 branches (each creates 1 chunk + 1 tree + 1 node + 1 version = 4
+    // objects), then push with concurrency=4.  Each shard carries ~4 objects,
+    // and all must arrive on the server.
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    let client = Backends::new();
+    let vid_a = seed_branch(&client, "main", b"data-a", vec![]);
+    let vid_b = seed_branch(&client, "feat", b"data-b", vec![]);
+    let vid_c = seed_branch(&client, "dev", b"data-c", vec![]);
+    let vid_d = seed_branch(&client, "fix", b"data-d", vec![]);
+
+    let results = push_with_concurrency(addr, &client, 4).await;
+
+    assert_eq!(results.get("main").map(String::as_str), Some("ok"));
+    assert_eq!(results.get("feat").map(String::as_str), Some("ok"));
+    assert_eq!(results.get("dev").map(String::as_str), Some("ok"));
+    assert_eq!(results.get("fix").map(String::as_str), Some("ok"));
+
+    // All 4 versions must be present on the server.
+    assert!(server.versions.get_version(&vid_a).unwrap().is_some());
+    assert!(server.versions.get_version(&vid_b).unwrap().is_some());
+    assert!(server.versions.get_version(&vid_c).unwrap().is_some());
+    assert!(server.versions.get_version(&vid_d).unwrap().is_some());
+
+    // Server refs must point at the pushed tips.
+    assert_eq!(server.refs.get_ref("main").unwrap().unwrap().target, vid_a);
+    assert_eq!(server.refs.get_ref("feat").unwrap().unwrap().target, vid_b);
+    assert_eq!(server.refs.get_ref("dev").unwrap().unwrap().target, vid_c);
+    assert_eq!(server.refs.get_ref("fix").unwrap().unwrap().target, vid_d);
+}
+
+#[tokio::test]
+async fn parallel_push_result_matches_serial() {
+    // Push the same data twice: once serially (concurrency=1) and once in
+    // parallel (concurrency=4), to two separate servers.  Both server ref
+    // states must be identical.
+    let server_serial = Backends::new();
+    let addr_serial = spawn_server(server_serial.clone()).await;
+
+    let server_parallel = Backends::new();
+    let addr_parallel = spawn_server(server_parallel.clone()).await;
+
+    let client = Backends::new();
+    let vid = seed_branch(&client, "main", b"compare-data", vec![]);
+
+    push_with_concurrency(addr_serial, &client, 1).await;
+    push_with_concurrency(addr_parallel, &client, 4).await;
+
+    // Both servers must have the same version.
+    let v_serial = server_serial.versions.get_version(&vid).unwrap().unwrap();
+    let v_parallel = server_parallel.versions.get_version(&vid).unwrap().unwrap();
+    assert_eq!(v_serial.id, v_parallel.id);
+    assert_eq!(v_serial.root, v_parallel.root);
+
+    // Both servers must have the branch ref pointing at the same target.
+    let r_serial = server_serial.refs.get_ref("main").unwrap().unwrap();
+    let r_parallel = server_parallel.refs.get_ref("main").unwrap().unwrap();
+    assert_eq!(r_serial.target, r_parallel.target);
+}
+
+#[tokio::test]
+async fn parallel_push_concurrency_clamped_succeeds() {
+    // concurrency=0 is clamped to 1 (serial path) — must not panic or error.
+    // concurrency=16 (max) must also succeed.
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    let client = Backends::new();
+    let vid = seed_branch(&client, "main", b"clamp-test", vec![]);
+
+    // concurrency=0 → clamped to 1.
+    push_with_concurrency(addr, &client, 0).await;
+    assert!(server.refs.get_ref("main").unwrap().is_some());
+
+    // Second push to the same server: already up-to-date (need_objects empty),
+    // but must not error on concurrency=16 either.
+    let results = push_with_concurrency(addr, &client, 16).await;
+    assert_eq!(results.get("main").map(String::as_str), Some("ok"));
+    assert_eq!(server.refs.get_ref("main").unwrap().unwrap().target, vid);
 }
