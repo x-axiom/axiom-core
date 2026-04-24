@@ -166,8 +166,10 @@ impl Drop for PushServiceHandler {
 
 // ─── Helper: fast-forward check ──────────────────────────────────────────────
 
-/// Wrapper around [`crate::sync::fast_forward::is_fast_forward`] that also
-/// honours the `--force` flag (force always allows the update).
+/// Wrapper around [`crate::sync::fast_forward::is_fast_forward_with_limit`]
+/// that also honours the `--force` flag and the default BFS node cap
+/// (100 000 versions).  A pathologically deep history returns
+/// `Status::failed_precondition` via `cas_err_to_status`.
 fn is_fast_forward_allowed(
     old_vid: &VersionId,
     new_vid: &VersionId,
@@ -226,6 +228,10 @@ fn cas_err_to_status(e: CasError) -> Status {
         CasError::NonFastForward(s) => Status::failed_precondition(format!("non-fast-forward: {s}")),
         CasError::Unauthorized(s) => Status::unauthenticated(s),
         CasError::Forbidden(s) => Status::permission_denied(s),
+        // E05-S10: pathologically deep history from is_fast_forward_with_limit
+        CasError::SyncError(ref s) if s.contains("too deep") || s.contains("exceeded") => {
+            Status::failed_precondition(e.to_string())
+        }
         other => Status::internal(other.to_string()),
     }
 }
