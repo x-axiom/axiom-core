@@ -71,10 +71,15 @@ message ListRefsResponse {
 // ──────────────────────────────────────────────
 
 message NegotiatePushRequest {
-    string              workspace_id  = 1;
-    string              tenant_id     = 2;
-    repeated RefUpdate  ref_updates   = 3;
-    repeated ObjectId   local_versions = 4; // all version IDs the client wants to push
+    string              workspace_id      = 1;
+    string              tenant_id         = 2;
+    repeated RefUpdate  ref_updates       = 3;
+    repeated ObjectId   local_versions    = 4; // all version IDs the client wants to push
+    // NEW (E05-S07) — client-side inventory of all reachable objects under
+    // the new ref tips (relative to remote_tips as the "have" boundary).
+    // Server uses these to compute exactly which objects it is missing.
+    // Empty in old-client messages → server falls back to conservative logic.
+    repeated ObjectList client_inventory  = 5;
 }
 
 message NegotiatePushResponse {

@@ -267,92 +267,150 @@ impl SyncService for PushServiceHandler {
         }
 
         // ② Compute which objects the client needs to send.
-        //    We determine the server's existing version set and subtract it
-        //    from what the client wants to push.
+        //    Strategy (E05-S07):
+        //    a) If `client_inventory` is non-empty (new client): the client has
+        //       already walked its reachable set and listed every object.  We just
+        //       check each hash against our stores and collect the missing ones.
+        //       This is O(N) existence checks, avoids the server needing to walk a
+        //       reachable graph it may not have, and is the authoritative path.
+        //    b) If `client_inventory` is empty (old client, backward compat): fall
+        //       back to the previous `collect_reachable_with_have` approach.
         let mut need_chunks: Vec<ObjectId> = Vec::new();
         let mut need_trees: Vec<ObjectId> = Vec::new();
         let mut need_nodes: Vec<ObjectId> = Vec::new();
         let mut need_versions: Vec<ObjectId> = Vec::new();
 
-        for oid in &req.local_versions {
-            let vid = vid_from_bytes(&oid.hash);
-            if self
-                .state
-                .versions
-                .get_version(&vid)
-                .map_err(cas_err_to_status)?
-                .is_none()
-            {
-                need_versions.push(ObjectId { hash: oid.hash.clone() });
-            }
-        }
+        if !req.client_inventory.is_empty() {
+            // ── New path: inventory-based negotiation ─────────────────────────
+            for list in &req.client_inventory {
+                for oid in &list.hashes {
+                    let h = &oid.hash;
+                    if h.len() != 32 {
+                        continue;
+                    }
+                    let arr: [u8; 32] = h.as_slice().try_into().unwrap();
+                    let hash = blake3::Hash::from_bytes(arr);
 
-        // Collect all reachable objects from the pushed version tips that the
-        // server does not already have.
-        {
-            use std::collections::HashSet;
+                    let missing = match list.r#type {
+                        PROTO_TYPE_CHUNK => !self
+                            .state
+                            .chunks
+                            .has_chunk(&hash)
+                            .map_err(cas_err_to_status)?,
+                        PROTO_TYPE_TREE_NODE => self
+                            .state
+                            .trees
+                            .get_tree_node(&hash)
+                            .map_err(cas_err_to_status)?
+                            .is_none(),
+                        PROTO_TYPE_NODE_ENTRY => self
+                            .state
+                            .nodes
+                            .get_node(&hash)
+                            .map_err(cas_err_to_status)?
+                            .is_none(),
+                        PROTO_TYPE_VERSION => {
+                            let vid = vid_from_bytes(h);
+                            self.state
+                                .versions
+                                .get_version(&vid)
+                                .map_err(cas_err_to_status)?
+                                .is_none()
+                        }
+                        _ => continue,
+                    };
 
-            let want_vids: Vec<VersionId> = req
-                .local_versions
-                .iter()
-                .map(|o| vid_from_bytes(&o.hash))
-                .collect();
-
-            // Server's "have" = all versions currently known.
-            let server_have: HashSet<VersionId> = {
-                let all_refs = self.state.refs.list_refs(None).map_err(cas_err_to_status)?;
-                all_refs.into_iter().map(|r| r.target).collect()
-            };
-
-            let reachable = self
-                .state
-                .sync
-                .collect_reachable_with_have(&want_vids, &server_have)
-                .map_err(cas_err_to_status)?;
-
-            for h in &reachable.chunk_hashes {
-                if !self
-                    .state
-                    .chunks
-                    .has_chunk(h)
-                    .map_err(cas_err_to_status)?
-                {
-                    need_chunks.push(ObjectId { hash: h.as_bytes().to_vec() });
+                    if missing {
+                        let entry = ObjectId { hash: h.clone() };
+                        match list.r#type {
+                            PROTO_TYPE_CHUNK => need_chunks.push(entry),
+                            PROTO_TYPE_TREE_NODE => need_trees.push(entry),
+                            PROTO_TYPE_NODE_ENTRY => need_nodes.push(entry),
+                            PROTO_TYPE_VERSION => need_versions.push(entry),
+                            _ => {}
+                        }
+                    }
                 }
             }
-            for h in &reachable.tree_hashes {
-                if self
-                    .state
-                    .trees
-                    .get_tree_node(h)
-                    .map_err(cas_err_to_status)?
-                    .is_none()
-                {
-                    need_trees.push(ObjectId { hash: h.as_bytes().to_vec() });
-                }
-            }
-            for h in &reachable.node_hashes {
-                if self
-                    .state
-                    .nodes
-                    .get_node(h)
-                    .map_err(cas_err_to_status)?
-                    .is_none()
-                {
-                    need_nodes.push(ObjectId { hash: h.as_bytes().to_vec() });
-                }
-            }
-            for v in &reachable.versions {
+        } else {
+            // ── Legacy path: server-side reachable walk (old clients) ─────────
+            for oid in &req.local_versions {
+                let vid = vid_from_bytes(&oid.hash);
                 if self
                     .state
                     .versions
-                    .get_version(v)
+                    .get_version(&vid)
                     .map_err(cas_err_to_status)?
                     .is_none()
                 {
-                    if v.as_str().len() == 64 {
-                        if let Ok(b) = hex::decode(v.as_str()) {
-                            need_versions.push(ObjectId { hash: b });
+                    need_versions.push(ObjectId { hash: oid.hash.clone() });
+                }
+            }
+
+            {
+                use std::collections::HashSet;
+
+                let want_vids: Vec<VersionId> = req
+                    .local_versions
+                    .iter()
+                    .map(|o| vid_from_bytes(&o.hash))
+                    .collect();
+
+                let server_have: HashSet<VersionId> = {
+                    let all_refs = self.state.refs.list_refs(None).map_err(cas_err_to_status)?;
+                    all_refs.into_iter().map(|r| r.target).collect()
+                };
+
+                let reachable = self
+                    .state
+                    .sync
+                    .collect_reachable_with_have(&want_vids, &server_have)
+                    .map_err(cas_err_to_status)?;
+
+                for h in &reachable.chunk_hashes {
+                    if !self
+                        .state
+                        .chunks
+                        .has_chunk(h)
+                        .map_err(cas_err_to_status)?
+                    {
+                        need_chunks.push(ObjectId { hash: h.as_bytes().to_vec() });
+                    }
+                }
+                for h in &reachable.tree_hashes {
+                    if self
+                        .state
+                        .trees
+                        .get_tree_node(h)
+                        .map_err(cas_err_to_status)?
+                        .is_none()
+                    {
+                        need_trees.push(ObjectId { hash: h.as_bytes().to_vec() });
+                    }
+                }
+                for h in &reachable.node_hashes {
+                    if self
+                        .state
+                        .nodes
+                        .get_node(h)
+                        .map_err(cas_err_to_status)?
+                        .is_none()
+                    {
+                        need_nodes.push(ObjectId { hash: h.as_bytes().to_vec() });
+                    }
+                }
+                for v in &reachable.versions {
+                    if self
+                        .state
+                        .versions
+                        .get_version(v)
+                        .map_err(cas_err_to_status)?
+                        .is_none()
+                    {
+                        if v.as_str().len() == 64 {
+                            if let Ok(b) = hex::decode(v.as_str()) {
+                                need_versions.push(ObjectId { hash: b });
+                            }
                         }
                     }
                 }

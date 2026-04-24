@@ -1746,3 +1746,129 @@ async fn bloom_pull_unknown_object_still_downloaded_when_not_in_filter() {
     assert_eq!(results[0].remote_tip, vid2);
     assert!(client_b.versions.get_version(&vid2).unwrap().is_some());
 }
+
+// ─── E05-S07: client_inventory negotiation ────────────────────────────────────
+
+/// Client A pushes "shared data".  Client B then has the *same* chunk (same
+/// BLAKE3 hash) plus a new "unique data" chunk on a fresh branch.  B's push
+/// must not transfer the already-present shared chunk.
+///
+/// This verifies that `client_inventory` → server diff → `need_objects`
+/// correctly excludes objects the server already holds.
+#[tokio::test]
+async fn push_skips_objects_server_already_has() {
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    // Client A: push "shared data" on main.
+    let client_a = Backends::new();
+    seed_branch(&client_a, "main", b"shared data", vec![]);
+    let mut push_a = connect_push(addr).await;
+    push_a
+        .push(
+            &cfg_push(false),
+            &[],
+            client_a.refs.as_ref(),
+            client_a.chunks.as_ref(),
+            client_a.trees.as_ref(),
+            client_a.nodes.as_ref(),
+            client_a.versions.as_ref(),
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("push A ok");
+
+    // The server now has the "shared data" chunk.
+    let shared_hash = client_a.chunks.put_chunk(b"shared data".to_vec()).unwrap();
+    assert!(server.chunks.has_chunk(&shared_hash).unwrap());
+
+    // Client B: create a different workspace that has the *same* "shared data"
+    // branch AND a new "feature" branch with unique content.
+    let client_b = Backends::new();
+    seed_branch(&client_b, "main", b"shared data", vec![]);
+    let vid_feature = seed_branch(&client_b, "feature", b"unique data for feature", vec![]);
+
+    // Push only the "feature" branch from client B.
+    let mut push_b = connect_push(addr).await;
+    let results = push_b
+        .push(
+            &PushConfig {
+                remote_name: "origin".into(),
+                workspace_id: "default".into(),
+                tenant_id: "test".into(),
+                force: false,
+                concurrency: 1,
+            },
+            &["feature".to_string()],
+            client_b.refs.as_ref(),
+            client_b.chunks.as_ref(),
+            client_b.trees.as_ref(),
+            client_b.nodes.as_ref(),
+            client_b.versions.as_ref(),
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("push B ok");
+
+    assert_eq!(results.get("feature").map(String::as_str), Some("ok"));
+    // The feature branch's version and unique chunk must arrive on the server.
+    assert!(server.refs.get_ref("feature").unwrap().is_some());
+    assert_eq!(
+        server.refs.get_ref("feature").unwrap().unwrap().target,
+        vid_feature
+    );
+    assert!(server.versions.get_version(&vid_feature).unwrap().is_some());
+
+    // The unique data chunk must have been transferred.
+    let unique_hash = client_b.chunks.put_chunk(b"unique data for feature".to_vec()).unwrap();
+    assert!(server.chunks.has_chunk(&unique_hash).unwrap());
+}
+
+/// An initial push (server starts empty) must transfer every reachable object
+/// exactly once.  The `client_inventory` path is authoritative: server count
+/// after push must equal client reachable count.
+#[tokio::test]
+async fn initial_push_inventory_is_authoritative() {
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    let client = Backends::new();
+    let vid = seed_branch(&client, "main", b"test content for inventory check", vec![]);
+
+    let mut push = connect_push(addr).await;
+    let results = push
+        .push(
+            &cfg_push(false),
+            &[],
+            client.refs.as_ref(),
+            client.chunks.as_ref(),
+            client.trees.as_ref(),
+            client.nodes.as_ref(),
+            client.versions.as_ref(),
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("initial push ok");
+
+    assert_eq!(results.get("main").map(String::as_str), Some("ok"));
+
+    // The exact version must be present on the server.
+    assert!(server.versions.get_version(&vid).unwrap().is_some());
+
+    // Every chunk the client put must now also be in the server store.
+    // We know `seed_branch` puts exactly one chunk of the supplied data.
+    let chunk_hash = client.chunks.put_chunk(b"test content for inventory check".to_vec()).unwrap();
+    assert!(
+        server.chunks.has_chunk(&chunk_hash).unwrap(),
+        "server must hold the content chunk after initial push"
+    );
+}

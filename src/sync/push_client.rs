@@ -285,6 +285,14 @@ impl PushClient {
             bytes_uploaded: 0,
         });
 
+        // Build client inventory: walk all objects reachable from the new
+        // ref tips, stopping at versions the remote already has.  The server
+        // will subtract its own holdings to produce the exact `need_objects`
+        // list — no more `augment_needs_locally` workaround.
+        let client_inventory = build_client_inventory(
+            &to_push, &remote_tips, chunks, trees, nodes, versions,
+        )?;
+
         let neg_resp = self
             .inner
             .negotiate_push(Request::new(NegotiatePushRequest {
@@ -292,6 +300,7 @@ impl PushClient {
                 tenant_id: config.tenant_id.clone(),
                 ref_updates: ref_updates.clone(),
                 local_versions,
+                client_inventory,
             }))
             .await
             .map_err(|e| CasError::SyncError(format!("negotiate_push: {e}")))?
@@ -308,25 +317,15 @@ impl PushClient {
 
         let server_session_id = neg_resp.session_id.clone();
 
-        // ── Augment server-reported needs with locally-walked reachable set.
-        //
-        // The server's `negotiate_push` walks reachable objects from the
-        // pushed version tips, but it can only see objects it already has.
-        // For initial pushes (or any push that introduces a brand-new
-        // version), the server cannot enumerate the reachable tree/node/
-        // chunk set itself, so its `need_objects` only contains the version
-        // hashes. We close the gap on the client by walking each new
-        // version's tree locally and merging the result into the upload
-        // plan.
-        let augmented_need_objects =
-            augment_needs_locally(&neg_resp.need_objects, &to_push, &remote_tips,
-                                  chunks, trees, nodes, versions)?;
+        // Server now returns the exact set of missing objects via
+        // `neg_resp.need_objects`.  No local augmentation needed.
+        let need_objects: Vec<ObjectList> = neg_resp.need_objects;
 
         // Filter out objects already confirmed sent in a previous session.
-        let augmented_need_objects: Vec<ObjectList> = if resume_set.is_empty() {
-            augmented_need_objects
+        let need_objects: Vec<ObjectList> = if resume_set.is_empty() {
+            need_objects
         } else {
-            augmented_need_objects
+            need_objects
                 .into_iter()
                 .map(|mut ol| {
                     ol.hashes.retain(|oid| !resume_set.contains_hex(&hex::encode(&oid.hash)));
@@ -335,7 +334,7 @@ impl PushClient {
                 .collect()
         };
 
-        let total_objects: u64 = augmented_need_objects
+        let total_objects: u64 = need_objects
             .iter()
             .map(|l| l.hashes.len() as u64)
             .sum();
@@ -354,7 +353,7 @@ impl PushClient {
             });
 
             let shards = crate::sync::parallel::shard_object_lists(
-                augmented_need_objects,
+                need_objects,
                 concurrency,
             );
             let non_empty: Vec<_> = shards.into_iter().filter(|s| !s.is_empty()).collect();
@@ -413,7 +412,7 @@ impl PushClient {
             let mut bytes_uploaded = 0u64;
             let mut uploaded_hexes = Vec::<String>::new();
 
-            for obj_list in &augmented_need_objects {
+            for obj_list in &need_objects {
                 let proto_type = obj_list.r#type;
                 for oid in &obj_list.hashes {
                     let raw =
@@ -660,16 +659,13 @@ fn fetch_object(
     }
 }
 
-/// Merge the server-reported `need_objects` with locally-walked reachable
-/// hashes from the new ref tips.
+/// Build the `client_inventory` for a `NegotiatePushRequest`.
 ///
-/// The server cannot enumerate trees/nodes/chunks for versions it has never
-/// seen, so for any pushed ref whose tip is unknown to the server we walk
-/// the local reachability graph and add every hash that the server is
-/// missing.  `remote_tips` is used as the BFS "have" boundary so we stop
-/// at versions the server already has.
-fn augment_needs_locally(
-    server_needs: &[ObjectList],
+/// Walks all objects reachable from the new ref tips (stopping at versions
+/// the remote already has) and packages them as a list of [`ObjectList`]s
+/// grouped by type.  The server subtracts its own holdings to derive the
+/// exact `need_objects` set — no `augment_needs_locally` workaround needed.
+fn build_client_inventory(
     to_push: &[crate::model::Ref],
     remote_tips: &HashMap<String, Vec<u8>>,
     _chunks: &dyn ChunkStore,
@@ -680,34 +676,6 @@ fn augment_needs_locally(
     use std::collections::HashSet;
     use crate::sync::reachable::{CancelToken, collect_reachable};
 
-    // Seed the merged sets from whatever the server already asked for.
-    let mut need_chunks: Vec<Vec<u8>> = Vec::new();
-    let mut need_trees: Vec<Vec<u8>> = Vec::new();
-    let mut need_nodes: Vec<Vec<u8>> = Vec::new();
-    let mut need_versions: Vec<Vec<u8>> = Vec::new();
-
-    let mut seen_chunks: HashSet<Vec<u8>> = HashSet::new();
-    let mut seen_trees: HashSet<Vec<u8>> = HashSet::new();
-    let mut seen_nodes: HashSet<Vec<u8>> = HashSet::new();
-    let mut seen_versions: HashSet<Vec<u8>> = HashSet::new();
-
-    for list in server_needs {
-        for h in &list.hashes {
-            let dst = match list.r#type {
-                PROTO_TYPE_CHUNK => (&mut need_chunks, &mut seen_chunks),
-                PROTO_TYPE_TREE_NODE => (&mut need_trees, &mut seen_trees),
-                PROTO_TYPE_NODE_ENTRY => (&mut need_nodes, &mut seen_nodes),
-                PROTO_TYPE_VERSION => (&mut need_versions, &mut seen_versions),
-                _ => continue,
-            };
-            if dst.1.insert(h.hash.clone()) {
-                dst.0.push(h.hash.clone());
-            }
-        }
-    }
-
-    // Walk reachable from each new tip, with the remote's current tip
-    // (if any) as the BFS boundary.
     let want: Vec<VersionId> = to_push.iter().map(|r| r.target.clone()).collect();
     let have: HashSet<VersionId> = remote_tips
         .iter()
@@ -729,70 +697,50 @@ fn augment_needs_locally(
         &CancelToken::new(),
     )?;
 
-    for h in &reachable.chunk_hashes {
-        let bytes = h.as_bytes().to_vec();
-        if seen_chunks.insert(bytes.clone()) {
-            need_chunks.push(bytes);
-        }
-    }
-    for h in &reachable.tree_hashes {
-        let bytes = h.as_bytes().to_vec();
-        if seen_trees.insert(bytes.clone()) {
-            need_trees.push(bytes);
-        }
-    }
-    for h in &reachable.node_hashes {
-        let bytes = h.as_bytes().to_vec();
-        if seen_nodes.insert(bytes.clone()) {
-            need_nodes.push(bytes);
-        }
-    }
-    for v in &reachable.versions {
-        if v.as_str().len() == 64 {
-            if let Ok(b) = hex::decode(v.as_str()) {
-                if seen_versions.insert(b.clone()) {
-                    need_versions.push(b);
-                }
-            }
-        }
-    }
-
     let mut out = Vec::new();
-    if !need_chunks.is_empty() {
+
+    if !reachable.chunk_hashes.is_empty() {
         out.push(ObjectList {
             r#type: PROTO_TYPE_CHUNK,
-            hashes: need_chunks
-                .into_iter()
-                .map(|h| ObjectId { hash: h })
+            hashes: reachable
+                .chunk_hashes
+                .iter()
+                .map(|h| ObjectId { hash: h.as_bytes().to_vec() })
                 .collect(),
         });
     }
-    if !need_trees.is_empty() {
+    if !reachable.tree_hashes.is_empty() {
         out.push(ObjectList {
             r#type: PROTO_TYPE_TREE_NODE,
-            hashes: need_trees
-                .into_iter()
-                .map(|h| ObjectId { hash: h })
+            hashes: reachable
+                .tree_hashes
+                .iter()
+                .map(|h| ObjectId { hash: h.as_bytes().to_vec() })
                 .collect(),
         });
     }
-    if !need_nodes.is_empty() {
+    if !reachable.node_hashes.is_empty() {
         out.push(ObjectList {
             r#type: PROTO_TYPE_NODE_ENTRY,
-            hashes: need_nodes
-                .into_iter()
-                .map(|h| ObjectId { hash: h })
+            hashes: reachable
+                .node_hashes
+                .iter()
+                .map(|h| ObjectId { hash: h.as_bytes().to_vec() })
                 .collect(),
         });
     }
-    if !need_versions.is_empty() {
+    if !reachable.versions.is_empty() {
         out.push(ObjectList {
             r#type: PROTO_TYPE_VERSION,
-            hashes: need_versions
-                .into_iter()
-                .map(|h| ObjectId { hash: h })
+            hashes: reachable
+                .versions
+                .iter()
+                .filter_map(|v| hex::decode(v.as_str()).ok())
+                .filter(|b| b.len() == 32)
+                .map(|b| ObjectId { hash: b })
                 .collect(),
         });
     }
+
     Ok(out)
 }
