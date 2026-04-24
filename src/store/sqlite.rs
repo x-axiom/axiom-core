@@ -6,14 +6,18 @@ use rusqlite::{params, Connection};
 
 use crate::error::{CasError, CasResult};
 use crate::model::{ChunkHash, Ref, RefKind, VersionId, VersionNode};
-use super::traits::{PathEntry, PathIndexRepo, RefRepo, Remote, RemoteRef, RemoteRepo, RemoteTrackingRepo, SyncDirection, SyncSession, SyncSessionRepo, SyncSessionStatus, VersionRepo};
+use super::traits::{
+    ObjectManifestRepo, PathEntry, PathIndexRepo, RefRepo, Remote, RemoteRef, RemoteRepo,
+    RemoteTrackingRepo, SyncDirection, SyncSession, SyncSessionRepo, SyncSessionStatus,
+    VersionRepo,
+};
 
 // ---------------------------------------------------------------------------
 // Schema migration
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding new migrations.
-const CURRENT_SCHEMA_VERSION: u32 = 4;
+const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// Apply all pending migrations up to `CURRENT_SCHEMA_VERSION`.
 fn run_migrations(conn: &Connection) -> CasResult<()> {
@@ -50,6 +54,9 @@ fn run_migrations(conn: &Connection) -> CasResult<()> {
             }
             if current < 4 {
                 migrate_v4(conn)?;
+            }
+            if current < 5 {
+                migrate_v5(conn)?;
             }
             Ok(())
         })();
@@ -293,6 +300,25 @@ fn migrate_v4(conn: &Connection) -> CasResult<()> {
         CREATE INDEX IF NOT EXISTS idx_sync_sessions_remote ON sync_sessions(remote_name);
 
         UPDATE schema_version SET version = 4;
+        ",
+    )
+    .map_err(|e| CasError::Store(e.to_string()))?;
+    Ok(())
+}
+
+/// Migration v5: add `sync_manifests` table for E05-S03 resume support.
+fn migrate_v5(conn: &Connection) -> CasResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS sync_manifests (
+            session_id  TEXT    NOT NULL,
+            hash_hex    TEXT    NOT NULL,
+            PRIMARY KEY (session_id, hash_hex)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_manifests_session
+            ON sync_manifests(session_id);
+
+        UPDATE schema_version SET version = 5;
         ",
     )
     .map_err(|e| CasError::Store(e.to_string()))?;
@@ -1192,6 +1218,47 @@ impl SyncSessionRepo for SqliteMetadataStore {
                 row_to_sync_session(id, rn, dir, st, sa, fa, ot, bt, em)
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ObjectManifestRepo (E05-S03 resume support)
+// ---------------------------------------------------------------------------
+
+impl ObjectManifestRepo for SqliteMetadataStore {
+    fn manifest_append(&self, session_id: &str, hash_hexes: &[String]) -> CasResult<()> {
+        let conn = self.conn.lock();
+        for hex in hash_hexes {
+            conn.execute(
+                "INSERT OR IGNORE INTO sync_manifests (session_id, hash_hex) VALUES (?1, ?2)",
+                params![session_id, hex],
+            )
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn manifest_load(&self, session_id: &str) -> CasResult<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT hash_hex FROM sync_manifests WHERE session_id = ?1")
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))
+            .map_err(|e| CasError::Store(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(rows)
+    }
+
+    fn manifest_delete(&self, session_id: &str) -> CasResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM sync_manifests WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(())
     }
 }
 

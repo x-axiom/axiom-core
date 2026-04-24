@@ -6,7 +6,10 @@ use crate::model::{
     ChunkHash, NodeEntry, Ref, RefKind, TreeNode, VersionId, VersionNode,
     hash_bytes, hash_children,
 };
-use super::traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry, SyncStore, ReachableObjects};
+use super::traits::{
+    ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry,
+    ObjectManifestRepo, SyncStore, ReachableObjects,
+};
 
 // ---------------------------------------------------------------------------
 // InMemoryChunkStore
@@ -260,6 +263,47 @@ impl PathIndexRepo for InMemoryPathIndex {
             .map(|(_, entry)| entry.clone())
             .collect();
         Ok(results)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InMemoryManifestStore (E05-S03)
+// ---------------------------------------------------------------------------
+
+/// In-memory implementation of [`ObjectManifestRepo`] for use in tests.
+#[derive(Default)]
+pub struct InMemoryManifestStore {
+    inner: RwLock<HashMap<String, Vec<String>>>,
+}
+
+impl InMemoryManifestStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ObjectManifestRepo for InMemoryManifestStore {
+    fn manifest_append(&self, session_id: &str, hash_hexes: &[String]) -> CasResult<()> {
+        self.inner
+            .write()
+            .entry(session_id.to_string())
+            .or_default()
+            .extend_from_slice(hash_hexes);
+        Ok(())
+    }
+
+    fn manifest_load(&self, session_id: &str) -> CasResult<Vec<String>> {
+        Ok(self
+            .inner
+            .read()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn manifest_delete(&self, session_id: &str) -> CasResult<()> {
+        self.inner.write().remove(session_id);
+        Ok(())
     }
 }
 

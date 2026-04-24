@@ -18,8 +18,8 @@ use tonic::{transport::Channel, Request};
 use crate::error::{CasError, CasResult};
 use crate::model::{NodeEntry, Ref, RefKind, TreeNode, VersionId, VersionNode, current_timestamp};
 use crate::store::traits::{
-    ChunkStore, NodeStore, RefRepo, RemoteTrackingRepo, SyncDirection, SyncSessionRepo,
-    TreeStore, VersionRepo,
+    ChunkStore, NodeStore, ObjectManifestRepo, RefRepo, RemoteTrackingRepo, SyncDirection,
+    SyncSessionRepo, TreeStore, VersionRepo,
 };
 use crate::sync::proto::{
     DownloadPackRequest, ListRefsRequest, NegotiatePullRequest, WantEntry,
@@ -27,6 +27,7 @@ use crate::sync::proto::{
     sync_service_client::SyncServiceClient,
 };
 use crate::sync::remote_refs::RemoteRef;
+use crate::sync::resume::{ResumeSet, cleanup_stale_sessions, find_resumable};
 use crate::sync::session::{begin_session, complete_session, fail_session};
 
 // ─── Proto ObjectType constants ──────────────────────────────────────────────
@@ -116,6 +117,9 @@ impl PullClient {
     ///                 sync-sessions table (begin/complete/fail). Bookkeeping
     ///                 errors are intentionally swallowed so they cannot mask
     ///                 a real pull error.
+    /// * `manifests` — if `Some`, received version hashes are checkpointed so
+    ///                 an interrupted pull can resume without re-downloading
+    ///                 already-received objects (E05-S03).
     /// * `progress`  — called at each protocol step and after every object.
     ///
     /// # Returns
@@ -132,30 +136,54 @@ impl PullClient {
         nodes: &dyn NodeStore,
         versions: &dyn VersionRepo,
         sessions: Option<&dyn SyncSessionRepo>,
+        manifests: Option<&dyn ObjectManifestRepo>,
         progress: impl FnMut(PullProgress),
     ) -> CasResult<Vec<PullResult>> {
-        let session_id = new_session_id("pull");
-        if let Some(repo) = sessions {
-            let _ = begin_session(
-                repo,
-                &session_id,
-                &config.remote_name,
-                SyncDirection::Pull,
-            );
+        let now = current_timestamp();
+
+        // Expire stale sessions.
+        if let (Some(sess), mfst) = (sessions, manifests) {
+            let _ = cleanup_stale_sessions(sess, mfst, 86400, now);
         }
+
+        // Look for a resumable Running session.
+        let (session_id, have_hints) = if let (Some(sess), Some(mfst)) = (sessions, manifests) {
+            match find_resumable(sess, &config.remote_name, SyncDirection::Pull, 86400, now)? {
+                Some(s) => {
+                    let hexes = mfst.manifest_load(&s.id)?;
+                    (s.id.clone(), hexes)
+                }
+                None => {
+                    let id = new_session_id("pull");
+                    let _ = begin_session(sess, &id, &config.remote_name, SyncDirection::Pull);
+                    (id, Vec::new())
+                }
+            }
+        } else {
+            let id = new_session_id("pull");
+            if let Some(repo) = sessions {
+                let _ = begin_session(repo, &id, &config.remote_name, SyncDirection::Pull);
+            }
+            (id, Vec::new())
+        };
 
         let outcome = self
             .pull_inner(
-                config, ref_names, refs, tracking, chunks, trees, nodes, versions, progress,
+                config, ref_names, refs, tracking, chunks, trees, nodes, versions,
+                &session_id, have_hints, manifests, progress,
             )
             .await;
 
         match (&outcome, sessions) {
             (Ok((_, objs, bytes)), Some(repo)) => {
                 let _ = complete_session(repo, &session_id, *objs, *bytes);
+                if let Some(mfst) = manifests {
+                    let _ = mfst.manifest_delete(&session_id);
+                }
             }
             (Err(e), Some(repo)) => {
                 let _ = fail_session(repo, &session_id, e.to_string());
+                // Keep manifest for future resume.
             }
             _ => {}
         }
@@ -175,6 +203,9 @@ impl PullClient {
         trees: &dyn TreeStore,
         nodes: &dyn NodeStore,
         versions: &dyn VersionRepo,
+        local_session_id: &str,
+        have_hints: Vec<String>,
+        manifests: Option<&dyn ObjectManifestRepo>,
         mut progress: impl FnMut(PullProgress),
     ) -> CasResult<(Vec<PullResult>, u64, u64)> {
         // ── Step 1: ListRefs ──────────────────────────────────────────────
@@ -210,7 +241,7 @@ impl PullClient {
         }
 
         // ── Build want/have list ──────────────────────────────────────────
-        let wants: Vec<WantEntry> = remote_refs
+        let mut wants: Vec<WantEntry> = remote_refs
             .iter()
             .map(|(name, remote_hash)| {
                 // "have" = local tip of the remote-tracking ref for this branch.
@@ -231,6 +262,20 @@ impl PullClient {
             })
             .collect();
 
+        // Append resume have-hints so the server knows which versions the
+        // client already has (from a previous interrupted pull).
+        for hex in &have_hints {
+            if let Ok(bytes) = hex::decode(hex) {
+                if bytes.len() == 32 {
+                    wants.push(WantEntry {
+                        ref_name: String::new(),
+                        have: Some(crate::sync::proto::ObjectId { hash: bytes }),
+                        want: None,
+                    });
+                }
+            }
+        }
+
         // ── Step 2: NegotiatePull ─────────────────────────────────────────
         progress(PullProgress {
             stage: PullStage::Negotiating,
@@ -249,14 +294,14 @@ impl PullClient {
             .map_err(|e| CasError::SyncError(format!("negotiate_pull: {e}")))?
             .into_inner();
 
-        let session_id = neg_resp.session_id.clone();
+        let server_session_id = neg_resp.session_id.clone();
         let total_objects = neg_resp.total_objects;
 
         // ── Step 3: DownloadPack ──────────────────────────────────────────
         let mut dl_stream = self
             .inner
             .download_pack(Request::new(DownloadPackRequest {
-                session_id: session_id.clone(),
+                session_id: server_session_id.clone(),
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
             }))
@@ -294,6 +339,16 @@ impl PullClient {
                     let declared = blake3::Hash::from_bytes(arr);
 
                     store_object(entry.r#type, declared, &raw, chunks, trees, nodes, versions)?;
+
+                    // Checkpoint received versions for potential resume.
+                    if entry.r#type == PROTO_TYPE_VERSION {
+                        if let Some(mfst) = manifests {
+                            let _ = mfst.manifest_append(
+                                local_session_id,
+                                &[hex::encode(arr)],
+                            );
+                        }
+                    }
 
                     objects_done += 1;
                     progress(PullProgress {

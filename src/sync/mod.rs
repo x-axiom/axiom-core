@@ -41,6 +41,10 @@ pub mod clone_client;
 #[cfg(feature = "cloud")]
 pub mod shallow;
 
+/// Resume/checkpoint helpers for interrupted push/pull (E05-S03).
+#[cfg(feature = "cloud")]
+pub mod resume;
+
 /// Generated gRPC types and service traits for `axiom.sync.v1`.
 #[cfg(feature = "cloud")]
 pub mod proto {

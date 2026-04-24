@@ -16,8 +16,8 @@ use tonic::{transport::Channel, Request};
 use crate::error::{CasError, CasResult};
 use crate::model::{ChunkHash, RefKind, VersionId, current_timestamp};
 use crate::store::traits::{
-    ChunkStore, NodeStore, RefRepo, RemoteTrackingRepo, SyncDirection, SyncSessionRepo,
-    TreeStore, VersionRepo,
+    ChunkStore, NodeStore, ObjectManifestRepo, RefRepo, RemoteTrackingRepo, SyncDirection,
+    SyncSessionRepo, TreeStore, VersionRepo,
 };
 use crate::sync::proto::{
     FinalizeRefsRequest, ListRefsRequest, NegotiatePushRequest, ObjectId, ObjectList,
@@ -26,6 +26,7 @@ use crate::sync::proto::{
     upload_pack_request::Payload,
 };
 use crate::sync::remote_refs::RemoteRef;
+use crate::sync::resume::{ResumeSet, cleanup_stale_sessions, find_resumable};
 use crate::sync::session::{begin_session, complete_session, fail_session};
 
 // ─── Proto ObjectType constants ──────────────────────────────────────────────
@@ -110,6 +111,9 @@ impl PushClient {
     ///                  sync-sessions table (begin/complete/fail). Bookkeeping
     ///                  errors are intentionally swallowed so that they cannot
     ///                  mask a real push error.
+    /// * `manifests`  — if `Some`, object hashes are checkpointed so an
+    ///                  interrupted push can be resumed without re-uploading
+    ///                  already-transferred objects (E05-S03).
     /// * `progress`   — called at each protocol step and after every object.
     ///
     /// # Returns
@@ -127,30 +131,55 @@ impl PushClient {
         versions: &dyn VersionRepo,
         tracking: Option<&dyn RemoteTrackingRepo>,
         sessions: Option<&dyn SyncSessionRepo>,
+        manifests: Option<&dyn ObjectManifestRepo>,
         progress: impl FnMut(SyncProgress),
     ) -> CasResult<HashMap<String, String>> {
-        let session_id = new_session_id("push");
-        if let Some(repo) = sessions {
-            let _ = begin_session(
-                repo,
-                &session_id,
-                &config.remote_name,
-                SyncDirection::Push,
-            );
+        let now = current_timestamp();
+
+        // Expire stale sessions before looking for a resumable one.
+        if let (Some(sess), mfst) = (sessions, manifests) {
+            let _ = cleanup_stale_sessions(sess, mfst, 86400, now);
         }
+
+        // Look for a resumable Running session.
+        let (session_id, resume_set) = if let (Some(sess), Some(mfst)) = (sessions, manifests) {
+            match find_resumable(sess, &config.remote_name, SyncDirection::Push, 86400, now)? {
+                Some(s) => {
+                    let hexes = mfst.manifest_load(&s.id)?;
+                    (s.id.clone(), ResumeSet::from_manifest(hexes))
+                }
+                None => {
+                    let id = new_session_id("push");
+                    let _ = begin_session(sess, &id, &config.remote_name, SyncDirection::Push);
+                    (id, ResumeSet::empty())
+                }
+            }
+        } else {
+            let id = new_session_id("push");
+            if let Some(repo) = sessions {
+                let _ = begin_session(repo, &id, &config.remote_name, SyncDirection::Push);
+            }
+            (id, ResumeSet::empty())
+        };
 
         let outcome = self
             .push_inner(
-                config, ref_names, refs, chunks, trees, nodes, versions, tracking, progress,
+                config, ref_names, refs, chunks, trees, nodes, versions, tracking,
+                &session_id, &resume_set, manifests, progress,
             )
             .await;
 
         match (&outcome, sessions) {
             (Ok((_, objs, bytes)), Some(repo)) => {
                 let _ = complete_session(repo, &session_id, *objs, *bytes);
+                // Manifest cleanup on success.
+                if let Some(mfst) = manifests {
+                    let _ = mfst.manifest_delete(&session_id);
+                }
             }
             (Err(e), Some(repo)) => {
                 let _ = fail_session(repo, &session_id, e.to_string());
+                // Keep manifest for future resume — do NOT delete.
             }
             _ => {}
         }
@@ -170,6 +199,9 @@ impl PushClient {
         nodes: &dyn NodeStore,
         versions: &dyn VersionRepo,
         tracking: Option<&dyn RemoteTrackingRepo>,
+        session_id: &str,
+        resume_set: &ResumeSet,
+        manifests: Option<&dyn ObjectManifestRepo>,
         mut progress: impl FnMut(SyncProgress),
     ) -> CasResult<(HashMap<String, String>, u64, u64)> {
         // ── Step 1: ListRefs ──────────────────────────────────────────────
@@ -267,7 +299,7 @@ impl PushClient {
             return Err(CasError::SyncError(format!("push rejected: {reason}")));
         }
 
-        let session_id = neg_resp.session_id.clone();
+        let server_session_id = neg_resp.session_id.clone();
 
         // ── Augment server-reported needs with locally-walked reachable set.
         //
@@ -282,6 +314,19 @@ impl PushClient {
         let augmented_need_objects =
             augment_needs_locally(&neg_resp.need_objects, &to_push, &remote_tips,
                                   chunks, trees, nodes, versions)?;
+
+        // Filter out objects already confirmed sent in a previous session.
+        let augmented_need_objects: Vec<ObjectList> = if resume_set.is_empty() {
+            augmented_need_objects
+        } else {
+            augmented_need_objects
+                .into_iter()
+                .map(|mut ol| {
+                    ol.hashes.retain(|oid| !resume_set.contains_hex(&hex::encode(&oid.hash)));
+                    ol
+                })
+                .collect()
+        };
 
         let total_objects: u64 = augmented_need_objects
             .iter()
@@ -299,12 +344,13 @@ impl PushClient {
             payload: Some(Payload::Header(PackHeader {
                 object_count: total_objects,
                 estimated_bytes: 0,
-                session_id: session_id.clone(),
+                session_id: server_session_id.clone(),
             })),
         });
 
         let mut objects_done: u64 = 0;
         let mut bytes_uploaded: u64 = 0;
+        let mut uploaded_hexes: Vec<String> = Vec::new();
 
         for obj_list in &augmented_need_objects {
             let proto_type = obj_list.r#type;
@@ -315,6 +361,7 @@ impl PushClient {
 
                 bytes_uploaded += compressed.len() as u64;
                 objects_done += 1;
+                uploaded_hexes.push(hex::encode(&oid.hash));
 
                 messages.push(UploadPackRequest {
                     payload: Some(Payload::Entry(PackEntry {
@@ -339,6 +386,13 @@ impl PushClient {
             .await
             .map_err(|e| CasError::SyncError(format!("upload_pack: {e}")))?;
 
+        // Checkpoint the uploaded objects for potential future resume.
+        if let Some(mfst) = manifests {
+            if !uploaded_hexes.is_empty() {
+                let _ = mfst.manifest_append(session_id, &uploaded_hexes);
+            }
+}
+
         // ── Step 4: FinalizeRefs ──────────────────────────────────────────
         progress(SyncProgress {
             stage: PushStage::Finalizing,
@@ -348,7 +402,7 @@ impl PushClient {
         let fin_resp = self
             .inner
             .finalize_refs(Request::new(FinalizeRefsRequest {
-                session_id,
+                session_id: server_session_id,
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
                 ref_updates,

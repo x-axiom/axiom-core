@@ -433,3 +433,39 @@ impl<T: SyncSessionRepo + ?Sized> SyncSessionRepo for Arc<T> {
         (**self).list_sync_sessions(remote, limit)
     }
 }
+
+// ---------------------------------------------------------------------------
+// ObjectManifestRepo (E05-S03) — per-session object transfer manifest
+// ---------------------------------------------------------------------------
+
+/// Persists which object hashes have been confirmed transferred for a given
+/// sync session.
+///
+/// Used by push/pull clients to skip already-transferred objects when resuming
+/// an interrupted session without re-transferring the full pack.
+///
+/// Hash values are stored as lowercase hex strings (64 chars for BLAKE3).
+pub trait ObjectManifestRepo: Send + Sync {
+    /// Append confirmed-transferred object hashes to the manifest for `session_id`.
+    fn manifest_append(&self, session_id: &str, hash_hexes: &[String]) -> CasResult<()>;
+
+    /// Load all recorded hash hex strings for `session_id`.
+    fn manifest_load(&self, session_id: &str) -> CasResult<Vec<String>>;
+
+    /// Delete all manifest entries for `session_id`.
+    ///
+    /// Called when a session completes or fails so no stale entries remain.
+    fn manifest_delete(&self, session_id: &str) -> CasResult<()>;
+}
+
+impl<T: ObjectManifestRepo + ?Sized> ObjectManifestRepo for Arc<T> {
+    fn manifest_append(&self, session_id: &str, hash_hexes: &[String]) -> CasResult<()> {
+        (**self).manifest_append(session_id, hash_hexes)
+    }
+    fn manifest_load(&self, session_id: &str) -> CasResult<Vec<String>> {
+        (**self).manifest_load(session_id)
+    }
+    fn manifest_delete(&self, session_id: &str) -> CasResult<()> {
+        (**self).manifest_delete(session_id)
+    }
+}
