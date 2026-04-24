@@ -22,14 +22,16 @@ use parking_lot::Mutex;
 use tonic::{Request, Response, Status};
 
 use crate::error::{CasError, CasResult};
-use crate::model::{NodeEntry, TreeNode, VersionId, VersionNode};
+use crate::model::{NodeEntry, Ref, TreeNode, VersionId, VersionNode};
+use crate::sync::shallow::collect_versions_shallow;
 use crate::store::traits::{ChunkStore, NodeStore, RefRepo, SyncStore, TreeStore, VersionRepo};
 use crate::sync::proto::{
     CloneDownloadRequest, CloneDownloadResponse, CloneInitRequest, CloneInitResponse,
     DownloadPackRequest, DownloadPackResponse, FinalizeRefsRequest, FinalizeRefsResponse,
     ListRefsRequest, ListRefsResponse, NegotiatePullRequest, NegotiatePullResponse,
-    NegotiatePushRequest, NegotiatePushResponse, ObjectId, PackEntry, PackHeader,
+    NegotiatePushRequest, NegotiatePushResponse, ObjectId, PackEntry, PackHeader, RefInfo,
     UploadPackRequest, UploadPackResponse,
+    clone_download_response::Payload as ClonePayload,
     download_pack_response::Payload,
 };
 use crate::sync::proto::sync_service_server::SyncService;
@@ -46,6 +48,13 @@ const PROTO_TYPE_VERSION: i32 = 4;
 /// to the client during `DownloadPack`.
 #[derive(Clone, Debug)]
 struct PullSession {
+    objects: Vec<(i32, [u8; 32])>,
+}
+
+/// Clone session — same payload shape as [`PullSession`] but keyed separately
+/// so clone and pull sessions cannot collide.
+#[derive(Clone, Debug)]
+struct CloneSession {
     objects: Vec<(i32, [u8; 32])>,
 }
 
@@ -78,6 +87,7 @@ pub struct PullServiceHandler {
     /// Wrapped in `Arc` so stream closures can cheaply clone a reference.
     state: Arc<PullServiceState>,
     sessions: Arc<Mutex<HashMap<String, PullSession>>>,
+    clone_sessions: Arc<Mutex<HashMap<String, CloneSession>>>,
 }
 
 impl PullServiceHandler {
@@ -85,6 +95,7 @@ impl PullServiceHandler {
         Self {
             state: Arc::new(state),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            clone_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -346,20 +357,169 @@ impl SyncService for PullServiceHandler {
         Err(Status::unimplemented("push not handled by PullServiceHandler"))
     }
 
+    // ── CloneInit ─────────────────────────────────────────────────────────
     async fn clone_init(
         &self,
-        _request: Request<CloneInitRequest>,
+        request: Request<CloneInitRequest>,
     ) -> Result<Response<CloneInitResponse>, Status> {
-        Err(Status::unimplemented("clone not yet implemented"))
+        let req = request.into_inner();
+
+        // Collect refs, optionally filtered to the requested subset.
+        let all_refs: Vec<Ref> = self.state.refs
+            .list_refs(None)
+            .map_err(cas_err_to_status)?;
+
+        let selected_refs: Vec<Ref> = if req.refs.is_empty() {
+            all_refs
+        } else {
+            all_refs.into_iter().filter(|r| req.refs.contains(&r.name)).collect()
+        };
+
+        let tips: Vec<VersionId> =
+            selected_refs.iter().map(|r| r.target.clone()).collect();
+
+        // Collect objects based on depth (None or 0 = full clone).
+        let reachable = if tips.is_empty() {
+            crate::store::traits::ReachableObjects::default()
+        } else {
+            let depth = req.depth.unwrap_or(0);
+            if depth == 0 {
+                self.state.sync
+                    .collect_reachable_objects(&tips)
+                    .map_err(cas_err_to_status)?
+            } else {
+                let (version_ids, boundary) =
+                    collect_versions_shallow(&tips, depth, self.state.versions.as_ref())
+                        .map_err(cas_err_to_status)?;
+                let have_set = boundary.into_set();
+                self.state.sync
+                    .collect_reachable_with_have(&version_ids, &have_set)
+                    .map_err(cas_err_to_status)?
+            }
+        };
+
+        // Build ordered object list (versions → tree nodes → node entries → chunks).
+        let mut objects: Vec<(i32, [u8; 32])> = Vec::new();
+        for vid in &reachable.versions {
+            if let Ok(bytes) = hex::decode(vid.as_str()) {
+                if bytes.len() == 32 {
+                    let arr: [u8; 32] = bytes.try_into().unwrap();
+                    objects.push((PROTO_TYPE_VERSION, arr));
+                }
+            }
+        }
+        for h in &reachable.tree_hashes {
+            objects.push((PROTO_TYPE_TREE_NODE, *h.as_bytes()));
+        }
+        for h in &reachable.node_hashes {
+            objects.push((PROTO_TYPE_NODE_ENTRY, *h.as_bytes()));
+        }
+        for h in &reachable.chunk_hashes {
+            objects.push((PROTO_TYPE_CHUNK, *h.as_bytes()));
+        }
+
+        let total_objects = objects.len() as u64;
+        let session_id = new_session_id();
+        {
+            let mut sessions = self.clone_sessions.lock();
+            sessions.insert(session_id.clone(), CloneSession { objects });
+        }
+
+        // Build proto RefInfo list.
+        let proto_refs: Vec<RefInfo> = selected_refs
+            .iter()
+            .filter_map(|r| {
+                hex::decode(r.target.as_str()).ok().and_then(|bytes| {
+                    if bytes.len() == 32 {
+                        Some(RefInfo {
+                            name: r.name.clone(),
+                            target: Some(ObjectId { hash: bytes }),
+                        })
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        Ok(Response::new(CloneInitResponse {
+            session_id,
+            refs: proto_refs,
+            total_objects,
+            total_bytes: 0,
+        }))
     }
 
+    // ── CloneDownload ─────────────────────────────────────────────────────
     type CloneDownloadStream =
         Pin<Box<dyn futures_util::Stream<Item = Result<CloneDownloadResponse, Status>> + Send>>;
 
     async fn clone_download(
         &self,
-        _request: Request<CloneDownloadRequest>,
+        request: Request<CloneDownloadRequest>,
     ) -> Result<Response<Self::CloneDownloadStream>, Status> {
-        Err(Status::unimplemented("clone not yet implemented"))
+        let req = request.into_inner();
+
+        let session = {
+            let mut sessions = self.clone_sessions.lock();
+            sessions.remove(&req.session_id)
+        }
+        .ok_or_else(|| {
+            Status::not_found(format!("clone session '{}' not found", req.session_id))
+        })?;
+
+        let total = session.objects.len() as u64;
+        let state = Arc::clone(&self.state);
+
+        let header_msg: Result<CloneDownloadResponse, Status> =
+            Ok(CloneDownloadResponse {
+                payload: Some(ClonePayload::Header(PackHeader {
+                    object_count: total,
+                    estimated_bytes: 0,
+                    session_id: req.session_id.clone(),
+                })),
+            });
+
+        let object_stream = futures_util::stream::unfold(
+            (0usize, session.objects, state),
+            |(idx, objects, state)| async move {
+                if idx >= objects.len() {
+                    return None;
+                }
+                let (proto_type, hash_bytes) = objects[idx];
+                let hash = blake3::Hash::from_bytes(hash_bytes);
+
+                let result = (|| -> CasResult<CloneDownloadResponse> {
+                    let raw = fetch_raw(
+                        proto_type,
+                        &hash,
+                        state.chunks.as_ref(),
+                        state.trees.as_ref(),
+                        state.nodes.as_ref(),
+                        state.versions.as_ref(),
+                    )?;
+                    let compressed = zstd::bulk::compress(&raw, 3)
+                        .map_err(|e| CasError::SyncError(format!("zstd compress: {e}")))?;
+
+                    Ok(CloneDownloadResponse {
+                        payload: Some(ClonePayload::Entry(PackEntry {
+                            r#type: proto_type,
+                            hash: Some(ObjectId {
+                                hash: hash_bytes.to_vec(),
+                            }),
+                            data: compressed,
+                        })),
+                    })
+                })();
+
+                let item = result.map_err(cas_err_to_status);
+                Some((item, (idx + 1, objects, state)))
+            },
+        );
+
+        let full_stream =
+            futures_util::stream::once(async move { header_msg }).chain(object_stream);
+
+        Ok(Response::new(Box::pin(full_stream)))
     }
 }

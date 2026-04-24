@@ -44,6 +44,7 @@ use axiom_core::sync::proto::{
 use axiom_core::sync::proto::sync_service_server::SyncService;
 use axiom_core::store::memory::InMemoryPathIndex;
 use axiom_core::sync::clone_client::{CloneClient, CloneConfig};
+use axiom_core::sync::shallow::ShallowBoundary;
 use axiom_core::sync::pull_client::{PullClient, PullConfig};
 use axiom_core::sync::pull_server::{PullServiceHandler, PullServiceState};
 use axiom_core::sync::push_client::{PushClient, PushConfig};
@@ -116,12 +117,12 @@ impl SyncService for CombinedSyncHandler {
         Ok(Response::new(boxed))
     }
 
-    // ── Clone (unimplemented stubs) ───────────────────────────────────────
+    // ── Clone (routed to pull handler) ────────────────────────────────────
     async fn clone_init(
         &self,
-        _req: Request<CloneInitRequest>,
+        req: Request<CloneInitRequest>,
     ) -> Result<Response<CloneInitResponse>, Status> {
-        Err(Status::unimplemented("clone not implemented"))
+        self.pull.clone_init(req).await
     }
 
     type CloneDownloadStream =
@@ -129,9 +130,12 @@ impl SyncService for CombinedSyncHandler {
 
     async fn clone_download(
         &self,
-        _req: Request<CloneDownloadRequest>,
+        req: Request<CloneDownloadRequest>,
     ) -> Result<Response<Self::CloneDownloadStream>, Status> {
-        Err(Status::unimplemented("clone not implemented"))
+        let resp = self.pull.clone_download(req).await?;
+        let inner = resp.into_inner();
+        let boxed: Self::CloneDownloadStream = Box::pin(inner);
+        Ok(Response::new(boxed))
     }
 }
 
@@ -991,4 +995,146 @@ async fn clone_with_history_rebuilds_refs_and_path_index() {
     // (4) Path index was populated for the cloned version (root entry).
     let root_entry = path_index.get_by_path(&vid_a, "").unwrap();
     assert!(root_entry.is_some(), "path index root entry must exist after clone");
+}
+
+// ── Shallow clone tests (E05-S02) ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn shallow_clone_depth_1_gets_only_tip_version() {
+    // Server: root → tip (2-commit chain on branch "main").
+    let server = Backends::new();
+    let root_vid = seed_branch(&server, "main", b"root", vec![]);
+    let tip_vid = seed_branch(&server, "main", b"tip", vec![root_vid.clone()]);
+    let addr = spawn_server(server).await;
+
+    let client = Backends::new();
+    let path_index = InMemoryPathIndex::new();
+    let mut clone = connect_clone(addr).await;
+
+    let (results, boundary) = clone
+        .clone_shallow(
+            &cfg_clone(),
+            1, // depth=1: only the tip
+            &[],
+            client.refs.as_ref(),
+            client.chunks.as_ref(),
+            client.trees.as_ref(),
+            client.nodes.as_ref(),
+            client.versions.as_ref(),
+            Some(&path_index),
+            None,
+            |_| {},
+        )
+        .await
+        .expect("shallow clone must not error");
+
+    // Only the tip was transferred.
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].ref_name, "main");
+    assert_eq!(results[0].tip, tip_vid);
+
+    // Tip version is readable.
+    assert!(client.versions.get_version(&tip_vid).unwrap().is_some());
+
+    // Root version must NOT be in the client store.
+    assert!(client.versions.get_version(&root_vid).unwrap().is_none());
+
+    // Boundary contains the parent we didn't fetch.
+    assert!(boundary.contains(&root_vid), "root_vid must be in boundary");
+}
+
+#[tokio::test]
+async fn shallow_clone_depth_2_gets_two_versions() {
+    // Server: root → mid → tip (3-commit chain).
+    let server = Backends::new();
+    let root_vid = seed_branch(&server, "main", b"r", vec![]);
+    let mid_vid = seed_branch(&server, "main", b"mi", vec![root_vid.clone()]);
+    let tip_vid = seed_branch(&server, "main", b"tip", vec![mid_vid.clone()]);
+    let addr = spawn_server(server).await;
+
+    let client = Backends::new();
+    let path_index = InMemoryPathIndex::new();
+    let mut clone = connect_clone(addr).await;
+
+    let (results, boundary) = clone
+        .clone_shallow(
+            &cfg_clone(),
+            2, // depth=2: tip + mid
+            &[],
+            client.refs.as_ref(),
+            client.chunks.as_ref(),
+            client.trees.as_ref(),
+            client.nodes.as_ref(),
+            client.versions.as_ref(),
+            Some(&path_index),
+            None,
+            |_| {},
+        )
+        .await
+        .expect("shallow clone depth=2 must not error");
+
+    assert_eq!(results[0].tip, tip_vid);
+    assert!(client.versions.get_version(&tip_vid).unwrap().is_some());
+    assert!(client.versions.get_version(&mid_vid).unwrap().is_some());
+    assert!(client.versions.get_version(&root_vid).unwrap().is_none());
+
+    assert!(boundary.contains(&root_vid), "root_vid must be in boundary");
+    assert!(!boundary.contains(&mid_vid), "mid_vid must NOT be a boundary");
+}
+
+#[tokio::test]
+async fn unshallow_retrieves_full_history() {
+    // Server: root → mid → tip (3-commit chain).
+    let server = Backends::new();
+    let root_vid = seed_branch(&server, "main", b"r", vec![]);
+    let mid_vid = seed_branch(&server, "main", b"mi", vec![root_vid.clone()]);
+    let tip_vid = seed_branch(&server, "main", b"tip", vec![mid_vid.clone()]);
+    let addr = spawn_server(server).await;
+
+    let client = Backends::new();
+    let path_index = InMemoryPathIndex::new();
+    let mut clone = connect_clone(addr).await;
+
+    // Shallow clone with depth=1: only the tip.
+    let (_, boundary) = clone
+        .clone_shallow(
+            &cfg_clone(),
+            1,
+            &[],
+            client.refs.as_ref(),
+            client.chunks.as_ref(),
+            client.trees.as_ref(),
+            client.nodes.as_ref(),
+            client.versions.as_ref(),
+            Some(&path_index),
+            None,
+            |_| {},
+        )
+        .await
+        .expect("shallow clone must not error");
+
+    assert!(client.versions.get_version(&root_vid).unwrap().is_none());
+    assert!(!boundary.is_empty());
+
+    // Unshallow: fetch the missing ancestors (mid + root).
+    let objects_received = clone
+        .unshallow(
+            &cfg_clone(),
+            &boundary,
+            client.chunks.as_ref(),
+            client.trees.as_ref(),
+            client.nodes.as_ref(),
+            client.versions.as_ref(),
+            Some(&path_index),
+            |_| {},
+        )
+        .await
+        .expect("unshallow must not error");
+
+    assert!(objects_received > 0, "unshallow must transfer some objects");
+
+    // After unshallow, all three versions must be present.
+    assert!(client.versions.get_version(&tip_vid).unwrap().is_some());
+    assert!(client.versions.get_version(&mid_vid).unwrap().is_some());
+    assert!(client.versions.get_version(&root_vid).unwrap().is_some());
 }

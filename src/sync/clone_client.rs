@@ -1,17 +1,20 @@
-//! Clone client — first-time full repository clone (E05-S01).
+//! Clone client — first-time full repository clone (E05-S01) and shallow clone
+//! (E05-S02).
 //!
-//! ## Protocol
+//! ## Full-clone protocol (E05-S01)
 //! 1. `ListRefs`       — discover all refs on the remote.
-//! 2. `NegotiatePull`  — send wants with an empty have list (clone has no
-//!                       local objects to offer as a boundary).
-//! 3. `DownloadPack`   — receive every reachable object in the streaming pack.
+//! 2. `NegotiatePull`  — send wants with an empty have list.
+//! 3. `DownloadPack`   — receive every reachable object.
 //!
-//! After a successful clone:
-//! - All objects (chunks, tree nodes, node entries, versions) are stored locally.
-//! - Local branch refs are created pointing at the remote tips.
-//! - The path index is rebuilt for every cloned version (full history BFS).
+//! ## Shallow-clone protocol (E05-S02)
+//! 1. `CloneInit(depth)` — server prepares a depth-limited pack session.
+//! 2. `CloneDownload`    — stream the objects for that session.
+//!
+//! ## Unshallow (E05-S02)
+//! Uses `NegotiatePull` with the shallow boundary version IDs as the `want`
+//! set (empty `have`) to fetch only the missing ancestors.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use futures_util::StreamExt;
 use tonic::{transport::Channel, Request};
@@ -23,11 +26,14 @@ use crate::store::traits::{
     VersionRepo,
 };
 use crate::sync::proto::{
-    DownloadPackRequest, ListRefsRequest, NegotiatePullRequest, WantEntry,
+    CloneDownloadRequest, CloneInitRequest, DownloadPackRequest, ListRefsRequest,
+    NegotiatePullRequest, WantEntry,
+    clone_download_response::Payload as ClonePayload,
     download_pack_response::Payload,
     sync_service_client::SyncServiceClient,
 };
 use crate::sync::session::{begin_session, complete_session, fail_session};
+use crate::sync::shallow::{ShallowBoundary, collect_versions_shallow};
 
 // ─── Proto ObjectType constants ──────────────────────────────────────────────
 const PROTO_TYPE_CHUNK: i32 = 1;
@@ -341,6 +347,400 @@ impl CloneClient {
             .collect();
 
         Ok(results)
+    }
+
+    // ── Shallow clone (E05-S02) ───────────────────────────────────────────
+
+    /// Perform a depth-limited clone using the `CloneInit` / `CloneDownload`
+    /// dedicated RPCs.
+    ///
+    /// # Parameters
+    /// * `depth`      — number of version-history levels to fetch (≥ 1).
+    ///                  Use [`CloneClient::clone`] for a full clone.
+    /// * `ref_names`  — branch names to clone; empty slice clones all refs.
+    /// * other params — same as [`CloneClient::clone`].
+    ///
+    /// # Returns
+    /// `(results, boundary)` where `boundary` records the version IDs just
+    /// below the fetched history (parents not fetched).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn clone_shallow(
+        &mut self,
+        config: &CloneConfig,
+        depth: u32,
+        ref_names: &[String],
+        refs: &dyn RefRepo,
+        chunks: &dyn ChunkStore,
+        trees: &dyn TreeStore,
+        nodes: &dyn NodeStore,
+        versions: &dyn VersionRepo,
+        path_index: Option<&dyn PathIndexRepo>,
+        sessions: Option<&dyn SyncSessionRepo>,
+        progress: impl FnMut(CloneProgress),
+    ) -> CasResult<(Vec<CloneResult>, ShallowBoundary)> {
+        let session_id = new_session_id("shallow");
+        if let Some(repo) = sessions {
+            let _ = begin_session(repo, &session_id, &config.remote_name, SyncDirection::Pull);
+        }
+
+        let outcome = self
+            .clone_shallow_inner(
+                config, depth, ref_names, refs, chunks, trees, nodes, versions,
+                path_index, progress,
+            )
+            .await;
+
+        match (&outcome, sessions) {
+            (Ok((results, _)), Some(repo)) => {
+                let total_objects: u64 = results.iter().map(|r| r.objects_received).sum();
+                let total_bytes: u64 = results.iter().map(|r| r.bytes_downloaded).sum();
+                let _ = complete_session(repo, &session_id, total_objects, total_bytes);
+            }
+            (Err(e), Some(repo)) => {
+                let _ = fail_session(repo, &session_id, e.to_string());
+            }
+            _ => {}
+        }
+
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn clone_shallow_inner(
+        &mut self,
+        config: &CloneConfig,
+        depth: u32,
+        ref_names: &[String],
+        refs: &dyn RefRepo,
+        chunks: &dyn ChunkStore,
+        trees: &dyn TreeStore,
+        nodes: &dyn NodeStore,
+        versions: &dyn VersionRepo,
+        path_index: Option<&dyn PathIndexRepo>,
+        mut progress: impl FnMut(CloneProgress),
+    ) -> CasResult<(Vec<CloneResult>, ShallowBoundary)> {
+        // ── Step 1: CloneInit ─────────────────────────────────────────────
+        progress(CloneProgress {
+            stage: CloneStage::Negotiating,
+            bytes_downloaded: 0,
+        });
+
+        let init_resp = self
+            .inner
+            .clone_init(Request::new(CloneInitRequest {
+                workspace_id: config.workspace_id.clone(),
+                tenant_id: config.tenant_id.clone(),
+                depth: Some(depth),
+                refs: ref_names.to_vec(),
+            }))
+            .await
+            .map_err(|e| CasError::SyncError(format!("clone_init: {e}")))?
+            .into_inner();
+
+        let dl_session_id = init_resp.session_id.clone();
+        let total_objects = init_resp.total_objects;
+
+        // Collect remote ref name → tip hash from the response.
+        let remote_refs: Vec<(String, Vec<u8>)> = init_resp
+            .refs
+            .into_iter()
+            .filter(|ri| ref_names.is_empty() || ref_names.contains(&ri.name))
+            .filter_map(|ri| ri.target.map(|t| (ri.name, t.hash)))
+            .collect();
+
+        if remote_refs.is_empty() {
+            progress(CloneProgress {
+                stage: CloneStage::Done,
+                bytes_downloaded: 0,
+            });
+            return Ok((Vec::new(), ShallowBoundary::new()));
+        }
+
+        // ── Step 2: CloneDownload ─────────────────────────────────────────
+        let mut dl_stream = self
+            .inner
+            .clone_download(Request::new(CloneDownloadRequest {
+                session_id: dl_session_id,
+                workspace_id: config.workspace_id.clone(),
+                tenant_id: config.tenant_id.clone(),
+            }))
+            .await
+            .map_err(|e| CasError::SyncError(format!("clone_download: {e}")))?
+            .into_inner();
+
+        let mut objects_done: u64 = 0;
+        let mut bytes_downloaded: u64 = 0;
+        // Track which version IDs were actually received so we can compute
+        // the boundary from the client side.
+        let mut received_vids: HashSet<VersionId> = HashSet::new();
+
+        while let Some(msg) = dl_stream.next().await {
+            let msg = msg.map_err(|e| CasError::SyncError(format!("stream recv: {e}")))?;
+            match msg.payload {
+                Some(ClonePayload::Header(_)) => {}
+                Some(ClonePayload::Entry(entry)) => {
+                    let Some(oid) = entry.hash else {
+                        return Err(CasError::SyncError("pack entry missing hash".into()));
+                    };
+                    if oid.hash.len() != 32 {
+                        return Err(CasError::SyncError(format!(
+                            "hash must be 32 bytes, got {}",
+                            oid.hash.len()
+                        )));
+                    }
+
+                    bytes_downloaded += entry.data.len() as u64;
+
+                    let raw = zstd::bulk::decompress(&entry.data, 64 * 1024 * 1024)
+                        .map_err(|e| CasError::SyncError(format!("decompress: {e}")))?;
+
+                    let arr: [u8; 32] = oid.hash.as_slice().try_into().unwrap();
+                    let declared = blake3::Hash::from_bytes(arr);
+
+                    // Track received version IDs for boundary computation.
+                    if entry.r#type == 4 {
+                        // PROTO_TYPE_VERSION = 4
+                        received_vids.insert(VersionId(hex::encode(arr)));
+                    }
+
+                    store_object(
+                        entry.r#type, declared, &raw, chunks, trees, nodes, versions,
+                    )?;
+
+                    objects_done += 1;
+                    progress(CloneProgress {
+                        stage: CloneStage::Downloading {
+                            objects_done,
+                            objects_total: total_objects,
+                        },
+                        bytes_downloaded,
+                    });
+                }
+                None => {}
+            }
+        }
+
+        // ── Step 3: Rebuild local refs and path index ─────────────────────
+        progress(CloneProgress {
+            stage: CloneStage::Rebuilding,
+            bytes_downloaded,
+        });
+
+        for (ref_name, remote_hash) in &remote_refs {
+            let tip = VersionId(hex::encode(remote_hash));
+            refs.put_ref(&Ref {
+                name: ref_name.clone(),
+                kind: RefKind::Branch,
+                target: tip.clone(),
+            })?;
+            // Rebuild path index only for fetched versions (not full history).
+            if let Some(pi) = path_index {
+                for vid in &received_vids {
+                    let Some(vnode) = versions.get_version(vid)? else { continue };
+                    rebuild_path_index_for_version(vid, &vnode.root, nodes, pi)?;
+                }
+            }
+        }
+
+        // ── Step 4: Compute shallow boundary ─────────────────────────────
+        // For each received version, if any of its parents are not in the
+        // received set, those parents are boundary versions.
+        let mut boundary = ShallowBoundary::new();
+        for vid in &received_vids {
+            if let Some(v) = versions.get_version(vid)? {
+                for parent in &v.parents {
+                    if !received_vids.contains(parent) {
+                        boundary.add(parent.clone());
+                    }
+                }
+            }
+        }
+
+        progress(CloneProgress {
+            stage: CloneStage::Done,
+            bytes_downloaded,
+        });
+
+        let results = remote_refs
+            .iter()
+            .map(|(ref_name, _)| {
+                let tip = refs
+                    .get_ref(ref_name)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.target)
+                    .unwrap_or_else(|| VersionId(String::new()));
+                CloneResult {
+                    ref_name: ref_name.clone(),
+                    tip,
+                    objects_received: objects_done,
+                    bytes_downloaded,
+                }
+            })
+            .collect();
+
+        Ok((results, boundary))
+    }
+
+    // ── Unshallow (E05-S02) ──────────────────────────────────────────────
+
+    /// Convert a shallow clone into a full clone by fetching all missing
+    /// ancestors from the remote.
+    ///
+    /// Uses the versions in `boundary` as `want` tips (with empty `have`),
+    /// so only the ancestry below the current shallow boundary is transferred
+    /// — no objects the client already has are re-downloaded.
+    ///
+    /// After this call the `ShallowBoundary` should be discarded (cleared)
+    /// by the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn unshallow(
+        &mut self,
+        config: &CloneConfig,
+        boundary: &ShallowBoundary,
+        chunks: &dyn ChunkStore,
+        trees: &dyn TreeStore,
+        nodes: &dyn NodeStore,
+        versions: &dyn VersionRepo,
+        path_index: Option<&dyn PathIndexRepo>,
+        progress: impl FnMut(CloneProgress),
+    ) -> CasResult<u64> {
+        if boundary.is_empty() {
+            return Ok(0);
+        }
+
+        // Build one WantEntry per boundary version (no `have` — these are
+        // exactly the versions we do not yet have).
+        let wants: Vec<WantEntry> = boundary
+            .iter()
+            .filter_map(|vid| {
+                hex::decode(vid.as_str()).ok().and_then(|bytes| {
+                    if bytes.len() == 32 {
+                        Some(WantEntry {
+                            ref_name: String::new(),
+                            have: None,
+                            want: Some(crate::sync::proto::ObjectId { hash: bytes }),
+                        })
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        self.download_objects(config, wants, versions, chunks, trees, nodes, path_index, progress)
+            .await
+    }
+
+    /// Internal helper: NegotiatePull(wants) → DownloadPack → store + rebuild.
+    #[allow(clippy::too_many_arguments)]
+    async fn download_objects(
+        &mut self,
+        config: &CloneConfig,
+        wants: Vec<WantEntry>,
+        versions: &dyn VersionRepo,
+        chunks: &dyn ChunkStore,
+        trees: &dyn TreeStore,
+        nodes: &dyn NodeStore,
+        path_index: Option<&dyn PathIndexRepo>,
+        mut progress: impl FnMut(CloneProgress),
+    ) -> CasResult<u64> {
+        if wants.is_empty() {
+            return Ok(0);
+        }
+
+        progress(CloneProgress {
+            stage: CloneStage::Negotiating,
+            bytes_downloaded: 0,
+        });
+
+        let neg_resp = self
+            .inner
+            .negotiate_pull(Request::new(NegotiatePullRequest {
+                workspace_id: config.workspace_id.clone(),
+                tenant_id: config.tenant_id.clone(),
+                wants,
+                have_filter: Vec::new(),
+            }))
+            .await
+            .map_err(|e| CasError::SyncError(format!("negotiate_pull: {e}")))?
+            .into_inner();
+
+        let total_objects = neg_resp.total_objects;
+        let mut dl_stream = self
+            .inner
+            .download_pack(Request::new(DownloadPackRequest {
+                session_id: neg_resp.session_id,
+                workspace_id: config.workspace_id.clone(),
+                tenant_id: config.tenant_id.clone(),
+            }))
+            .await
+            .map_err(|e| CasError::SyncError(format!("download_pack: {e}")))?
+            .into_inner();
+
+        let mut objects_done: u64 = 0;
+        let mut bytes_downloaded: u64 = 0;
+        let mut received_vids: HashSet<VersionId> = HashSet::new();
+
+        while let Some(msg) = dl_stream.next().await {
+            let msg = msg.map_err(|e| CasError::SyncError(format!("stream recv: {e}")))?;
+            match msg.payload {
+                Some(Payload::Header(_)) => {}
+                Some(Payload::Entry(entry)) => {
+                    let Some(oid) = entry.hash else {
+                        return Err(CasError::SyncError("pack entry missing hash".into()));
+                    };
+                    if oid.hash.len() != 32 {
+                        return Err(CasError::SyncError(format!(
+                            "hash must be 32 bytes, got {}",
+                            oid.hash.len()
+                        )));
+                    }
+
+                    bytes_downloaded += entry.data.len() as u64;
+
+                    let raw = zstd::bulk::decompress(&entry.data, 64 * 1024 * 1024)
+                        .map_err(|e| CasError::SyncError(format!("decompress: {e}")))?;
+
+                    let arr: [u8; 32] = oid.hash.as_slice().try_into().unwrap();
+                    let declared = blake3::Hash::from_bytes(arr);
+
+                    if entry.r#type == 4 {
+                        received_vids.insert(VersionId(hex::encode(arr)));
+                    }
+
+                    store_object(
+                        entry.r#type, declared, &raw, chunks, trees, nodes, versions,
+                    )?;
+
+                    objects_done += 1;
+                    progress(CloneProgress {
+                        stage: CloneStage::Downloading {
+                            objects_done,
+                            objects_total: total_objects,
+                        },
+                        bytes_downloaded,
+                    });
+                }
+                None => {}
+            }
+        }
+
+        // Rebuild path index for newly fetched versions.
+        if let Some(pi) = path_index {
+            for vid in &received_vids {
+                if let Some(vnode) = versions.get_version(vid)? {
+                    rebuild_path_index_for_version(vid, &vnode.root, nodes, pi)?;
+                }
+            }
+        }
+
+        progress(CloneProgress {
+            stage: CloneStage::Done,
+            bytes_downloaded,
+        });
+
+        Ok(objects_done)
     }
 }
 

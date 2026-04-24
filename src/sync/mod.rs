@@ -37,6 +37,10 @@ pub mod pack;
 #[cfg(feature = "cloud")]
 pub mod clone_client;
 
+/// Shallow clone boundary tracking (E05-S02).
+#[cfg(feature = "cloud")]
+pub mod shallow;
+
 /// Generated gRPC types and service traits for `axiom.sync.v1`.
 #[cfg(feature = "cloud")]
 pub mod proto {
