@@ -231,6 +231,7 @@ async fn spawn_server(server: Backends) -> std::net::SocketAddr {
         sync: sync_store.clone(),
         session_ttl_secs: 3600,
         cleanup_interval_secs: 300,
+        max_decompressed_bytes: 4 * 1024 * 1024 * 1024,
     };
     let pull_state = PullServiceState {
         chunks: server.chunks.clone(),
@@ -1897,6 +1898,7 @@ async fn spawn_server_short_ttl(server: Backends) -> std::net::SocketAddr {
         sync: sync_store.clone(),
         session_ttl_secs: 1,
         cleanup_interval_secs: 1,
+        max_decompressed_bytes: 4 * 1024 * 1024 * 1024,
     };
     let pull_state = PullServiceState {
         chunks: server.chunks.clone(),
@@ -2040,4 +2042,127 @@ async fn push_session_reaper_does_not_interfere_with_normal_push() {
 
     assert_eq!(results.get("main").map(String::as_str), Some("ok"));
     assert!(server.refs.get_ref("main").unwrap().is_some());
+}
+
+// ─── E05-S09: UploadPack decompressed-bytes quota ────────────────────────────
+
+/// Spawn a server whose `upload_pack` decompressed-bytes limit is `quota`.
+async fn spawn_server_with_quota(server: Backends, quota: u64) -> std::net::SocketAddr {
+    let sync_store: Arc<dyn axiom_core::store::traits::SyncStore> =
+        Arc::new(axiom_core::store::InMemorySyncStore::new(
+            server.versions.clone(),
+            server.trees.clone(),
+            server.nodes.clone(),
+        ));
+    let push_state = PushServiceState {
+        chunks: server.chunks.clone(),
+        trees: server.trees.clone(),
+        nodes: server.nodes.clone(),
+        versions: server.versions.clone(),
+        refs: server.refs.clone(),
+        sync: sync_store.clone(),
+        session_ttl_secs: 3600,
+        cleanup_interval_secs: 300,
+        max_decompressed_bytes: quota,
+    };
+    let pull_state = PullServiceState {
+        chunks: server.chunks.clone(),
+        trees: server.trees.clone(),
+        nodes: server.nodes.clone(),
+        versions: server.versions.clone(),
+        refs: server.refs.clone(),
+        sync: sync_store,
+        session_ttl_secs: 3600,
+        cleanup_interval_secs: 300,
+    };
+    let handler = CombinedSyncHandler {
+        push: PushServiceHandler::new(push_state),
+        pull: PullServiceHandler::new(pull_state),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = TcpListenerStream::new(listener);
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(SyncServiceServer::new(handler))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
+/// When the total decompressed bytes of an `UploadPack` session exceed the
+/// configured quota, the server must return `ResourceExhausted`.
+#[tokio::test]
+async fn upload_pack_quota_exceeded_returns_resource_exhausted() {
+    // Quota = 256 bytes — smaller than a real chunk payload.
+    // `seed_branch` stores 512 bytes of data, which decompresses to > 256 bytes.
+    let data = vec![0x42u8; 512]; // 512 bytes, easily exceeds 256-byte quota
+    let quota: u64 = 256;
+
+    let server = Backends::new();
+    let addr = spawn_server_with_quota(server.clone(), quota).await;
+
+    let client = Backends::new();
+    seed_branch(&client, "main", &data, vec![]);
+
+    let mut push = connect_push(addr).await;
+    let err = push
+        .push(
+            &cfg_push(false),
+            &[],
+            client.refs.as_ref(),
+            client.chunks.as_ref(),
+            client.trees.as_ref(),
+            client.nodes.as_ref(),
+            client.versions.as_ref(),
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect_err("push must fail when quota exceeded");
+
+    // The error should surface as a SyncError wrapping the gRPC ResourceExhausted.
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("resource") || msg.contains("exhausted") || msg.contains("limit"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Default quota (4 GiB) must not interfere with normal pushes.
+#[tokio::test]
+async fn upload_pack_default_quota_allows_normal_push() {
+    let server = Backends::new();
+    let addr = spawn_server(server.clone()).await;
+
+    let client = Backends::new();
+    seed_branch(&client, "main", b"quota compat test data", vec![]);
+
+    let mut push = connect_push(addr).await;
+    let results = push
+        .push(
+            &cfg_push(false),
+            &[],
+            client.refs.as_ref(),
+            client.chunks.as_ref(),
+            client.trees.as_ref(),
+            client.nodes.as_ref(),
+            client.versions.as_ref(),
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("push ok under default quota");
+
+    assert_eq!(results.get("main").map(String::as_str), Some("ok"));
 }

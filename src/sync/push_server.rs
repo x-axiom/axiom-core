@@ -105,6 +105,10 @@ pub struct PushServiceState {
     /// How often (seconds) the reaper task wakes up to scan for expired sessions.
     /// Default: 300 (5 minutes).
     pub cleanup_interval_secs: u64,
+    /// Maximum cumulative decompressed bytes accepted in one `UploadPack` call.
+    /// Prevents zip-bomb / OOM DoS from clients that send many highly-compressed
+    /// entries.  Defaults to 4 GiB.  Inject a smaller value in tests.
+    pub max_decompressed_bytes: u64,
 }
 
 // ─── PushServiceHandler ──────────────────────────────────────────────────────
@@ -520,6 +524,8 @@ impl SyncService for PushServiceHandler {
         let mut stored: u64 = 0;
         let mut duplicates: u64 = 0;
         let mut session_id = String::new();
+        let mut total_decompressed: u64 = 0;
+        let max_decompressed = self.state.max_decompressed_bytes;
 
         while let Some(msg) = stream.next().await {
             let msg = msg.map_err(|e| Status::internal(e.to_string()))?;
@@ -556,6 +562,25 @@ impl SyncService for PushServiceHandler {
                         .map_err(|e| {
                             Status::invalid_argument(format!("decompress failed: {e}"))
                         })?;
+
+                    // Enforce per-session decompressed-bytes quota (B6 / E05-S09).
+                    total_decompressed = total_decompressed.saturating_add(raw.len() as u64);
+                    if total_decompressed > max_decompressed {
+                        // Evict the session so the client cannot retry with the
+                        // same session_id and continue accumulating bytes.
+                        if !session_id.is_empty() {
+                            self.sessions.lock().remove(&session_id);
+                        }
+                        tracing::warn!(
+                            session_id = %session_id,
+                            total_decompressed,
+                            max_decompressed,
+                            "upload_pack exceeded decompressed-bytes quota"
+                        );
+                        return Err(Status::resource_exhausted(format!(
+                            "upload exceeds decompressed-bytes limit ({max_decompressed} bytes)"
+                        )));
+                    }
 
                     // Verify hash.
                     let arr: [u8; 32] = oid.hash.as_slice().try_into().unwrap();
