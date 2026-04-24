@@ -28,6 +28,7 @@ use crate::sync::proto::{
 use crate::sync::remote_refs::RemoteRef;
 use crate::sync::resume::{ResumeSet, cleanup_stale_sessions, find_resumable};
 use crate::sync::session::{begin_session, complete_session, fail_session};
+use crate::sync::shallow::ShallowBoundary;
 
 // ─── Proto ObjectType constants ──────────────────────────────────────────────
 // Mirrors the proto enum values without importing the prost enum directly.
@@ -80,6 +81,15 @@ pub struct PushConfig {
     /// shard objects by `hash[0] % N` and transmit each shard in parallel,
     /// which improves throughput when network bandwidth is the bottleneck.
     pub concurrency: u8,
+    /// Local shallow-clone boundary, if this workspace was created via
+    /// [`crate::sync::clone_client::CloneClient::clone_shallow`].
+    ///
+    /// When set, the BFS used to build `client_inventory` treats every
+    /// boundary version as if the remote already had it, so the walk stops
+    /// at the boundary instead of trying to traverse parents the local
+    /// store does not actually have.  This makes "push from a shallow
+    /// repo" work correctly (E05-S02).  Pass `None` for full clones.
+    pub shallow_boundary: Option<ShallowBoundary>,
 }
 
 // ─── PushClient ───────────────────────────────────────────────────────────────
@@ -289,8 +299,18 @@ impl PushClient {
         // ref tips, stopping at versions the remote already has.  The server
         // will subtract its own holdings to produce the exact `need_objects`
         // list — no more `augment_needs_locally` workaround.
+        //
+        // For shallow workspaces we additionally treat every boundary
+        // version as a `have`, so the BFS does not try to follow parents
+        // the local store has never received (E05-S02).
         let client_inventory = build_client_inventory(
-            &to_push, &remote_tips, chunks, trees, nodes, versions,
+            &to_push,
+            &remote_tips,
+            config.shallow_boundary.as_ref(),
+            chunks,
+            trees,
+            nodes,
+            versions,
         )?;
 
         let neg_resp = self
@@ -668,6 +688,7 @@ fn fetch_object(
 fn build_client_inventory(
     to_push: &[crate::model::Ref],
     remote_tips: &HashMap<String, Vec<u8>>,
+    shallow_boundary: Option<&ShallowBoundary>,
     _chunks: &dyn ChunkStore,
     trees: &dyn TreeStore,
     nodes: &dyn NodeStore,
@@ -677,7 +698,7 @@ fn build_client_inventory(
     use crate::sync::reachable::{CancelToken, collect_reachable};
 
     let want: Vec<VersionId> = to_push.iter().map(|r| r.target.clone()).collect();
-    let have: HashSet<VersionId> = remote_tips
+    let mut have: HashSet<VersionId> = remote_tips
         .iter()
         .filter_map(|(_, bytes)| {
             if bytes.len() == 32 && !bytes.iter().all(|b| *b == 0) {
@@ -687,6 +708,15 @@ fn build_client_inventory(
             }
         })
         .collect();
+
+    // Extend `have` with every shallow-boundary version, so the BFS stops
+    // at the boundary rather than walking into parents the local store
+    // never received.
+    if let Some(boundary) = shallow_boundary {
+        for vid in boundary.iter() {
+            have.insert(vid.clone());
+        }
+    }
 
     let reachable = collect_reachable(
         &want,

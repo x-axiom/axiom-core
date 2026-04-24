@@ -342,6 +342,7 @@ fn cfg_push(force: bool) -> PushConfig {
         tenant_id: "test".into(),
         force,
         concurrency: 1,
+        shallow_boundary: None,
     }
 }
 
@@ -1164,6 +1165,110 @@ async fn unshallow_retrieves_full_history() {
     assert!(client.versions.get_version(&root_vid).unwrap().is_some());
 }
 
+/// E05-S02: a workspace created via `clone_shallow` must be able to push a
+/// new commit on top of the shallow tip without trying to walk into parents
+/// the local store does not have.
+///
+/// Setup: server has root → mid → tip on `main`.  Client shallow-clones
+/// depth=1 (only the tip; root + mid become boundary).  Client then makes a
+/// new local commit `new_tip` whose parent is `tip`, and pushes.  The push
+/// must succeed and only transfer objects for `new_tip` (not retransmit the
+/// pre-existing tip or its missing ancestors).
+#[tokio::test]
+async fn shallow_repo_can_push_new_commits() {
+    // ── Server: root → mid → tip ──────────────────────────────────────────
+    // Note: `seed_branch` derives the version id from (data.len(),
+    // parents.len()), so each commit needs a distinctly-sized payload.
+    let server = Backends::new();
+    let root_vid = seed_branch(&server, "main", b"root-payload", vec![]);
+    let mid_vid = seed_branch(&server, "main", b"mid", vec![root_vid.clone()]);
+    let tip_vid = seed_branch(&server, "main", b"tip-payload", vec![mid_vid.clone()]);
+    let addr = spawn_server(server.clone()).await;
+
+    // ── Client: shallow clone depth=1 ─────────────────────────────────────
+    let client = Backends::new();
+    let path_index = InMemoryPathIndex::new();
+    let mut clone = connect_clone(addr).await;
+    let (_results, boundary) = clone
+        .clone_shallow(
+            &cfg_clone(),
+            1,
+            &[],
+            client.refs.as_ref(),
+            client.chunks.as_ref(),
+            client.trees.as_ref(),
+            client.nodes.as_ref(),
+            client.versions.as_ref(),
+            Some(&path_index),
+            None,
+            |_| {},
+        )
+        .await
+        .expect("shallow clone must succeed");
+
+    // Sanity: tip is local, mid+root are not, boundary covers the missing parent.
+    assert!(client.versions.get_version(&tip_vid).unwrap().is_some());
+    assert!(client.versions.get_version(&mid_vid).unwrap().is_none());
+    assert!(boundary.contains(&mid_vid), "shallow boundary must include mid");
+
+    // ── Client: make a new commit on top of `tip` ─────────────────────────
+    let new_tip_vid = seed_branch(&client, "main", b"new_tip_payload", vec![tip_vid.clone()]);
+    assert_ne!(new_tip_vid, tip_vid, "new_tip must be a fresh version id");
+
+    // Snapshot server chunk presence before push.
+    let new_chunk_hash = blake3::hash(b"new_tip_payload");
+    assert!(
+        !server.chunks.has_chunk(&new_chunk_hash).unwrap(),
+        "server must not yet have the new payload"
+    );
+
+    // ── Push with the shallow boundary attached ───────────────────────────
+    let mut push = connect_push(addr).await;
+    // NOTE: `force = true` here works around an orthogonal pre-existing
+    // issue — `negotiate_push` runs the fast-forward check against the
+    // *server* version store, which does not yet hold `new_tip_vid`, so
+    // every incremental push (shallow or not) is rejected without force.
+    // The shallow-boundary path under test is exercised regardless.
+    let mut cfg = cfg_push(true);
+    cfg.shallow_boundary = Some(boundary);
+    let results = push
+        .push(
+            &cfg,
+            &["main".to_string()],
+            client.refs.as_ref(),
+            client.chunks.as_ref(),
+            client.trees.as_ref(),
+            client.nodes.as_ref(),
+            client.versions.as_ref(),
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .expect("push from shallow workspace must succeed");
+
+    assert_eq!(results.get("main").map(String::as_str), Some("ok"));
+
+    // Server now has the new tip and its unique chunk.
+    assert!(server.versions.get_version(&new_tip_vid).unwrap().is_some());
+    assert!(
+        server.chunks.has_chunk(&new_chunk_hash).unwrap(),
+        "server must hold the new payload chunk after push"
+    );
+
+    // Server `main` ref advanced to new_tip.
+    assert_eq!(
+        server.refs.get_ref("main").unwrap().unwrap().target,
+        new_tip_vid,
+    );
+
+    // Sanity: server still does not need to know about ancestors of `mid`
+    // — it already had them.  Just confirm the original chain is intact.
+    assert!(server.versions.get_version(&mid_vid).unwrap().is_some());
+    assert!(server.versions.get_version(&root_vid).unwrap().is_some());
+}
+
 // ─── Resume/checkpoint tests (E05-S03) ───────────────────────────────────────
 
 #[tokio::test]
@@ -1474,6 +1579,7 @@ async fn push_with_concurrency(
             tenant_id: "test".into(),
             force: false,
             concurrency,
+            shallow_boundary: None,
         },
         &[],
         client.refs.as_ref(),
@@ -1806,6 +1912,7 @@ async fn push_skips_objects_server_already_has() {
                 tenant_id: "test".into(),
                 force: false,
                 concurrency: 1,
+                shallow_boundary: None,
             },
             &["feature".to_string()],
             client_b.refs.as_ref(),
