@@ -316,7 +316,7 @@ fn compute_file_root_from_path(path: &Path) -> CasResult<(ChunkHash, u64)> {
 /// file entries as `(workspace-relative-path) → (chunk-root-hash, size)`.
 ///
 /// `prefix` is the path accumulated so far (empty for the workspace root).
-fn collect_files_from_tree(
+pub fn collect_files_from_tree(
     root_hash: &ChunkHash,
     prefix: &str,
     nodes: &dyn NodeStore,

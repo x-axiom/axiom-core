@@ -439,3 +439,155 @@ fn test_commit_with_sqlite_backend() {
     let tag = svc.resolve_tag("v1.0").unwrap().unwrap();
     assert_eq!(tag.id, v1.id);
 }
+
+// ---------------------------------------------------------------------------
+// commit_partial
+// ---------------------------------------------------------------------------
+
+/// Write a file at `dir/rel_path` with `content` and return the relative path.
+fn write_file(dir: &std::path::Path, rel_path: &str, content: &[u8]) {
+    let abs = dir.join(rel_path);
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(abs, content).unwrap();
+}
+
+#[test]
+fn test_commit_partial_initial_single_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = axiom_core::api::state::AppState::memory();
+
+    write_file(tmp.path(), "hello.txt", b"hello world");
+
+    let result = axiom_core::commit::commit_partial(
+        tmp.path(),
+        None,
+        &["hello.txt".to_string()],
+        "initial".to_string(),
+        None,
+        &state,
+    )
+    .unwrap();
+
+    assert_eq!(result.staged_files, 1);
+    assert_eq!(result.carried_files, 0);
+    assert_eq!(result.version.parents.len(), 0);
+    assert_eq!(result.version.message, "initial");
+}
+
+/// Stage one file, commit, then stage a second file — the first file's hash
+/// must remain identical in the new version (zero-copy carry-over).
+#[test]
+fn test_commit_partial_carry_over_hash_unchanged() {
+    use axiom_core::commit::commit_partial;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = axiom_core::api::state::AppState::memory();
+
+    write_file(tmp.path(), "a.txt", b"file-a content");
+    write_file(tmp.path(), "b.txt", b"file-b content");
+
+    // First commit: only stage a.txt
+    let r1 = commit_partial(
+        tmp.path(),
+        None,
+        &["a.txt".to_string()],
+        "add a".to_string(),
+        None,
+        &state,
+    )
+    .unwrap();
+    let v1 = r1.version;
+
+    // Walk the first version tree to get a.txt's root hash.
+    use axiom_core::working_tree::collect_files_from_tree;
+    let files_v1 = collect_files_from_tree(&v1.root, "", state.nodes.as_ref()).unwrap();
+    let a_hash_v1 = files_v1["a.txt"].0;
+
+    // Second commit: stage b.txt only; a.txt should be carried over.
+    let r2 = commit_partial(
+        tmp.path(),
+        Some(&v1.id),
+        &["b.txt".to_string()],
+        "add b".to_string(),
+        None,
+        &state,
+    )
+    .unwrap();
+    let v2 = r2.version;
+
+    assert_eq!(r2.staged_files, 1);
+    assert_eq!(r2.carried_files, 1);
+    assert_eq!(v2.parents, vec![v1.id.clone()]);
+
+    // a.txt's hash in v2 must equal a.txt's hash in v1 (zero-copy).
+    let files_v2 = collect_files_from_tree(&v2.root, "", state.nodes.as_ref()).unwrap();
+    let a_hash_v2 = files_v2["a.txt"].0;
+    assert_eq!(a_hash_v1, a_hash_v2, "a.txt hash must be identical (zero-copy carry-over)");
+
+    // b.txt should also appear in v2.
+    assert!(files_v2.contains_key("b.txt"), "b.txt should be in v2");
+}
+
+/// Staging a path that does not exist on disk = deletion; the file must be
+/// absent from the resulting tree.
+#[test]
+fn test_commit_partial_deleted_file_absent_from_tree() {
+    use axiom_core::commit::commit_partial;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = axiom_core::api::state::AppState::memory();
+
+    write_file(tmp.path(), "keep.txt", b"keep");
+    write_file(tmp.path(), "gone.txt", b"gone");
+
+    // v1: both files
+    let r1 = commit_partial(
+        tmp.path(),
+        None,
+        &["keep.txt".to_string(), "gone.txt".to_string()],
+        "v1".to_string(),
+        None,
+        &state,
+    )
+    .unwrap();
+
+    // Remove gone.txt from disk to simulate deletion.
+    std::fs::remove_file(tmp.path().join("gone.txt")).unwrap();
+
+    // v2: stage gone.txt (deleted) — keep.txt is carry-over.
+    let r2 = commit_partial(
+        tmp.path(),
+        Some(&r1.version.id),
+        &["gone.txt".to_string()],
+        "delete gone".to_string(),
+        None,
+        &state,
+    )
+    .unwrap();
+
+    use axiom_core::working_tree::collect_files_from_tree;
+    let files = collect_files_from_tree(&r2.version.root, "", state.nodes.as_ref()).unwrap();
+    assert!(files.contains_key("keep.txt"), "keep.txt should still be present");
+    assert!(!files.contains_key("gone.txt"), "gone.txt should have been deleted");
+}
+
+/// Staging an empty list must return an error.
+#[test]
+fn test_commit_partial_empty_staged_paths_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = axiom_core::api::state::AppState::memory();
+
+    let err = axiom_core::commit::commit_partial(
+        tmp.path(),
+        None,
+        &[],
+        "should fail".to_string(),
+        None,
+        &state,
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, axiom_core::error::CasError::InvalidObject(_)));
+}
