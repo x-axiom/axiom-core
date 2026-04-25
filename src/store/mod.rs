@@ -6,6 +6,8 @@ pub mod rocksdb;
 pub mod sqlite;
 #[cfg(feature = "cloud")]
 pub mod s3;
+#[cfg(feature = "cloud")]
+pub mod cache;
 #[cfg(feature = "fdb")]
 pub mod fdb;
 
@@ -21,6 +23,8 @@ pub use rocksdb::RocksDbCasStore;
 pub use sqlite::SqliteMetadataStore;
 #[cfg(feature = "cloud")]
 pub use s3::{S3ChunkStore, S3Config, StaticCredentials};
+#[cfg(feature = "cloud")]
+pub use cache::{CacheClient, CacheConfig, CacheStats, CachedChunkStore, CachedMetadataStore};
 #[cfg(feature = "fdb")]
 pub use fdb::{FdbMetadataStore, FdbConfig};
 

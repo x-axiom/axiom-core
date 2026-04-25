@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Metadata about a path entry in a specific version.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PathEntry {
     /// The path relative to the version root (e.g. "src/main.rs").
     pub path: String,
