@@ -156,6 +156,15 @@ pub struct Workspace {
     /// Free-form JSON metadata (e.g. description). Stored as a string so the
     /// store layer does not need to depend on a JSON type.
     pub metadata: String,
+    /// Absolute path to the bound local folder (E15-S01). `None` when no
+    /// folder has been bound yet.
+    pub local_path: Option<String>,
+    /// Name of the ref currently checked out in the local folder (e.g.
+    /// `"main"`). `None` when no folder is bound or after a detached checkout.
+    pub current_ref: Option<String>,
+    /// Hex-encoded `VersionId` of the last commit / checkout written to
+    /// `local_path`. Used as the comparison base for `compute_status`.
+    pub current_version: Option<String>,
 }
 
 /// Repository for workspace records.
@@ -168,6 +177,9 @@ pub trait WorkspaceRepo: Send + Sync {
     fn list_workspaces(&self) -> CasResult<Vec<Workspace>>;
     /// Delete a workspace by id. No-op if it does not exist.
     fn delete_workspace(&self, id: &str) -> CasResult<()>;
+    /// Update mutable fields of an existing workspace (name, metadata,
+    /// local_path, current_ref, current_version). No-op if id not found.
+    fn update_workspace(&self, ws: &Workspace) -> CasResult<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +225,9 @@ impl<T: WorkspaceRepo + ?Sized> WorkspaceRepo for Arc<T> {
     }
     fn delete_workspace(&self, id: &str) -> CasResult<()> {
         (**self).delete_workspace(id)
+    }
+    fn update_workspace(&self, ws: &Workspace) -> CasResult<()> {
+        (**self).update_workspace(ws)
     }
 }
 
