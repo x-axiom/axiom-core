@@ -388,7 +388,7 @@ impl StoreFactory {
             credentials,
             cfg.s3.force_path_style,
         );
-        let s3 = S3ChunkStore::new(s3_cfg)?;
+        let s3 = S3ChunkStore::new(s3_cfg);
 
         // ---- FDB metadata store ----
         let fdb_cfg = FdbConfig {
