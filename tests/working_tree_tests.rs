@@ -269,3 +269,188 @@ fn test_compute_file_root_empty() {
     let root = compute_file_root(b"");
     assert_eq!(root, hash_bytes(b""));
 }
+
+// ---------------------------------------------------------------------------
+// IgnoreMatcher tests
+// ---------------------------------------------------------------------------
+
+/// Built-in rule: `node_modules/` — deeply nested files must be invisible.
+#[test]
+fn test_ignore_node_modules_files_excluded() {
+    let dir = setup_workspace(&[
+        ("src/index.js", b"export default {};"),
+        ("node_modules/lodash/index.js", b"/* lodash */"),
+        ("node_modules/react/index.js", b"/* react */"),
+    ]);
+    let stores = Stores::new();
+    let ignore = IgnoreMatcher::from_workspace_root(dir.path());
+
+    let status = compute_status(
+        dir.path(),
+        None,
+        stores.versions.as_ref(),
+        stores.trees.as_ref(),
+        stores.nodes.as_ref(),
+        &ignore,
+    )
+    .unwrap();
+
+    let paths: Vec<&str> = status.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, vec!["src/index.js"], "only src/ should be visible, got: {paths:?}");
+    assert_eq!(status.entries[0].change, FileChange::Untracked);
+}
+
+/// Built-in rule: `src/` is NOT ignored — files inside it must be visible.
+#[test]
+fn test_ignore_src_not_ignored() {
+    let dir = setup_workspace(&[
+        ("src/main.rs", b"fn main() {}"),
+        ("src/lib.rs", b"pub fn helper() {}"),
+    ]);
+    let stores = Stores::new();
+    let ignore = IgnoreMatcher::from_workspace_root(dir.path());
+
+    let status = compute_status(
+        dir.path(),
+        None,
+        stores.versions.as_ref(),
+        stores.trees.as_ref(),
+        stores.nodes.as_ref(),
+        &ignore,
+    )
+    .unwrap();
+
+    let paths: Vec<&str> = status.entries.iter().map(|e| e.path.as_str()).collect();
+    assert!(paths.contains(&"src/main.rs"), "src/main.rs should be visible");
+    assert!(paths.contains(&"src/lib.rs"), "src/lib.rs should be visible");
+    assert!(
+        status.entries.iter().all(|e| e.change == FileChange::Untracked),
+        "all files should be Untracked: {:?}",
+        status.entries.iter().map(|e| &e.change).collect::<Vec<_>>()
+    );
+}
+
+/// Built-in rule: `target/` build artefacts are excluded.
+#[test]
+fn test_ignore_target_dir_excluded() {
+    let dir = setup_workspace(&[
+        ("src/main.rs", b"fn main() {}"),
+        ("target/release/mybin", b"\x7fELF"),
+        ("target/debug/mybin.d", b"deps"),
+    ]);
+    let stores = Stores::new();
+    let ignore = IgnoreMatcher::from_workspace_root(dir.path());
+
+    let status = compute_status(
+        dir.path(),
+        None,
+        stores.versions.as_ref(),
+        stores.trees.as_ref(),
+        stores.nodes.as_ref(),
+        &ignore,
+    )
+    .unwrap();
+
+    let paths: Vec<&str> = status.entries.iter().map(|e| e.path.as_str()).collect();
+    assert!(!paths.iter().any(|p| p.starts_with("target/")), "target/ should be ignored: {paths:?}");
+    assert!(paths.contains(&"src/main.rs"), "src/main.rs should be visible");
+}
+
+/// Custom `.axiomignore` at workspace root — user-defined patterns are applied.
+#[test]
+fn test_axiomignore_custom_patterns() {
+    let dir = setup_workspace(&[
+        (".axiomignore", b"*.log\nbuild/\n"),
+        ("main.rs", b"fn main() {}"),
+        ("output.log", b"2024-01-01 error: oops"),
+        ("debug.log", b"trace output"),
+        ("build/out.bin", b"\x00\x01\x02"),
+        ("build/manifest.json", b"{}"),
+    ]);
+    let stores = Stores::new();
+    let ignore = IgnoreMatcher::from_workspace_root(dir.path());
+
+    let status = compute_status(
+        dir.path(),
+        None,
+        stores.versions.as_ref(),
+        stores.trees.as_ref(),
+        stores.nodes.as_ref(),
+        &ignore,
+    )
+    .unwrap();
+
+    let paths: Vec<&str> = status.entries.iter().map(|e| e.path.as_str()).collect();
+
+    // .axiomignore itself is excluded by the built-in rule.
+    assert!(!paths.contains(&".axiomignore"), ".axiomignore should be excluded");
+
+    // User-added *.log rule.
+    assert!(!paths.contains(&"output.log"), "output.log should be excluded by *.log");
+    assert!(!paths.contains(&"debug.log"), "debug.log should be excluded by *.log");
+
+    // User-added build/ rule.
+    assert!(!paths.iter().any(|p| p.starts_with("build/")), "build/ should be excluded");
+
+    // main.rs is not excluded.
+    assert!(paths.contains(&"main.rs"), "main.rs should be visible");
+}
+
+/// `.axiomignore` itself is excluded by the built-in rule even with no user rules.
+#[test]
+fn test_axiomignore_itself_excluded() {
+    let dir = setup_workspace(&[
+        (".axiomignore", b"# empty rules file\n"),
+        ("readme.md", b"# project"),
+    ]);
+    let stores = Stores::new();
+    let ignore = IgnoreMatcher::from_workspace_root(dir.path());
+
+    let status = compute_status(
+        dir.path(),
+        None,
+        stores.versions.as_ref(),
+        stores.trees.as_ref(),
+        stores.nodes.as_ref(),
+        &ignore,
+    )
+    .unwrap();
+
+    let paths: Vec<&str> = status.entries.iter().map(|e| e.path.as_str()).collect();
+    assert!(!paths.contains(&".axiomignore"), ".axiomignore must be excluded by default");
+    assert!(paths.contains(&"readme.md"), "readme.md should be visible");
+}
+
+/// Nested `.axiomignore` in a subdirectory applies rules scoped to that dir.
+#[test]
+fn test_nested_axiomignore_scoped_to_subdir() {
+    let dir = setup_workspace(&[
+        ("src/.axiomignore", b"*.gen.ts\n"),
+        ("src/api.gen.ts", b"// generated"),
+        ("src/main.ts", b"// manual"),
+        ("lib/api.gen.ts", b"// generated in lib"),  // NOT under src/, so not ignored
+    ]);
+    let stores = Stores::new();
+    let ignore = IgnoreMatcher::from_workspace_root(dir.path());
+
+    let status = compute_status(
+        dir.path(),
+        None,
+        stores.versions.as_ref(),
+        stores.trees.as_ref(),
+        stores.nodes.as_ref(),
+        &ignore,
+    )
+    .unwrap();
+
+    let paths: Vec<&str> = status.entries.iter().map(|e| e.path.as_str()).collect();
+
+    // src/api.gen.ts matches src/.axiomignore rule (*.gen.ts scoped to src/).
+    assert!(!paths.contains(&"src/api.gen.ts"), "src/api.gen.ts should be excluded by nested rule");
+
+    // src/main.ts is not excluded.
+    assert!(paths.contains(&"src/main.ts"), "src/main.ts should be visible");
+
+    // lib/api.gen.ts is outside src/, so the src/.axiomignore rule doesn't apply.
+    assert!(paths.contains(&"lib/api.gen.ts"), "lib/api.gen.ts should be visible (outside src/)");
+}

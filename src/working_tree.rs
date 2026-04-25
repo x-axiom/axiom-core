@@ -22,6 +22,7 @@ use crate::merkle::DEFAULT_FAN_OUT;
 use crate::model::hash::{hash_bytes, hash_children, ChunkHash, VersionId};
 use crate::model::node::NodeKind;
 use crate::store::traits::{NodeStore, TreeStore, VersionRepo};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -72,24 +73,190 @@ impl WorkingTreeStatus {
 }
 
 // ---------------------------------------------------------------------------
-// IgnoreMatcher — stub replaced by S03
+// IgnoreMatcher — .axiomignore + built-in default rules
 // ---------------------------------------------------------------------------
 
-/// Path ignore matcher. The stub implementation ignores nothing; E15-S03
-/// will replace this with a real `.axiomignore`-backed matcher.
+/// Built-in ignore patterns applied to every workspace regardless of whether
+/// a `.axiomignore` file exists.
+///
+/// Syntax is identical to `.gitignore`.
+const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
+    ".git/",
+    ".svn/",
+    ".hg/",
+    ".DS_Store",
+    "Thumbs.db",
+    "node_modules/",
+    "target/",
+    "*.tmp",
+    "*.swp",
+    ".axiomignore",
+];
+
+/// Path ignore matcher backed by `.axiomignore` files (`.gitignore` syntax)
+/// and a set of built-in default rules.
+///
+/// # Default-ignored paths
+///
+/// The following are excluded in every workspace regardless of whether a
+/// `.axiomignore` file is present:
+///
+/// - VCS directories: `.git/`, `.svn/`, `.hg/`
+/// - OS noise: `.DS_Store`, `Thumbs.db`
+/// - Common build artefacts: `node_modules/`, `target/`
+/// - Temporary files: `*.tmp`, `*.swp`
+/// - The ignore file itself: `.axiomignore`
+///
+/// # Nested files
+///
+/// [`from_workspace_root`](IgnoreMatcher::from_workspace_root) walks the
+/// entire workspace tree and loads every `.axiomignore` file it finds.
+/// Each file is matched against paths relative to its own directory,
+/// matching `.gitignore` priority semantics.
 pub struct IgnoreMatcher {
-    _private: (),
+    /// Per-directory matchers. Each tuple is `(dir_prefix, Gitignore)`.
+    ///
+    /// `dir_prefix` is the workspace-relative directory path with a trailing
+    /// `/`, e.g. `"src/"`. The root-level entry uses an empty prefix `""`.
+    ///
+    /// When checking a path, each matcher receives the portion of the path
+    /// that is relative to its own directory root.
+    matchers: Vec<(String, Gitignore)>,
 }
 
 impl IgnoreMatcher {
     /// Create a matcher that ignores nothing (all paths are visible).
+    ///
+    /// Useful when no workspace root is available or in tests that need
+    /// full visibility.
     pub fn none() -> Self {
-        Self { _private: () }
+        Self {
+            matchers: Vec::new(),
+        }
     }
 
-    /// Returns `true` if the workspace-relative `path` should be excluded
-    /// from status computation and commits.
-    pub fn is_ignored(&self, _path: &str) -> bool {
+    /// Build a matcher by scanning `root` for `.axiomignore` files and
+    /// layering the built-in default rules.
+    ///
+    /// Each `.axiomignore` file's rules are scoped to the directory that
+    /// contains it — exactly as git handles nested `.gitignore` files.
+    /// If a file cannot be parsed, the error is logged and that file is
+    /// skipped; rules from other files still apply.
+    pub fn from_workspace_root(root: &Path) -> Self {
+        let mut matchers: Vec<(String, Gitignore)> = Vec::new();
+
+        // 1. Root-level matcher: default built-in patterns + root .axiomignore.
+        let mut builder = GitignoreBuilder::new(root);
+        for pattern in DEFAULT_IGNORE_PATTERNS {
+            let _ = builder.add_line(None, pattern);
+        }
+        let root_file = root.join(".axiomignore");
+        if root_file.is_file() {
+            if let Some(err) = builder.add(&root_file) {
+                tracing::warn!(path = ?root_file, error = %err, "failed to parse root .axiomignore");
+            }
+        }
+        match builder.build() {
+            Ok(gi) => matchers.push((String::new(), gi)),
+            Err(err) => tracing::warn!(error = %err, "failed to build root IgnoreMatcher"),
+        }
+
+        // 2. Nested .axiomignore files (depth >= 2 means at least one subdir level).
+        //    Use WalkDir directly so we don't accidentally skip .axiomignore files
+        //    inside directories that would normally be ignored.
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .min_depth(2)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_type().is_file() && e.file_name() == ".axiomignore"
+            })
+        {
+            let dir = match entry.path().parent() {
+                Some(d) => d,
+                None => continue,
+            };
+            // Compute the workspace-relative prefix for this subdirectory.
+            let prefix = match dir.strip_prefix(root) {
+                Ok(rel) => {
+                    let parts: Vec<_> = rel
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect();
+                    format!("{}/", parts.join("/"))
+                }
+                Err(_) => continue,
+            };
+
+            // Each nested matcher is rooted at its own directory so that
+            // patterns are resolved relative to that directory, not the
+            // workspace root.
+            let mut nb = GitignoreBuilder::new(dir);
+            if let Some(err) = nb.add(entry.path()) {
+                tracing::warn!(
+                    path = ?entry.path(),
+                    error = %err,
+                    "failed to parse nested .axiomignore"
+                );
+            }
+            match nb.build() {
+                Ok(gi) => matchers.push((prefix, gi)),
+                Err(err) => tracing::warn!(
+                    path = ?entry.path(),
+                    error = %err,
+                    "failed to build nested IgnoreMatcher"
+                ),
+            }
+        }
+
+        Self { matchers }
+    }
+
+    /// Returns `true` if the workspace-relative file `path` (using `/`
+    /// separators, e.g. `"src/main.rs"`) should be excluded from status
+    /// computation and commits.
+    ///
+    /// Checks the path itself **and** every parent component so that a
+    /// directory-level pattern like `node_modules/` correctly ignores
+    /// `node_modules/lodash/index.js`.
+    pub fn is_ignored(&self, path: &str) -> bool {
+        self.check(path, false)
+    }
+
+    /// Returns `true` if the workspace-relative directory `path` (using `/`
+    /// separators, e.g. `"node_modules"`) should be skipped entirely without
+    /// descending into it.
+    ///
+    /// This is used by [`compute_status`] to prune directory traversal early
+    /// and avoid hashing thousands of files inside ignored trees.
+    pub fn is_dir_ignored(&self, path: &str) -> bool {
+        self.check(path, true)
+    }
+
+    fn check(&self, path: &str, is_dir: bool) -> bool {
+        for (prefix, gitignore) in &self.matchers {
+            // Determine the path relative to this matcher's directory root.
+            let rel: &str = if prefix.is_empty() {
+                path
+            } else if let Some(stripped) = path.strip_prefix(prefix.as_str()) {
+                stripped
+            } else {
+                // Path is not under this matcher's directory; skip.
+                continue;
+            };
+
+            if rel.is_empty() {
+                continue;
+            }
+
+            if gitignore
+                .matched_path_or_any_parents(Path::new(rel), is_dir)
+                .is_ignore()
+            {
+                return true;
+            }
+        }
         false
     }
 }
@@ -245,9 +412,21 @@ pub fn compute_status(
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|e| {
-            // Skip hidden directories (e.g. `.git`) at any level.
-            let name = e.file_name().to_string_lossy();
-            !name.starts_with('.') || e.depth() == 0
+            if e.depth() == 0 {
+                return true;
+            }
+            // Skip ignored directories early to avoid hashing their contents.
+            if e.file_type().is_dir() {
+                if let Ok(rel) = e.path().strip_prefix(local_path) {
+                    let rel_str: String = rel
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    return !ignore.is_dir_ignored(&rel_str);
+                }
+            }
+            true
         })
     {
         let entry = entry.map_err(|e| CasError::Io(e.into()))?;
