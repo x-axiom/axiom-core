@@ -6,6 +6,7 @@ pub mod merkle;
 pub mod namespace;
 pub mod commit;
 pub mod diff_engine;
+pub mod working_tree;
 pub mod api;
 pub mod sync;
 
