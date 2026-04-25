@@ -9,7 +9,7 @@ use crate::model::{ChunkHash, Ref, RefKind, VersionId, VersionNode};
 use super::traits::{
     ObjectManifestRepo, PathEntry, PathIndexRepo, RefRepo, Remote, RemoteRef, RemoteRepo,
     RemoteTrackingRepo, SyncDirection, SyncSession, SyncSessionRepo, SyncSessionStatus,
-    VersionRepo,
+    VersionRepo, WtCacheEntry, WtCacheRepo,
 };
 
 // ---------------------------------------------------------------------------
@@ -17,7 +17,7 @@ use super::traits::{
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding new migrations.
-const CURRENT_SCHEMA_VERSION: u32 = 6;
+const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// Apply all pending migrations up to `CURRENT_SCHEMA_VERSION`.
 fn run_migrations(conn: &Connection) -> CasResult<()> {
@@ -60,6 +60,9 @@ fn run_migrations(conn: &Connection) -> CasResult<()> {
             }
             if current < 6 {
                 migrate_v6(conn)?;
+            }
+            if current < 7 {
+                migrate_v7(conn)?;
             }
             Ok(())
         })();
@@ -316,6 +319,26 @@ fn migrate_v6(conn: &Connection) -> CasResult<()> {
          ALTER TABLE workspaces ADD COLUMN current_ref TEXT;
          ALTER TABLE workspaces ADD COLUMN current_version TEXT;
          UPDATE schema_version SET version = 6;",
+    )
+    .map_err(|e| CasError::Store(e.to_string()))?;
+    Ok(())
+}
+
+fn migrate_v7(conn: &Connection) -> CasResult<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS wt_cache (
+            workspace_id  TEXT    NOT NULL,
+            path          TEXT    NOT NULL,
+            mtime_ns      INTEGER NOT NULL,
+            size          INTEGER NOT NULL,
+            hash_hex      TEXT    NOT NULL,
+            PRIMARY KEY (workspace_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_wt_cache_workspace
+            ON wt_cache(workspace_id);
+        UPDATE schema_version SET version = 7;
+        ",
     )
     .map_err(|e| CasError::Store(e.to_string()))?;
     Ok(())
@@ -1314,6 +1337,66 @@ impl SqliteMetadataStore {
         Ok(ids)
     }
 }
+
+// ---------------------------------------------------------------------------
+// WtCacheRepo implementation
+// ---------------------------------------------------------------------------
+
+impl WtCacheRepo for SqliteMetadataStore {
+    fn wt_cache_get(&self, workspace_id: &str, path: &str) -> CasResult<Option<WtCacheEntry>> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT mtime_ns, size, hash_hex FROM wt_cache
+             WHERE workspace_id = ?1 AND path = ?2",
+            rusqlite::params![workspace_id, path],
+            |row| {
+                Ok(WtCacheEntry {
+                    mtime_ns: row.get(0)?,
+                    size: row.get::<_, i64>(1)? as u64,
+                    hash_hex: row.get(2)?,
+                })
+            },
+        );
+        match result {
+            Ok(e) => Ok(Some(e)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CasError::Store(e.to_string())),
+        }
+    }
+
+    fn wt_cache_put(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        entry: &WtCacheEntry,
+    ) -> CasResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO wt_cache (workspace_id, path, mtime_ns, size, hash_hex)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                workspace_id,
+                path,
+                entry.mtime_ns,
+                entry.size as i64,
+                entry.hash_hex,
+            ],
+        )
+        .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    fn wt_cache_clear(&self, workspace_id: &str) -> CasResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM wt_cache WHERE workspace_id = ?1",
+            rusqlite::params![workspace_id],
+        )
+        .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(())
+    }
+}
+
 // let's use a minimal inline hex decoder to avoid adding another dep.
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, String> {

@@ -484,3 +484,57 @@ impl<T: ObjectManifestRepo + ?Sized> ObjectManifestRepo for Arc<T> {
         (**self).manifest_delete(session_id)
     }
 }
+
+// ---------------------------------------------------------------------------
+// WtCacheRepo — working-tree hash cache (mtime + size fast-path)
+// ---------------------------------------------------------------------------
+
+/// A single entry in the working-tree hash cache.
+#[derive(Clone, Debug)]
+pub struct WtCacheEntry {
+    /// Last-modified timestamp of the file in nanoseconds since the Unix epoch.
+    pub mtime_ns: i64,
+    /// File size in bytes at the time the hash was computed.
+    pub size: u64,
+    /// Merkle root hash of the file (hex string, 64 chars).
+    pub hash_hex: String,
+}
+
+/// Cache of `(workspace_id, path) → (mtime_ns, size, hash)`.
+///
+/// `compute_status` uses this to skip re-hashing files whose `(mtime_ns,
+/// size)` pair hasn't changed since the last status computation.
+pub trait WtCacheRepo: Send + Sync {
+    /// Look up a cached entry for the given workspace and workspace-relative
+    /// path. Returns `None` if there is no cached entry.
+    fn wt_cache_get(&self, workspace_id: &str, path: &str) -> CasResult<Option<WtCacheEntry>>;
+
+    /// Insert or replace the cache entry for `(workspace_id, path)`.
+    fn wt_cache_put(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        entry: &WtCacheEntry,
+    ) -> CasResult<()>;
+
+    /// Delete all cache entries for `workspace_id`. Called when a workspace is
+    /// deleted or its `local_path` changes.
+    fn wt_cache_clear(&self, workspace_id: &str) -> CasResult<()>;
+}
+
+impl<T: WtCacheRepo + ?Sized> WtCacheRepo for Arc<T> {
+    fn wt_cache_get(&self, workspace_id: &str, path: &str) -> CasResult<Option<WtCacheEntry>> {
+        (**self).wt_cache_get(workspace_id, path)
+    }
+    fn wt_cache_put(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        entry: &WtCacheEntry,
+    ) -> CasResult<()> {
+        (**self).wt_cache_put(workspace_id, path, entry)
+    }
+    fn wt_cache_clear(&self, workspace_id: &str) -> CasResult<()> {
+        (**self).wt_cache_clear(workspace_id)
+    }
+}

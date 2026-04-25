@@ -52,3 +52,7 @@ harness = false
 [[bench]]
 name = "poc_benchmark"
 harness = false
+
+[[bench]]
+name = "working_tree_bench"
+harness = false

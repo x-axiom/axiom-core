@@ -21,7 +21,7 @@ use crate::error::{CasError, CasResult};
 use crate::merkle::DEFAULT_FAN_OUT;
 use crate::model::hash::{hash_bytes, hash_children, ChunkHash, VersionId};
 use crate::model::node::NodeKind;
-use crate::store::traits::{NodeStore, TreeStore, VersionRepo};
+use crate::store::traits::{NodeStore, TreeStore, VersionRepo, WtCacheEntry, WtCacheRepo};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 // ---------------------------------------------------------------------------
@@ -299,13 +299,23 @@ pub fn compute_file_root(data: &[u8]) -> ChunkHash {
     level[0]
 }
 
-/// Read a file from disk and compute its Merkle root. Returns an `Io` error
-/// if the file cannot be read.
-fn compute_file_root_from_path(path: &Path) -> CasResult<(ChunkHash, u64)> {
+/// Read a file from disk and compute its Merkle root.
+/// Returns `(hash, size_bytes, mtime_ns)`.
+fn compute_file_root_from_path(path: &Path) -> CasResult<(ChunkHash, u64, i64)> {
+    let meta = std::fs::metadata(path)?;
+    let size = meta.len();
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| {
+                d.as_nanos() as i64
+            })
+        })
+        .unwrap_or(0);
     let data = std::fs::read(path)?;
-    let size = data.len() as u64;
     let root = compute_file_root(&data);
-    Ok((root, size))
+    Ok((root, size, mtime_ns))
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +385,10 @@ pub fn collect_files_from_tree(
 ///   diffing). Not used in the current implementation.
 /// - `nodes` — used to walk the HEAD node tree.
 /// - `ignore` — controls which local paths to skip.
+/// - `wt_cache` — optional `(workspace_id, repo)` pair.  When supplied,
+///   the cache is consulted before re-hashing each file: if `(mtime_ns,
+///   size)` match the cached record the stored hash is reused (fast path),
+///   otherwise the file is re-hashed and the cache is updated.
 ///
 /// # Returns
 ///
@@ -387,6 +401,7 @@ pub fn compute_status(
     _trees: &dyn TreeStore,
     nodes: &dyn NodeStore,
     ignore: &IgnoreMatcher,
+    wt_cache: Option<(&str, &dyn WtCacheRepo)>,
 ) -> CasResult<WorkingTreeStatus> {
     // ------------------------------------------------------------------
     // 1. Build the HEAD file map (empty when there is no HEAD version).
@@ -454,7 +469,60 @@ pub fn compute_status(
 
         local_paths.insert(rel_str.clone());
 
-        let (local_root, local_size) = compute_file_root_from_path(entry.path())?;
+        // ------------------------------------------------------------------
+        // Cache fast-path: if (mtime_ns, size) match the cached record we
+        // can reuse the stored hash without reading the file again.
+        // ------------------------------------------------------------------
+        let (local_root, local_size) = if let Some((ws_id, cache)) = wt_cache {
+            // Read file metadata first (cheap syscall).
+            let meta = entry.path().metadata().map_err(CasError::Io)?;
+            let cur_size = meta.len();
+            let cur_mtime_ns: i64 = meta
+                .modified()
+                .ok()
+                .and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_nanos() as i64)
+                })
+                .unwrap_or(0);
+
+            // Check cache hit.
+            match cache.wt_cache_get(ws_id, &rel_str) {
+                Ok(Some(cached))
+                    if cached.mtime_ns == cur_mtime_ns && cached.size == cur_size =>
+                {
+                    tracing::trace!(
+                        path = %rel_str,
+                        "wt_cache: fast-path hit, reusing hash"
+                    );
+                    let hash = blake3::Hash::from_hex(&cached.hash_hex)
+                        .unwrap_or_else(|_| {
+                            // Corrupted cache entry — fall through to recompute.
+                            compute_file_root(&std::fs::read(entry.path()).unwrap_or_default())
+                        });
+                    (hash, cur_size)
+                }
+                _ => {
+                    // Cache miss (or read error) — hash from disk and write back.
+                    let (root, size, mtime_ns) =
+                        compute_file_root_from_path(entry.path())?;
+                    let _ = cache.wt_cache_put(
+                        ws_id,
+                        &rel_str,
+                        &WtCacheEntry {
+                            mtime_ns,
+                            size,
+                            hash_hex: root.to_hex().to_string(),
+                        },
+                    );
+                    (root, size)
+                }
+            }
+        } else {
+            let (root, size, _) = compute_file_root_from_path(entry.path())?;
+            (root, size)
+        };
 
         match head_files.get(&rel_str) {
             None => {

@@ -5,11 +5,11 @@ pub mod rocksdb;
 #[cfg(feature = "local")]
 pub mod sqlite;
 
-pub use traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry, SyncStore, ReachableObjects, Workspace, WorkspaceRepo, ObjectManifestRepo, Remote, RemoteRepo};
+pub use traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry, SyncStore, ReachableObjects, Workspace, WorkspaceRepo, ObjectManifestRepo, Remote, RemoteRepo, WtCacheRepo, WtCacheEntry};
 pub use memory::{
     InMemoryChunkStore, InMemoryTreeStore, InMemoryNodeStore,
     InMemoryVersionRepo, InMemoryRefRepo, InMemoryPathIndex, InMemoryCas,
-    InMemorySyncStore, InMemoryManifestStore,
+    InMemorySyncStore, InMemoryManifestStore, InMemoryWtCache, HashMapWtCache,
 };
 #[cfg(feature = "local")]
 pub use rocksdb::RocksDbCasStore;

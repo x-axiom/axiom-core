@@ -8,7 +8,7 @@ use crate::model::{
 };
 use super::traits::{
     ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry,
-    ObjectManifestRepo, SyncStore, ReachableObjects,
+    ObjectManifestRepo, SyncStore, ReachableObjects, WtCacheEntry, WtCacheRepo,
 };
 
 // ---------------------------------------------------------------------------
@@ -389,5 +389,76 @@ impl SyncStore for InMemorySyncStore {
 
     fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
         Ok(self.versions.versions.read().keys().cloned().collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InMemoryWtCache — trivial no-op cache for tests
+// ---------------------------------------------------------------------------
+
+/// A no-op working-tree cache used in tests.  It never returns a cache hit,
+/// which means `compute_status` always recomputes hashes from disk.  This is
+/// correct for tests (determinism over speed).
+#[derive(Default)]
+pub struct InMemoryWtCache;
+
+impl WtCacheRepo for InMemoryWtCache {
+    fn wt_cache_get(&self, _workspace_id: &str, _path: &str) -> CasResult<Option<WtCacheEntry>> {
+        Ok(None)
+    }
+    fn wt_cache_put(
+        &self,
+        _workspace_id: &str,
+        _path: &str,
+        _entry: &WtCacheEntry,
+    ) -> CasResult<()> {
+        Ok(())
+    }
+    fn wt_cache_clear(&self, _workspace_id: &str) -> CasResult<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HashMapWtCache — real in-memory cache for benchmarks
+// ---------------------------------------------------------------------------
+
+/// A HashMap-backed working-tree cache.  Suitable for benchmarks and
+/// integration tests that want to measure cache hit performance.
+#[derive(Default)]
+pub struct HashMapWtCache {
+    data: parking_lot::RwLock<HashMap<(String, String), WtCacheEntry>>,
+}
+
+impl HashMapWtCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl WtCacheRepo for HashMapWtCache {
+    fn wt_cache_get(&self, workspace_id: &str, path: &str) -> CasResult<Option<WtCacheEntry>> {
+        Ok(self
+            .data
+            .read()
+            .get(&(workspace_id.to_owned(), path.to_owned()))
+            .cloned())
+    }
+    fn wt_cache_put(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        entry: &WtCacheEntry,
+    ) -> CasResult<()> {
+        self.data
+            .write()
+            .insert((workspace_id.to_owned(), path.to_owned()), entry.clone());
+        Ok(())
+    }
+    fn wt_cache_clear(&self, workspace_id: &str) -> CasResult<()> {
+        self.data
+            .write()
+            .retain(|(ws, _), _| ws != workspace_id);
+        Ok(())
     }
 }

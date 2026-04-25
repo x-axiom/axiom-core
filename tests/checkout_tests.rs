@@ -95,6 +95,7 @@ fn test_checkout_force_status_clean_after() {
         state.trees.as_ref(),
         state.nodes.as_ref(),
         &ignore,
+        None,
     )
     .unwrap();
     assert!(!status.is_dirty(), "expected clean status after Force checkout");

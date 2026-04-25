@@ -109,6 +109,7 @@ fn test_all_untracked_when_no_head() {
         stores.trees.as_ref(),
         stores.nodes.as_ref(),
         &ignore,
+        None,
     )
     .unwrap();
 
@@ -137,6 +138,7 @@ fn test_unchanged_not_emitted() {
         stores.trees.as_ref(),
         stores.nodes.as_ref(),
         &ignore,
+        None,
     )
     .unwrap();
 
@@ -162,6 +164,7 @@ fn test_modified_file() {
         stores.trees.as_ref(),
         stores.nodes.as_ref(),
         &ignore,
+        None,
     )
     .unwrap();
 
@@ -194,6 +197,7 @@ fn test_deleted_file() {
         stores.trees.as_ref(),
         stores.nodes.as_ref(),
         &ignore,
+        None,
     )
     .unwrap();
 
@@ -238,6 +242,7 @@ fn test_mixed_changes() {
         stores.trees.as_ref(),
         stores.nodes.as_ref(),
         &ignore,
+        None,
     )
     .unwrap();
 
@@ -292,6 +297,7 @@ fn test_ignore_node_modules_files_excluded() {
         stores.trees.as_ref(),
         stores.nodes.as_ref(),
         &ignore,
+        None,
     )
     .unwrap();
 
@@ -317,6 +323,7 @@ fn test_ignore_src_not_ignored() {
         stores.trees.as_ref(),
         stores.nodes.as_ref(),
         &ignore,
+        None,
     )
     .unwrap();
 
@@ -348,6 +355,7 @@ fn test_ignore_target_dir_excluded() {
         stores.trees.as_ref(),
         stores.nodes.as_ref(),
         &ignore,
+        None,
     )
     .unwrap();
 
@@ -377,6 +385,7 @@ fn test_axiomignore_custom_patterns() {
         stores.trees.as_ref(),
         stores.nodes.as_ref(),
         &ignore,
+        None,
     )
     .unwrap();
 
@@ -413,6 +422,7 @@ fn test_axiomignore_itself_excluded() {
         stores.trees.as_ref(),
         stores.nodes.as_ref(),
         &ignore,
+        None,
     )
     .unwrap();
 
@@ -440,6 +450,7 @@ fn test_nested_axiomignore_scoped_to_subdir() {
         stores.trees.as_ref(),
         stores.nodes.as_ref(),
         &ignore,
+        None,
     )
     .unwrap();
 
