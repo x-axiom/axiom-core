@@ -81,6 +81,40 @@ pub trait RefRepo: Send + Sync {
     fn delete_ref(&self, name: &str) -> CasResult<()>;
     /// List all refs, optionally filtered by kind.
     fn list_refs(&self, kind: Option<RefKind>) -> CasResult<Vec<Ref>>;
+
+    /// Atomically compare-and-swap a ref's target.
+    ///
+    /// Reads the current ref named `name`:
+    /// - If `expected_old` is `None`, requires the ref to **not exist**.
+    /// - If `expected_old` is `Some(v)`, requires the current target to equal `v`.
+    ///
+    /// When the condition holds, writes `new_ref` and returns `Ok(true)`.
+    /// When the condition is **not** met, leaves the store unchanged and returns
+    /// `Ok(false)`.
+    ///
+    /// The default implementation is a **non-atomic** read-check-write, which
+    /// is safe for single-process use (SQLite/in-memory).  The FoundationDB
+    /// backend overrides this with a genuinely atomic FDB transaction, making
+    /// it safe under concurrent writers.
+    fn compare_and_swap_ref(
+        &self,
+        name: &str,
+        expected_old: Option<&VersionId>,
+        new_ref: &Ref,
+    ) -> CasResult<bool> {
+        let current = self.get_ref(name)?;
+        let matches = match (current.as_ref(), expected_old) {
+            (None, None) => true,
+            (Some(r), Some(expected)) => r.target == *expected,
+            _ => false,
+        };
+        if matches {
+            self.put_ref(new_ref)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 /// Repository for path-based metadata indexing per version.
@@ -210,6 +244,14 @@ impl<T: RefRepo + ?Sized> RefRepo for Arc<T> {
     }
     fn list_refs(&self, kind: Option<RefKind>) -> CasResult<Vec<Ref>> {
         (**self).list_refs(kind)
+    }
+    fn compare_and_swap_ref(
+        &self,
+        name: &str,
+        expected_old: Option<&VersionId>,
+        new_ref: &Ref,
+    ) -> CasResult<bool> {
+        (**self).compare_and_swap_ref(name, expected_old, new_ref)
     }
 }
 
