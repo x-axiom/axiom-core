@@ -4,6 +4,8 @@ pub mod memory;
 pub mod rocksdb;
 #[cfg(feature = "local")]
 pub mod sqlite;
+#[cfg(feature = "cloud")]
+pub mod s3;
 
 pub use traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry, SyncStore, ReachableObjects, Workspace, WorkspaceRepo, ObjectManifestRepo, Remote, RemoteRepo, WtCacheRepo, WtCacheEntry};
 pub use memory::{
@@ -15,6 +17,8 @@ pub use memory::{
 pub use rocksdb::RocksDbCasStore;
 #[cfg(feature = "local")]
 pub use sqlite::SqliteMetadataStore;
+#[cfg(feature = "cloud")]
+pub use s3::{S3ChunkStore, S3Config, StaticCredentials};
 
 // ---------------------------------------------------------------------------
 // LocalSyncStore — SyncStore backed by RocksDB + SQLite
