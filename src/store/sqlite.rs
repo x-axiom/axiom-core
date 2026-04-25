@@ -264,6 +264,34 @@ fn migrate_v3(conn: &Connection) -> CasResult<()> {
 /// transaction; we wrap with `defer_foreign_keys` instead, which is the
 /// transaction-scoped equivalent and does not require leaving the txn).
 fn migrate_v4(conn: &Connection) -> CasResult<()> {
+    // Pre-clean orphan rows before rebuilding with FK constraints.
+    // In a v3 DB that existed before FK constraints were enforced, rows whose
+    // `remote_name` no longer matches any `remotes.name` would cause the
+    // INSERT into the new tables to violate the FK at COMMIT time (because we
+    // use `defer_foreign_keys`).  Clean them up first and log the count so
+    // operators know if stale data was removed.
+    let orphan_remote_refs = conn
+        .execute(
+            "DELETE FROM remote_refs WHERE remote_name NOT IN (SELECT name FROM remotes)",
+            [],
+        )
+        .map_err(|e| CasError::Store(format!("migrate_v4 pre-clean remote_refs: {e}")))?;
+
+    let orphan_sync_sessions = conn
+        .execute(
+            "DELETE FROM sync_sessions WHERE remote_name NOT IN (SELECT name FROM remotes)",
+            [],
+        )
+        .map_err(|e| CasError::Store(format!("migrate_v4 pre-clean sync_sessions: {e}")))?;
+
+    if orphan_remote_refs > 0 || orphan_sync_sessions > 0 {
+        tracing::warn!(
+            orphan_remote_refs,
+            orphan_sync_sessions,
+            "migrate_v4: removed orphan rows before FK rebuild"
+        );
+    }
+
     conn.execute_batch(
         "
         PRAGMA defer_foreign_keys = ON;

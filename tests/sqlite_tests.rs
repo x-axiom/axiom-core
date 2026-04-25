@@ -640,3 +640,187 @@ fn test_persistence_across_reopen() {
         assert!(!p.is_directory);
     }
 }
+
+// ---------------------------------------------------------------------------
+// E06-S06: migrate_v4 orphan pre-clean
+// ---------------------------------------------------------------------------
+
+/// Manually construct a v3 schema, inject orphan rows into `remote_refs` and
+/// `sync_sessions` (rows whose `remote_name` does not exist in `remotes`),
+/// then open with `SqliteMetadataStore::open` which runs `migrate_v4`.
+///
+/// Verifies that:
+/// - Migration succeeds (DB reaches schema v4+).
+/// - Orphan rows are removed.
+/// - Legitimate rows (linked to real remotes) are preserved.
+#[test]
+fn test_migrate_v4_pre_clean_removes_orphan_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("orphan_test.db");
+
+    // ---- Build a v3 database directly ----
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+
+        // Create schema_version table and set it to v3.
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (3);",
+        )
+        .unwrap();
+
+        // v1 tables (versions, refs, etc. — needed for open to succeed).
+        conn.execute_batch(
+            "CREATE TABLE versions (
+                 id TEXT PRIMARY KEY,
+                 parent_ids TEXT,
+                 root_hash TEXT NOT NULL,
+                 message TEXT NOT NULL,
+                 timestamp INTEGER NOT NULL,
+                 metadata TEXT NOT NULL
+             );
+             CREATE TABLE refs (
+                 name TEXT PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 target TEXT NOT NULL
+             );
+             CREATE TABLE tree_nodes (
+                 hash TEXT PRIMARY KEY,
+                 data BLOB NOT NULL
+             );
+             CREATE TABLE node_entries (
+                 hash TEXT PRIMARY KEY,
+                 data BLOB NOT NULL
+             );
+             CREATE TABLE path_entries (
+                 version_id TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 node_hash TEXT NOT NULL,
+                 is_directory INTEGER NOT NULL,
+                 PRIMARY KEY (version_id, path)
+             );",
+        )
+        .unwrap();
+
+        // v2 tables (workspaces).
+        conn.execute_batch(
+            "CREATE TABLE workspaces (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 default_ref TEXT
+             );",
+        )
+        .unwrap();
+
+        // v3 tables (remotes, remote_refs, sync_sessions) — without CASCADE.
+        conn.execute_batch(
+            "CREATE TABLE remotes (
+                 name TEXT PRIMARY KEY,
+                 url TEXT NOT NULL,
+                 auth_token TEXT,
+                 tenant_id TEXT,
+                 workspace_id TEXT,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE TABLE remote_refs (
+                 remote_name TEXT NOT NULL,
+                 ref_name    TEXT NOT NULL,
+                 kind        TEXT NOT NULL,
+                 target      TEXT NOT NULL,
+                 updated_at  INTEGER NOT NULL,
+                 PRIMARY KEY (remote_name, ref_name)
+             );
+             CREATE TABLE sync_sessions (
+                 id          TEXT PRIMARY KEY,
+                 remote_name TEXT NOT NULL,
+                 direction   TEXT NOT NULL,
+                 status      TEXT NOT NULL,
+                 started_at  INTEGER NOT NULL,
+                 finished_at INTEGER,
+                 objects_transferred INTEGER NOT NULL DEFAULT 0,
+                 bytes_transferred   INTEGER NOT NULL DEFAULT 0,
+                 error_message TEXT
+             );",
+        )
+        .unwrap();
+
+        // Insert a real remote.
+        conn.execute_batch(
+            "INSERT INTO remotes VALUES ('origin', 'https://example.com', NULL, NULL, NULL, 0);",
+        )
+        .unwrap();
+
+        // Insert a legitimate remote_ref (linked to real remote).
+        conn.execute_batch(
+            "INSERT INTO remote_refs VALUES ('origin', 'main', 'branch', 'abc123', 0);",
+        )
+        .unwrap();
+
+        // Insert ORPHAN rows — remote_name 'ghost' does not exist in `remotes`.
+        conn.execute_batch(
+            "INSERT INTO remote_refs VALUES ('ghost', 'main', 'branch', 'deadbeef', 0);",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO sync_sessions
+                 VALUES ('sess-1', 'ghost', 'push', 'completed', 0, 1, 0, 0, NULL);",
+        )
+        .unwrap();
+    }
+
+    // ---- Open via SqliteMetadataStore — this runs migrate_v4 ----
+    let store = SqliteMetadataStore::open(&db_path)
+        .expect("open should succeed even with orphan rows in v3 DB");
+
+    // ---- Verify schema reached latest version ----
+    // (Indirectly: the store is usable for normal operations.)
+    let conn_guard = {
+        // Access the raw connection to inspect the DB state.
+        // We can't get the raw connection back; instead verify via the public
+        // API that the store is functional, and verify orphan removal by
+        // opening a raw connection to the same file.
+        drop(store);
+        Connection::open(&db_path).unwrap()
+    };
+
+    // Orphan remote_ref for 'ghost' must be gone.
+    let orphan_count: i64 = conn_guard
+        .query_row(
+            "SELECT COUNT(*) FROM remote_refs WHERE remote_name = 'ghost'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphan_count, 0, "orphan remote_refs rows should be removed");
+
+    // Orphan sync_session for 'ghost' must be gone.
+    let orphan_session: i64 = conn_guard
+        .query_row(
+            "SELECT COUNT(*) FROM sync_sessions WHERE remote_name = 'ghost'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphan_session, 0, "orphan sync_sessions rows should be removed");
+
+    // Legitimate remote_ref for 'origin' must still exist.
+    let legit_count: i64 = conn_guard
+        .query_row(
+            "SELECT COUNT(*) FROM remote_refs WHERE remote_name = 'origin'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legit_count, 1, "legitimate remote_ref must be preserved");
+
+    // Schema must have been upgraded (version >= 4).
+    let schema_version: u32 = conn_guard
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        schema_version >= 4,
+        "schema_version must be >= 4 after successful migration, got {schema_version}"
+    );
+}
