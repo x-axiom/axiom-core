@@ -10,6 +10,7 @@ pub mod s3;
 pub mod cache;
 #[cfg(feature = "fdb")]
 pub mod fdb;
+pub mod factory;
 
 pub use traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry, SyncStore, ReachableObjects, Workspace, WorkspaceRepo, ObjectManifestRepo, Remote, RemoteRepo, WtCacheRepo, WtCacheEntry};
 pub use memory::{
@@ -27,6 +28,7 @@ pub use s3::{S3ChunkStore, S3Config, StaticCredentials};
 pub use cache::{CacheClient, CacheConfig, CacheStats, CachedChunkStore, CachedMetadataStore};
 #[cfg(feature = "fdb")]
 pub use fdb::{FdbMetadataStore, FdbConfig};
+pub use factory::{StoreFactory, StoreConfig, BackendConfig, LocalConfig, CloudConfig};
 
 // ---------------------------------------------------------------------------
 // LocalSyncStore — SyncStore backed by RocksDB + SQLite

@@ -1,4 +1,5 @@
 use axiom_core::api::{build_router, state::AppState};
+use axiom_core::store::StoreFactory;
 use clap::{Parser, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
@@ -81,9 +82,24 @@ fn build_local_state(_cli: &Cli) -> AppState {
 }
 
 fn build_cloud_state(cli: &Cli) -> AppState {
-    if cli.fdb_cluster.is_none() || cli.s3_bucket.is_none() {
-        eprintln!("error: cloud mode requires --fdb-cluster and --s3-bucket");
-        std::process::exit(1);
+    // Prefer explicit CLI args over environment variables for ergonomic
+    // one-shot usage; missing required args fall through to env-var detection.
+    // SAFETY: single-threaded at this point — Tokio runtime not yet started.
+    unsafe {
+        if let Some(bucket) = &cli.s3_bucket {
+            std::env::set_var("AXIOM_S3_BUCKET", bucket);
+        }
+        if let Some(cluster) = &cli.fdb_cluster {
+            std::env::set_var("AXIOM_FDB_CLUSTER_FILE", cluster);
+        }
+        // `AXIOM_BACKEND` must be set for from_env() to pick up "cloud".
+        std::env::set_var("AXIOM_BACKEND", "cloud");
     }
-    panic!("cloud mode is not yet implemented");
+
+    StoreFactory::from_env()
+        .and_then(|f| f.create())
+        .unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        })
 }
