@@ -5,5 +5,7 @@ pub mod recycle_bin;
 pub mod refcount;
 #[cfg(feature = "fdb")]
 pub mod sweep;
+#[cfg(feature = "fdb")]
+pub mod scheduler;
 #[cfg(feature = "cloud")]
 pub mod lifecycle;

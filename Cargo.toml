@@ -9,7 +9,7 @@ local = ["dep:rocksdb", "dep:rusqlite"]
 cloud = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:zstd", "dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types", "dep:md-5", "dep:bytes", "dep:fred"]
 # FoundationDB backend — requires the FDB client library to be installed.
 # brew install foundationdb  (macOS) or the package for your distro.
-fdb = ["dep:foundationdb", "dep:uuid", "dep:jsonwebtoken", "dep:ed25519-dalek", "dep:rand"]
+fdb = ["dep:foundationdb", "dep:uuid", "dep:jsonwebtoken", "dep:ed25519-dalek", "dep:rand", "dep:prometheus"]
 full = ["local", "cloud"]
 
 [dependencies]
@@ -50,6 +50,7 @@ jsonwebtoken = { version = "9", optional = true }
 ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"], optional = true }
 rand = { version = "0.8", optional = true }
 fred = { version = "9", optional = true }
+prometheus = { version = "0.13", optional = true }
 
 [build-dependencies]
 tonic-build = "0.12"
