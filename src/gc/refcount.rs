@@ -275,6 +275,11 @@ impl RefCountRepo {
         format!("{GARBAGE_PREFIX}{tenant_id}\x00{workspace_id}\x00{hash}").into_bytes()
     }
 
+    /// Public-crate wrapper used by the sweep phase to clear garbage entries.
+    pub(crate) fn garbage_key_pub(tenant_id: &str, workspace_id: &str, hash: &ChunkHash) -> Vec<u8> {
+        Self::garbage_key(tenant_id, workspace_id, hash)
+    }
+
     fn garbage_prefix(tenant_id: &str, workspace_id: &str) -> Vec<u8> {
         format!("{GARBAGE_PREFIX}{tenant_id}\x00{workspace_id}\x00").into_bytes()
     }
@@ -397,7 +402,7 @@ impl RefCountRepo {
 ///
 /// Missing nodes (not present in `nodes`) are silently skipped — they may
 /// have already been GC'd or the tree may be partially populated.
-fn collect_node_hashes(root: &ChunkHash, nodes: &dyn NodeStore) -> CasResult<Vec<ChunkHash>> {
+pub(crate) fn collect_node_hashes(root: &ChunkHash, nodes: &dyn NodeStore) -> CasResult<Vec<ChunkHash>> {
     let mut visited: HashSet<[u8; 32]> = HashSet::new();
     let mut result: Vec<ChunkHash> = Vec::new();
     let mut queue: VecDeque<ChunkHash> = VecDeque::new();
