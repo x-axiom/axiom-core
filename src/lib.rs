@@ -14,3 +14,5 @@ pub mod sync;
 // Keep legacy modules for backward compatibility during transition.
 pub mod cas;
 pub mod version;
+#[cfg(feature = "fdb")]
+pub mod tenant;
