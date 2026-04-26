@@ -2,3 +2,5 @@
 
 pub mod refcount;
 pub mod sweep;
+#[cfg(feature = "cloud")]
+pub mod lifecycle;
