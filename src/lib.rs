@@ -16,3 +16,5 @@ pub mod cas;
 pub mod version;
 #[cfg(feature = "fdb")]
 pub mod tenant;
+#[cfg(feature = "fdb")]
+pub mod auth;
