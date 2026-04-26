@@ -199,21 +199,30 @@ pub struct Workspace {
     /// Hex-encoded `VersionId` of the last commit / checkout written to
     /// `local_path`. Used as the comparison base for `compute_status`.
     pub current_version: Option<String>,
+    /// Unix timestamp (seconds) when this workspace was soft-deleted.
+    /// `None` means the workspace is active.
+    pub deleted_at: Option<u64>,
 }
 
 /// Repository for workspace records.
 pub trait WorkspaceRepo: Send + Sync {
     /// Insert a workspace. Fails if the id already exists.
     fn create_workspace(&self, ws: &Workspace) -> CasResult<()>;
-    /// Get a workspace by id.
+    /// Get a workspace by id (regardless of soft-delete status).
     fn get_workspace(&self, id: &str) -> CasResult<Option<Workspace>>;
-    /// List all workspaces ordered by `created_at` ascending.
+    /// List active (non-deleted) workspaces ordered by `created_at` ascending.
     fn list_workspaces(&self) -> CasResult<Vec<Workspace>>;
-    /// Delete a workspace by id. No-op if it does not exist.
+    /// Permanently delete a workspace by id. No-op if it does not exist.
     fn delete_workspace(&self, id: &str) -> CasResult<()>;
     /// Update mutable fields of an existing workspace (name, metadata,
     /// local_path, current_ref, current_version). No-op if id not found.
     fn update_workspace(&self, ws: &Workspace) -> CasResult<()>;
+    /// Mark a workspace as soft-deleted by recording `deleted_at`.
+    fn soft_delete_workspace(&self, id: &str, deleted_at: u64) -> CasResult<()>;
+    /// Clear `deleted_at`, restoring a soft-deleted workspace to active.
+    fn restore_workspace(&self, id: &str) -> CasResult<()>;
+    /// List soft-deleted workspaces ordered by `deleted_at` ascending.
+    fn list_deleted_workspaces(&self) -> CasResult<Vec<Workspace>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +279,15 @@ impl<T: WorkspaceRepo + ?Sized> WorkspaceRepo for Arc<T> {
     }
     fn update_workspace(&self, ws: &Workspace) -> CasResult<()> {
         (**self).update_workspace(ws)
+    }
+    fn soft_delete_workspace(&self, id: &str, deleted_at: u64) -> CasResult<()> {
+        (**self).soft_delete_workspace(id, deleted_at)
+    }
+    fn restore_workspace(&self, id: &str) -> CasResult<()> {
+        (**self).restore_workspace(id)
+    }
+    fn list_deleted_workspaces(&self) -> CasResult<Vec<Workspace>> {
+        (**self).list_deleted_workspaces()
     }
 }
 

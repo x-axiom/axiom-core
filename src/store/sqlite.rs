@@ -17,7 +17,7 @@ use super::traits::{
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding new migrations.
-const CURRENT_SCHEMA_VERSION: u32 = 7;
+const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 /// Apply all pending migrations up to `CURRENT_SCHEMA_VERSION`.
 fn run_migrations(conn: &Connection) -> CasResult<()> {
@@ -63,6 +63,9 @@ fn run_migrations(conn: &Connection) -> CasResult<()> {
             }
             if current < 7 {
                 migrate_v7(conn)?;
+            }
+            if current < 8 {
+                migrate_v8(conn)?;
             }
             Ok(())
         })();
@@ -367,6 +370,19 @@ fn migrate_v7(conn: &Connection) -> CasResult<()> {
             ON wt_cache(workspace_id);
         UPDATE schema_version SET version = 7;
         ",
+    )
+    .map_err(|e| CasError::Store(e.to_string()))?;
+    Ok(())
+}
+
+/// Migration v8: add `deleted_at` column to `workspaces` for soft-delete
+/// (E11-S04 recycle bin).
+fn migrate_v8(conn: &Connection) -> CasResult<()> {
+    conn.execute_batch(
+        "ALTER TABLE workspaces ADD COLUMN deleted_at INTEGER;
+         CREATE INDEX IF NOT EXISTS idx_workspaces_deleted_at
+             ON workspaces(deleted_at);
+         UPDATE schema_version SET version = 8;",
     )
     .map_err(|e| CasError::Store(e.to_string()))?;
     Ok(())
@@ -861,7 +877,7 @@ impl crate::store::traits::WorkspaceRepo for SqliteMetadataStore {
     fn get_workspace(&self, id: &str) -> CasResult<Option<crate::store::traits::Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn
-            .prepare("SELECT id, name, created_at, metadata, local_path, current_ref, current_version FROM workspaces WHERE id = ?1")
+            .prepare("SELECT id, name, created_at, metadata, local_path, current_ref, current_version, deleted_at FROM workspaces WHERE id = ?1")
             .map_err(|e| CasError::Store(e.to_string()))?;
         stmt.query_row(params![id], |row| {
             Ok(crate::store::traits::Workspace {
@@ -872,6 +888,7 @@ impl crate::store::traits::WorkspaceRepo for SqliteMetadataStore {
                 local_path: row.get(4)?,
                 current_ref: row.get(5)?,
                 current_version: row.get(6)?,
+                deleted_at: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
             })
         })
         .optional()
@@ -881,7 +898,7 @@ impl crate::store::traits::WorkspaceRepo for SqliteMetadataStore {
     fn list_workspaces(&self) -> CasResult<Vec<crate::store::traits::Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn
-            .prepare("SELECT id, name, created_at, metadata, local_path, current_ref, current_version FROM workspaces ORDER BY created_at ASC")
+            .prepare("SELECT id, name, created_at, metadata, local_path, current_ref, current_version, deleted_at FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at ASC")
             .map_err(|e| CasError::Store(e.to_string()))?;
         let rows = stmt
             .query_map([], |row| {
@@ -893,6 +910,7 @@ impl crate::store::traits::WorkspaceRepo for SqliteMetadataStore {
                     local_path: row.get(4)?,
                     current_ref: row.get(5)?,
                     current_version: row.get(6)?,
+                    deleted_at: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
                 })
             })
             .map_err(|e| CasError::Store(e.to_string()))?;
@@ -918,6 +936,52 @@ impl crate::store::traits::WorkspaceRepo for SqliteMetadataStore {
         )
         .map_err(|e| CasError::Store(e.to_string()))?;
         Ok(())
+    }
+
+    fn soft_delete_workspace(&self, id: &str, deleted_at: u64) -> CasResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE workspaces SET deleted_at=?2 WHERE id=?1 AND deleted_at IS NULL",
+            params![id, deleted_at as i64],
+        )
+        .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    fn restore_workspace(&self, id: &str) -> CasResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE workspaces SET deleted_at=NULL WHERE id=?1",
+            params![id],
+        )
+        .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_deleted_workspaces(&self) -> CasResult<Vec<crate::store::traits::Workspace>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT id, name, created_at, metadata, local_path, current_ref, current_version, deleted_at FROM workspaces WHERE deleted_at IS NOT NULL ORDER BY deleted_at ASC")
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::store::traits::Workspace {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at: row.get::<_, i64>(2)? as u64,
+                    metadata: row.get(3)?,
+                    local_path: row.get(4)?,
+                    current_ref: row.get(5)?,
+                    current_version: row.get(6)?,
+                    deleted_at: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                })
+            })
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| CasError::Store(e.to_string()))?);
+        }
+        Ok(out)
     }
 }
 
