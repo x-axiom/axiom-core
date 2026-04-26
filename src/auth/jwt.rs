@@ -402,6 +402,39 @@ impl JwtService {
         Err(CasError::Unauthorized("invalid refresh token".into()))
     }
 
+    // -----------------------------------------------------------------------
+    // Test-only helpers
+    // -----------------------------------------------------------------------
+
+    /// Issue an access token with an explicit expiry timestamp.
+    ///
+    /// Used in tests to create already-expired tokens without sleeping.
+    #[cfg(test)]
+    pub fn issue_access_token_with_exp(
+        &self,
+        user_id: &str,
+        tenant_id: &str,
+        org_id: &str,
+        roles: Vec<String>,
+        exp: u64,
+    ) -> CasResult<String> {
+        let now = unix_now();
+        let claims = AccessClaims {
+            sub: user_id.to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            org_id: org_id.to_owned(),
+            roles,
+            iat: now,
+            exp,
+            jti: Uuid::new_v4().to_string(),
+        };
+        let active = &self.keys[self.active_idx];
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(active.kid.clone());
+        encode(&header, &claims, &active.encoding_key)
+            .map_err(|e| CasError::Store(format!("JWT test encode: {e}")))
+    }
+
     fn fdb_get(db: Arc<Database>, key: Vec<u8>) -> CasResult<Option<Vec<u8>>> {
         Self::rt()?.block_on(async move {
             let trx = db

@@ -60,6 +60,7 @@ reqwest = { version = "0.12", features = ["json"] }
 tokio-test = "0.4"
 tokio-stream = { version = "0.1", features = ["net"] }
 testcontainers-modules = { version = "0.15", features = ["minio", "redis"] }
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "cas-benchmark"
