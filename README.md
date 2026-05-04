@@ -1,55 +1,176 @@
-# Axiom
+# Axiom Core
 
-Axiom is a next-generation high-performance, versioned, content-addressed large-object storage engine.
+[简体中文](README.zh-CN.md)
 
-# Axiom-core
+Axiom Core is a high-performance, versioned, content-addressed storage engine written in Rust.
 
-This repository contains the core Rust prototype for Axiom — a versioned, content-addressed large-object storage engine. The v0.1 POC is complete, providing a fully functional single-node system with HTTP API, persistent storage, content-defined chunking, Merkle trees, version history, branching, tagging, diff, and streaming upload/download.
+It brings Git-like ideas to large binary assets: immutable versions, content-based deduplication, branch and tag references, and Merkle-tree diffing. It can run as an HTTP service or be embedded directly in other applications such as the Axiom desktop app.
 
-## Current Status — v0.1 POC Complete
+## Table of Contents
 
-The project provides:
+- [Why Axiom Core](#why-axiom-core)
+- [Key Capabilities](#key-capabilities)
+- [Architecture](#architecture)
+- [Repository Layout](#repository-layout)
+- [Getting Started](#getting-started)
+- [Feature Flags](#feature-flags)
+- [HTTP API Overview](#http-api-overview)
+- [Development](#development)
+- [Contributing](#contributing)
+- [Related Projects](#related-projects)
+- [Roadmap](#roadmap)
+- [License](#license)
 
-- **BLAKE3 content addressing** — all chunks, tree nodes, and directory nodes are hash-addressed
-- **Domain model** — chunk, tree, node, version, ref, and diff primitives
-- **RocksDB CAS** (AXIOM-102) — persistent chunk, tree node, and directory node storage with column families, idempotent writes, and crash recovery
-- **SQLite metadata** (AXIOM-103) — version, ref, and path index persistence with WAL mode and migration support
-- **FastCDC chunking** (AXIOM-104) — content-defined chunking (16KB–256KB), deduplication, and reassembly
-- **Merkle tree** (AXIOM-105) — multi-level tree with configurable fan-out (default 64), build and rehydrate operations
-- **Directory namespace** (AXIOM-106) — `build_directory_tree()`, deterministic directory hashing, path resolution, SQLite path index
-- **Commit service** (AXIOM-107) — version creation, branch/tag CRUD, history traversal, ref resolution
-- **Diff engine** (AXIOM-108) — directory-level and chunk-level diff with Merkle hash short-circuit for unchanged subtrees
-- **HTTP API** (AXIOM-109) — axum-based REST API with health, objects, versions, refs, diff, upload, and download routes
-- **Streaming upload** (AXIOM-110) — single-file (raw body) and multi-file (JSON+base64) upload with dedup statistics
-- **Streaming download** (AXIOM-111) — file download via Merkle rehydration and directory listing
-- **Query APIs** (AXIOM-112) — paginated version history, ref-aware version/diff resolution, node metadata endpoint
-- **E2E validation** (AXIOM-113) — 10 end-to-end tests, 6 benchmark scenarios, demo script, and known limitations documentation
-- **Immutable tags**, branch management, and ref-based navigation across all read endpoints
-- **158+ automated tests** covering all layers from domain model to HTTP API integration
+## Why Axiom Core
 
-## Quick Start
+Axiom Core is designed for workloads where plain object storage is not enough and Git-style tooling does not scale well to large files.
 
-Requirements:
+- Content-addressed storage with BLAKE3 hashes
+- Chunk-level deduplication for repeated content across versions
+- Immutable version history with mutable branch and tag references
+- Merkle-tree diffing for efficient change detection
+- Swappable storage backends behind trait-based abstractions
+- Support for both local single-node deployments and cloud-oriented extensions
 
-- Rust stable toolchain
-- Cargo
+### Comparison
 
-### Start the Server
+| Capability | Axiom Core | Git LFS | DVC | Plain S3 |
+| --- | --- | --- | --- | --- |
+| Content-addressed storage | Yes, BLAKE3 | Partial | Partial | No |
+| Built-in version graph | Yes | Via Git | Via Git | No |
+| Server-side diff | Yes, Merkle-based | No | No | No |
+| Chunk-level deduplication | Yes | No | No | No |
+| Embeddable without HTTP | Yes | No | No | No |
+| Multi-tenant SaaS path | Yes, with `fdb` | No | No | Partial |
 
-```bash
-cargo run --release
+## Key Capabilities
+
+### Storage and Versioning
+
+- FastCDC chunking for chunk-level deduplication
+- RocksDB-backed content-addressed storage for chunks, trees, and nodes
+- SQLite metadata storage for versions, refs, path indexes, and workspace metadata
+- Immutable version nodes with branch and tag references
+- BLAKE3 hashes used consistently across stored objects
+
+### Developer Workflow
+
+- Upload single files or whole directory snapshots
+- Browse versions, inspect metadata, and download file contents
+- Diff two versions, branches, or tags
+- Materialize a version into a working directory with checkout support
+- Compute working tree status against the current HEAD
+
+### Distributed and SaaS Extensions
+
+- gRPC sync support behind the `cloud` feature
+- Multi-tenant and FoundationDB-backed flows behind the `fdb` feature
+- JWT authentication, RBAC, remote refs, and sync session support
+- Garbage collection, retention handling, and lifecycle management for advanced deployments
+
+## Architecture
+
+```text
+HTTP API (axum)
+    |
+Service Layer
+    |-- commit.rs
+    |-- diff_engine.rs
+    |-- namespace.rs
+    |-- checkout.rs
+    |-- working_tree.rs
+    |-- sync/
+    |-- gc/
+    |
+Store Traits (src/store/traits.rs)
+    |-- ChunkStore
+    |-- TreeStore
+    |-- NodeStore
+    |-- VersionRepo
+    |-- RefRepo
+    |-- PathIndexRepo
+    |-- WorkspaceRepo
+    |-- SyncStore
+    |
+Implementations
+    |-- RocksDB CAS store
+    |-- SQLite metadata store
+    |-- In-memory store for tests
 ```
 
-The server listens on `http://localhost:3000`.
+All storage access goes through traits defined in `src/store/traits.rs`. Service and API code should depend on those traits rather than concrete backend types. `AppState` wraps the selected backends and exposes them through shared trait objects.
 
-### Upload Files
+## Repository Layout
+
+```text
+src/
+  api/          axum router, request handlers, DTOs, error mapping
+  auth/         JWT, RBAC, middleware
+  gc/           recycle bin, retention, garbage collection, scheduler
+  model/        domain types such as ChunkHash, VersionNode, Ref
+  store/        storage traits and backend implementations
+  sync/         sync protocol support, remote refs, session state
+  tenant/       multi-tenant support for FoundationDB-backed flows
+  checkout.rs   materialize stored data onto the local filesystem
+  chunker.rs    FastCDC content-defined chunking
+  commit.rs     version creation, refs, history
+  diff_engine.rs
+  merkle.rs     Merkle tree build and traversal
+  namespace.rs  directory tree construction
+  working_tree.rs
+tests/          integration tests
+benches/        Criterion benchmarks
+proto/          gRPC definitions for sync
+```
+
+## Getting Started
+
+### Prerequisites
+
+| Dependency | Required for | Notes |
+| --- | --- | --- |
+| Rust stable | All builds | Install from [rustup.rs](https://rustup.rs) |
+| RocksDB | `local` feature | `brew install rocksdb` or your distro equivalent |
+| SQLite CLI | Optional | Useful for inspecting metadata manually; not required for building |
+| `protoc` | `cloud` feature | `brew install protobuf` or your distro equivalent |
+| FoundationDB client | `fdb` feature | Required only for FoundationDB-backed workflows |
+
+### Build
 
 ```bash
-# Single file
+# Default single-node build
+cargo build
+
+# Local + cloud features
+cargo build --features full
+
+# FoundationDB-backed extensions
+cargo build --features fdb
+```
+
+### Run the Server
+
+```bash
+# Start with default local storage under .axiom/
+cargo run --release
+
+# Customize the data directory and listen address
+cargo run --release -- --data-dir .axiom-dev --listen 127.0.0.1:3000
+
+# Show all CLI options
+cargo run --release -- --help
+```
+
+By default, the server listens on `0.0.0.0:3000` and stores local data under `.axiom/`.
+
+### Upload Data
+
+```bash
+# Upload a single file
 curl -X POST 'http://localhost:3000/api/v1/upload/file?path=hello.txt&message=first+commit' \
   --data-binary 'Hello, Axiom!'
 
-# Directory (multiple files)
+# Upload a directory snapshot
 curl -X POST http://localhost:3000/api/v1/upload/directory \
   -H 'Content-Type: application/json' \
   -d '{
@@ -61,101 +182,111 @@ curl -X POST http://localhost:3000/api/v1/upload/directory \
   }'
 ```
 
-### Browse and Download
+### Browse and Diff Versions
 
 ```bash
-# List directory contents
+# List the root directory of the current main ref
 curl http://localhost:3000/api/v1/version/main/ls
 
-# Download a file
+# Download a file from a stored version
 curl http://localhost:3000/api/v1/version/main/file/hello.txt
 
-# View version history
+# Inspect version history
 curl http://localhost:3000/api/v1/versions/main/history
-```
 
-### Diff Versions
-
-```bash
+# Diff two refs
 curl -X POST http://localhost:3000/api/v1/diff \
   -H 'Content-Type: application/json' \
   -d '{"old_version": "v1.0", "new_version": "main"}'
 ```
 
-### Run Tests
+## Feature Flags
 
-```bash
-cargo test
-```
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `local` | Yes | RocksDB CAS plus SQLite metadata for local and embedded usage |
+| `cloud` | No | gRPC sync and cloud-oriented integrations |
+| `fdb` | No | FoundationDB-backed tenant, auth, GC, and observability features |
+| `full` | No | Convenience flag for `local` + `cloud` |
 
-### Run Benchmarks
+The desktop app in this monorepo builds Axiom Core with `--no-default-features --features local`.
 
-```bash
-cargo bench --bench poc_benchmark
-```
-
-For the full demo walkthrough, see [docs/demo.md](docs/demo.md).
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Health check |
-| POST | `/api/v1/upload/file` | Single-file upload (raw body) |
-| POST | `/api/v1/upload/directory` | Multi-file upload (JSON) |
-| GET | `/api/v1/version/{ref}/file/{path}` | Download file content |
-| GET | `/api/v1/version/{ref}/ls` | List root directory |
-| GET | `/api/v1/version/{ref}/ls/{path}` | List subdirectory |
-| GET | `/api/v1/versions/{ref}` | Get version by ID, branch, or tag |
-| GET | `/api/v1/versions/{ref}/history` | Paginated version history |
-| GET | `/api/v1/versions/{ref}/path/{path}` | Node metadata (hash, size, type) |
-| POST | `/api/v1/versions` | Create version record |
-| GET | `/api/v1/refs` | List refs (filterable by kind) |
-| POST | `/api/v1/refs` | Create branch or tag |
-| GET | `/api/v1/refs/{name}` | Get ref details |
-| PUT | `/api/v1/refs/{name}` | Update branch target |
-| DELETE | `/api/v1/refs/{name}` | Delete branch |
-| GET | `/api/v1/refs/{name}/resolve` | Resolve ref to version |
-| POST | `/api/v1/diff` | Diff two versions (by ID, branch, or tag) |
-| GET | `/api/v1/objects/{hash}` | Get object info |
+## HTTP API Overview
 
 All `{ref}` parameters accept a version ID, branch name, or tag name.
 
-## Architecture
+| Area | Representative endpoints |
+| --- | --- |
+| Health | `GET /health` |
+| Upload | `POST /api/v1/upload/file`, `POST /api/v1/upload/directory` |
+| Browse | `GET /api/v1/version/{ref}/ls`, `GET /api/v1/version/{ref}/file/{path}` |
+| History | `GET /api/v1/versions/{ref}`, `GET /api/v1/versions/{ref}/history` |
+| Path metadata | `GET /api/v1/versions/{ref}/path/{path}` |
+| Refs | `GET /api/v1/refs`, `POST /api/v1/refs`, `PUT /api/v1/refs/{name}` |
+| Diff | `POST /api/v1/diff` |
+| Objects | `GET /api/v1/objects/{hash}` |
 
+Route implementations live under `src/api/routes/`.
+
+## Development
+
+### Tests
+
+```bash
+# Run all default-feature tests
+cargo test
+
+# Run cloud-related tests
+cargo test --features full
+
+# Run a specific integration test file
+cargo test --test commit_tests
+
+# Run one test by name
+cargo test version_history_is_paginated
 ```
-┌─────────────────────────────────────────────┐
-│              HTTP API (axum)                 │
-│   upload · download · versions · refs · diff│
-├─────────────────────────────────────────────┤
-│           Service Layer                     │
-│   CommitService · DiffEngine · Namespace    │
-├──────────────────────┬──────────────────────┤
-│   RocksDB CAS        │   SQLite Metadata    │
-│   chunks · trees     │   versions · refs    │
-│   nodes              │   path index         │
-└──────────────────────┴──────────────────────┘
+
+### Benchmarks
+
+```bash
+cargo bench --bench poc_benchmark
+cargo bench --bench cas-benchmark
+cargo bench --bench working_tree_bench
 ```
 
-## Design Principles
+### Project Conventions
 
-- **Content-addressed** — chunks, trees, and nodes are all addressed by BLAKE3 hash
-- **Immutable versions** — version nodes are never modified; branches provide mutable pointers
-- **Trait-based storage** — all storage accessed through traits; implementations are swappable
-- **Deduplication by default** — identical content is stored once across all versions
+- Keep storage access behind the traits in `src/store/traits.rs`
+- Use `AppState::memory()` for fully in-memory tests
+- Keep integration tests in `tests/` instead of `src/`
+- Return `CasResult<T>` for fallible storage and service operations
+- Treat `ChunkHash` and `VersionId` as the canonical object identifiers
 
-## Documentation
+## Contributing
 
-- [Demo script](docs/demo.md) — step-by-step POC walkthrough
-- [Known limitations & v0.2 recommendations](docs/known-limitations.md)
-- [Architecture notes](docs/architecture.md)
+Issues and pull requests are welcome.
 
-## Next Steps (v0.2)
+Before opening a pull request:
 
-See [docs/known-limitations.md](docs/known-limitations.md) for the full list. Key priorities:
+- Make sure the relevant tests pass
+- Add or update tests for behavior changes
+- Avoid bypassing storage traits in new code
+- Add a SQLite migration when schema changes require it
+- Keep documentation in sync with user-facing behavior
 
-1. Streaming upload with back-pressure for large files
-2. Persistent storage benchmarks (RocksDB + SQLite)
-3. Garbage collection for orphaned chunks
-4. Merge commit support
-5. CLI tool
+## Related Projects
+
+- [`../axiom-desktop`](../axiom-desktop) - Tauri desktop application embedding Axiom Core
+- [`../axiom-docs`](../axiom-docs) - architecture and design documentation
+
+## Roadmap
+
+1. Merge commit support
+2. Dedicated CLI tooling
+3. End-to-end gRPC sync flows
+4. Web management console
+5. Billing and quota enforcement
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).

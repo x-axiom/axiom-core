@@ -21,7 +21,6 @@ use crate::merkle::{build_tree, DEFAULT_FAN_OUT};
 use crate::model::chunk::ChunkDescriptor;
 use crate::model::VersionId;
 use crate::namespace::{build_directory_tree, FileInput};
-use crate::store::traits::{ChunkStore, RefRepo};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -37,7 +36,7 @@ pub fn router() -> Router<AppState> {
 fn chunk_persist_with_stats(
     data: &[u8],
     policy: &ChunkPolicy,
-    store: &impl ChunkStore,
+    store: &dyn crate::store::traits::ChunkStore,
 ) -> Result<(Vec<ChunkDescriptor>, DedupFileStats), ApiError> {
     let raw_chunks = chunk_bytes(data, policy);
     let mut descriptors = Vec::with_capacity(raw_chunks.len());
@@ -112,17 +111,17 @@ async fn upload_file(
 
     // Auto-resolve branch head as parent if none provided.
     if parents.is_empty() {
-        if let Some(r) = state.meta.get_ref(branch).map_err(ApiError::from)? {
+        if let Some(r) = state.refs.get_ref(branch).map_err(ApiError::from)? {
             parents.push(r.target);
         }
     }
 
     // 1. Chunk and persist with dedup tracking.
     let (descriptors, file_stats) =
-        chunk_persist_with_stats(&body, &policy, state.cas.as_ref())?;
+        chunk_persist_with_stats(&body, &policy, state.chunks.as_ref())?;
 
     // 2. Build Merkle tree for this file.
-    let file_obj = build_tree(&descriptors, DEFAULT_FAN_OUT, state.cas.as_ref())
+    let file_obj = build_tree(&descriptors, DEFAULT_FAN_OUT, state.trees.as_ref())
         .map_err(ApiError::from)?;
 
     // 3. Build a single-file directory tree.
@@ -140,13 +139,13 @@ async fn upload_file(
     let root_entry = build_directory_tree(
         &[file_input],
         &tmp_vid,
-        state.cas.as_ref(),
-        state.meta.as_ref(),
+        state.nodes.as_ref(),
+        state.path_index.as_ref(),
     )
     .map_err(ApiError::from)?;
 
     // 4. Commit to branch.
-    let svc = CommitService::new(state.meta.clone(), state.meta.clone());
+    let svc = CommitService::new(state.versions.clone(), state.refs.clone());
     let version = svc
         .commit(CommitRequest {
             root: root_entry.hash,
@@ -165,8 +164,8 @@ async fn upload_file(
             size: file_obj.size,
         }],
         &version.id,
-        state.cas.as_ref(),
-        state.meta.as_ref(),
+        state.nodes.as_ref(),
+        state.path_index.as_ref(),
     )?;
 
     Ok(Json(UploadResponse {
@@ -192,6 +191,17 @@ async fn upload_directory(
     State(state): State<AppState>,
     Json(req): Json<DirectoryUploadRequest>,
 ) -> ApiResult<Json<UploadResponse>> {
+    upload_directory_service(&state, req).map(Json)
+}
+
+/// Synchronous service backing `POST /directory`.
+///
+/// Exposed so non-HTTP callers (Tauri IPC, internal pipelines) can run the
+/// same chunk → tree → commit pipeline without going through axum.
+pub fn upload_directory_service(
+    state: &AppState,
+    req: DirectoryUploadRequest,
+) -> ApiResult<UploadResponse> {
     if req.files.is_empty() {
         return Err(ApiError(crate::error::CasError::InvalidObject(
             "file list must not be empty".into(),
@@ -207,7 +217,7 @@ async fn upload_directory(
 
     // Auto-resolve branch head as parent if none provided.
     if parents.is_empty() {
-        if let Some(r) = state.meta.get_ref(branch).map_err(ApiError::from)? {
+        if let Some(r) = state.refs.get_ref(branch).map_err(ApiError::from)? {
             parents.push(r.target);
         }
     }
@@ -232,10 +242,10 @@ async fn upload_directory(
 
         // Chunk and persist.
         let (descriptors, stats) =
-            chunk_persist_with_stats(&data, &policy, state.cas.as_ref())?;
+            chunk_persist_with_stats(&data, &policy, state.chunks.as_ref())?;
 
         // Build Merkle tree.
-        let file_obj = build_tree(&descriptors, DEFAULT_FAN_OUT, state.cas.as_ref())
+        let file_obj = build_tree(&descriptors, DEFAULT_FAN_OUT, state.trees.as_ref())
             .map_err(ApiError::from)?;
 
         file_inputs.push(FileInput {
@@ -256,13 +266,13 @@ async fn upload_directory(
     let root_entry = build_directory_tree(
         &file_inputs,
         &tmp_vid,
-        state.cas.as_ref(),
-        state.meta.as_ref(),
+        state.nodes.as_ref(),
+        state.path_index.as_ref(),
     )
     .map_err(ApiError::from)?;
 
     // Commit.
-    let svc = CommitService::new(state.meta.clone(), state.meta.clone());
+    let svc = CommitService::new(state.versions.clone(), state.refs.clone());
     let version = svc
         .commit(CommitRequest {
             root: root_entry.hash,
@@ -277,11 +287,11 @@ async fn upload_directory(
     re_index_paths(
         &file_inputs,
         &version.id,
-        state.cas.as_ref(),
-        state.meta.as_ref(),
+        state.nodes.as_ref(),
+        state.path_index.as_ref(),
     )?;
 
-    Ok(Json(UploadResponse {
+    Ok(UploadResponse {
         version_id: version.id.to_string(),
         root: root_entry.hash.to_hex().to_string(),
         branch: branch.to_string(),
@@ -293,7 +303,7 @@ async fn upload_directory(
             dedup_chunks,
             dedup_bytes,
         },
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -305,8 +315,8 @@ async fn upload_directory(
 fn re_index_paths(
     files: &[FileInput],
     version_id: &VersionId,
-    node_store: &impl crate::store::traits::NodeStore,
-    path_index: &impl crate::store::traits::PathIndexRepo,
+    node_store: &dyn crate::store::traits::NodeStore,
+    path_index: &dyn crate::store::traits::PathIndexRepo,
 ) -> ApiResult<()> {
     // Rebuild the directory tree — the node_store writes are idempotent, so
     // the only new work is the path_index entries for the real version id.

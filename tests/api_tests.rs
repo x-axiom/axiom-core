@@ -1,3 +1,4 @@
+#![cfg(feature = "local")]
 //! HTTP API smoke tests.
 //!
 //! These tests spin up an in-process axum server on a random port, then
@@ -24,7 +25,7 @@ async fn start_server() -> (String, tempfile::TempDir) {
     let cas = RocksDbCasStore::open(&cas_path).unwrap();
     let meta = SqliteMetadataStore::open(&meta_path).unwrap();
 
-    let state = AppState::new(cas, meta);
+    let state = AppState::local(cas, meta);
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

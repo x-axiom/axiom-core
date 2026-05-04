@@ -1,3 +1,5 @@
+#![cfg(feature = "local")]
+
 use axiom_core::model::hash::hash_bytes;
 use axiom_core::model::node::NodeKind;
 use axiom_core::model::VersionId;

@@ -1,8 +1,11 @@
+#![cfg(feature = "local")]
+
 use std::collections::HashMap;
 
 use axiom_core::model::{hash_bytes, Ref, RefKind, VersionId, VersionNode};
 use axiom_core::store::sqlite::SqliteMetadataStore;
 use axiom_core::store::traits::{PathIndexRepo, RefRepo, VersionRepo};
+use rusqlite::Connection;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -55,6 +58,177 @@ fn test_migration_idempotent() {
         assert!(got.is_some());
         assert_eq!(got.unwrap().message, "init");
     }
+}
+
+// ---------------------------------------------------------------------------
+// v1→v2 migration tests
+// ---------------------------------------------------------------------------
+
+/// Helper: create a v1-only database by applying the v1 schema directly.
+fn create_v1_database(path: &std::path::Path) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);
+         CREATE TABLE versions (
+             id TEXT PRIMARY KEY, root TEXT NOT NULL, message TEXT NOT NULL,
+             timestamp INTEGER NOT NULL, metadata TEXT NOT NULL DEFAULT '{}'
+         );
+         CREATE TABLE version_parents (
+             version_id TEXT NOT NULL, parent_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+             PRIMARY KEY (version_id, ordinal)
+         );
+         CREATE TABLE refs (
+             name TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('branch','tag')),
+             target TEXT NOT NULL
+         );
+         CREATE TABLE nodes (
+             hash TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('file','directory')),
+             data TEXT NOT NULL
+         );
+         CREATE TABLE directory_entries (
+             parent_hash TEXT NOT NULL, name TEXT NOT NULL, child_hash TEXT NOT NULL,
+             PRIMARY KEY (parent_hash, name)
+         );
+         CREATE TABLE file_versions (
+             version_id TEXT NOT NULL, path TEXT NOT NULL,
+             node_hash TEXT NOT NULL, node_kind TEXT NOT NULL,
+             PRIMARY KEY (version_id, path)
+         );
+         CREATE TABLE commits (
+             version_id TEXT PRIMARY KEY, author TEXT NOT NULL DEFAULT '',
+             committer TEXT NOT NULL DEFAULT ''
+         );
+         CREATE INDEX idx_version_parents_parent ON version_parents(parent_id);
+         CREATE INDEX idx_file_versions_path ON file_versions(path);
+         CREATE INDEX idx_refs_target ON refs(target);
+         INSERT INTO schema_version (version) VALUES (1);",
+    ).unwrap();
+}
+
+#[test]
+fn test_migration_v0_to_v2_fresh_install() {
+    // A fresh open_in_memory should go 0→1→2.
+    let store = SqliteMetadataStore::open_in_memory().unwrap();
+
+    // Verify v2 tables exist by storing a version (uses v1 tables)
+    let v = make_version("v1", vec![], "fresh");
+    store.put_version(&v).unwrap();
+
+    // Verify the v2 tables exist by querying them directly.
+    // We can't access the connection directly, so reopen on a file path.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("meta.db");
+    let _store = SqliteMetadataStore::open(&db_path).unwrap();
+
+    let conn = Connection::open(&db_path).unwrap();
+    let ver: u32 = conn
+        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert!(ver >= 2, "schema version should be at least 2, got {ver}");
+
+    // v2 tables exist
+    let ws_count: u32 = conn
+        .query_row("SELECT COUNT(*) FROM workspaces", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ws_count, 1, "default workspace should exist");
+
+    let ws_name: String = conn
+        .query_row("SELECT name FROM workspaces WHERE id = 'default'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ws_name, "default");
+
+    // Other v2 tables should exist (empty)
+    let remote_count: u32 = conn
+        .query_row("SELECT COUNT(*) FROM remotes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remote_count, 0);
+
+    let rr_count: u32 = conn
+        .query_row("SELECT COUNT(*) FROM remote_refs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rr_count, 0);
+
+    let ss_count: u32 = conn
+        .query_row("SELECT COUNT(*) FROM sync_sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ss_count, 0);
+}
+
+#[test]
+fn test_migration_v1_to_v2_preserves_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("meta.db");
+
+    // Create a v1 database with some data.
+    create_v1_database(&db_path);
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO versions (id, root, message, timestamp) VALUES ('v1', 'aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd', 'hello', 1700000000)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO refs (name, kind, target) VALUES ('main', 'branch', 'v1')",
+            [],
+        ).unwrap();
+    }
+
+    // Open with SqliteMetadataStore — should auto-migrate v1→v2.
+    let store = SqliteMetadataStore::open(&db_path).unwrap();
+
+    // Existing v1 data preserved.
+    let v = store.get_version(&VersionId::from("v1")).unwrap();
+    assert!(v.is_some());
+    assert_eq!(v.unwrap().message, "hello");
+
+    let r = store.get_ref("main").unwrap();
+    assert!(r.is_some());
+    assert_eq!(r.unwrap().target.as_str(), "v1");
+
+    // Verify schema version is now 2.
+    let conn = Connection::open(&db_path).unwrap();
+    let ver: u32 = conn
+        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert!(ver >= 2, "schema version should be at least 2, got {ver}");
+
+    // Default workspace created.
+    let ws_name: String = conn
+        .query_row("SELECT name FROM workspaces WHERE id = 'default'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ws_name, "default");
+}
+
+#[test]
+fn test_migration_v2_idempotent_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("meta.db");
+
+    // First open: fresh v0→v2.
+    {
+        let _store = SqliteMetadataStore::open(&db_path).unwrap();
+    }
+
+    // Second open: v2 already applied, should be no-op.
+    {
+        let store = SqliteMetadataStore::open(&db_path).unwrap();
+        // Can still use v1 tables.
+        let v = make_version("v1", vec![], "after reopen");
+        store.put_version(&v).unwrap();
+    }
+
+    let conn = Connection::open(&db_path).unwrap();
+    let ver: u32 = conn
+        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert!(ver >= 2, "schema version should be at least 2, got {ver}");
+
+    // Still only one default workspace (INSERT OR IGNORE).
+    let ws_count: u32 = conn
+        .query_row("SELECT COUNT(*) FROM workspaces", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ws_count, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -465,4 +639,188 @@ fn test_persistence_across_reopen() {
             .unwrap();
         assert!(!p.is_directory);
     }
+}
+
+// ---------------------------------------------------------------------------
+// E06-S06: migrate_v4 orphan pre-clean
+// ---------------------------------------------------------------------------
+
+/// Manually construct a v3 schema, inject orphan rows into `remote_refs` and
+/// `sync_sessions` (rows whose `remote_name` does not exist in `remotes`),
+/// then open with `SqliteMetadataStore::open` which runs `migrate_v4`.
+///
+/// Verifies that:
+/// - Migration succeeds (DB reaches schema v4+).
+/// - Orphan rows are removed.
+/// - Legitimate rows (linked to real remotes) are preserved.
+#[test]
+fn test_migrate_v4_pre_clean_removes_orphan_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("orphan_test.db");
+
+    // ---- Build a v3 database directly ----
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+
+        // Create schema_version table and set it to v3.
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (3);",
+        )
+        .unwrap();
+
+        // v1 tables (versions, refs, etc. — needed for open to succeed).
+        conn.execute_batch(
+            "CREATE TABLE versions (
+                 id TEXT PRIMARY KEY,
+                 parent_ids TEXT,
+                 root_hash TEXT NOT NULL,
+                 message TEXT NOT NULL,
+                 timestamp INTEGER NOT NULL,
+                 metadata TEXT NOT NULL
+             );
+             CREATE TABLE refs (
+                 name TEXT PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 target TEXT NOT NULL
+             );
+             CREATE TABLE tree_nodes (
+                 hash TEXT PRIMARY KEY,
+                 data BLOB NOT NULL
+             );
+             CREATE TABLE node_entries (
+                 hash TEXT PRIMARY KEY,
+                 data BLOB NOT NULL
+             );
+             CREATE TABLE path_entries (
+                 version_id TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 node_hash TEXT NOT NULL,
+                 is_directory INTEGER NOT NULL,
+                 PRIMARY KEY (version_id, path)
+             );",
+        )
+        .unwrap();
+
+        // v2 tables (workspaces).
+        conn.execute_batch(
+            "CREATE TABLE workspaces (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 default_ref TEXT
+             );",
+        )
+        .unwrap();
+
+        // v3 tables (remotes, remote_refs, sync_sessions) — without CASCADE.
+        conn.execute_batch(
+            "CREATE TABLE remotes (
+                 name TEXT PRIMARY KEY,
+                 url TEXT NOT NULL,
+                 auth_token TEXT,
+                 tenant_id TEXT,
+                 workspace_id TEXT,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE TABLE remote_refs (
+                 remote_name TEXT NOT NULL,
+                 ref_name    TEXT NOT NULL,
+                 kind        TEXT NOT NULL,
+                 target      TEXT NOT NULL,
+                 updated_at  INTEGER NOT NULL,
+                 PRIMARY KEY (remote_name, ref_name)
+             );
+             CREATE TABLE sync_sessions (
+                 id          TEXT PRIMARY KEY,
+                 remote_name TEXT NOT NULL,
+                 direction   TEXT NOT NULL,
+                 status      TEXT NOT NULL,
+                 started_at  INTEGER NOT NULL,
+                 finished_at INTEGER,
+                 objects_transferred INTEGER NOT NULL DEFAULT 0,
+                 bytes_transferred   INTEGER NOT NULL DEFAULT 0,
+                 error_message TEXT
+             );",
+        )
+        .unwrap();
+
+        // Insert a real remote.
+        conn.execute_batch(
+            "INSERT INTO remotes VALUES ('origin', 'https://example.com', NULL, NULL, NULL, 0);",
+        )
+        .unwrap();
+
+        // Insert a legitimate remote_ref (linked to real remote).
+        conn.execute_batch(
+            "INSERT INTO remote_refs VALUES ('origin', 'main', 'branch', 'abc123', 0);",
+        )
+        .unwrap();
+
+        // Insert ORPHAN rows — remote_name 'ghost' does not exist in `remotes`.
+        conn.execute_batch(
+            "INSERT INTO remote_refs VALUES ('ghost', 'main', 'branch', 'deadbeef', 0);",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO sync_sessions
+                 VALUES ('sess-1', 'ghost', 'push', 'completed', 0, 1, 0, 0, NULL);",
+        )
+        .unwrap();
+    }
+
+    // ---- Open via SqliteMetadataStore — this runs migrate_v4 ----
+    let store = SqliteMetadataStore::open(&db_path)
+        .expect("open should succeed even with orphan rows in v3 DB");
+
+    // ---- Verify schema reached latest version ----
+    // (Indirectly: the store is usable for normal operations.)
+    let conn_guard = {
+        // Access the raw connection to inspect the DB state.
+        // We can't get the raw connection back; instead verify via the public
+        // API that the store is functional, and verify orphan removal by
+        // opening a raw connection to the same file.
+        drop(store);
+        Connection::open(&db_path).unwrap()
+    };
+
+    // Orphan remote_ref for 'ghost' must be gone.
+    let orphan_count: i64 = conn_guard
+        .query_row(
+            "SELECT COUNT(*) FROM remote_refs WHERE remote_name = 'ghost'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphan_count, 0, "orphan remote_refs rows should be removed");
+
+    // Orphan sync_session for 'ghost' must be gone.
+    let orphan_session: i64 = conn_guard
+        .query_row(
+            "SELECT COUNT(*) FROM sync_sessions WHERE remote_name = 'ghost'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphan_session, 0, "orphan sync_sessions rows should be removed");
+
+    // Legitimate remote_ref for 'origin' must still exist.
+    let legit_count: i64 = conn_guard
+        .query_row(
+            "SELECT COUNT(*) FROM remote_refs WHERE remote_name = 'origin'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legit_count, 1, "legitimate remote_ref must be preserved");
+
+    // Schema must have been upgraded (version >= 4).
+    let schema_version: u32 = conn_guard
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        schema_version >= 4,
+        "schema_version must be >= 4 after successful migration, got {schema_version}"
+    );
 }

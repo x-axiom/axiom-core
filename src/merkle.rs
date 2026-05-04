@@ -28,7 +28,7 @@ pub const DEFAULT_FAN_OUT: usize = 64;
 ///
 /// If `descriptors` is empty the function returns an error — a file must
 /// have at least one chunk (even an empty file produces a zero-length chunk).
-pub fn build_tree<S: TreeStore>(
+pub fn build_tree<S: TreeStore + ?Sized>(
     descriptors: &[ChunkDescriptor],
     fan_out: usize,
     store: &S,
@@ -93,7 +93,7 @@ pub fn build_tree<S: TreeStore>(
 /// Traverse the Merkle tree rooted at `root` and return the ordered list
 /// of leaf chunk hashes. This is enough to reconstruct the original file
 /// by fetching each chunk from the CAS in order.
-pub fn rehydrate<S: TreeStore>(
+pub fn rehydrate<S: TreeStore + ?Sized>(
     root: &ChunkHash,
     store: &S,
 ) -> CasResult<Vec<ChunkHash>> {

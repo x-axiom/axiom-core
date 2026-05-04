@@ -24,7 +24,7 @@ use crate::store::traits::{NodeStore, TreeStore};
 /// nodes. The engine walks the directory trees, emitting `DiffEntry` items
 /// for added, removed, and modified paths, and computes chunk-level
 /// statistics for modified files.
-pub fn diff_versions<N: NodeStore, T: TreeStore>(
+pub fn diff_versions<N: NodeStore + ?Sized, T: TreeStore + ?Sized>(
     old_root: &ChunkHash,
     new_root: &ChunkHash,
     node_store: &N,
@@ -74,7 +74,7 @@ struct ChunkStats {
 }
 
 /// Recursively walk two directory nodes and collect diff entries.
-fn walk_diff<N: NodeStore, T: TreeStore>(
+fn walk_diff<N: NodeStore + ?Sized, T: TreeStore + ?Sized>(
     prefix: &str,
     old_node: &NodeEntry,
     new_node: &NodeEntry,
@@ -172,7 +172,7 @@ fn dir_children(node: &NodeEntry) -> &std::collections::BTreeMap<String, ChunkHa
 // Helpers: collect all paths under an added/removed subtree
 // ---------------------------------------------------------------------------
 
-fn collect_added<N: NodeStore, T: TreeStore>(
+fn collect_added<N: NodeStore + ?Sized, T: TreeStore + ?Sized>(
     path: &str,
     hash: &ChunkHash,
     node_store: &N,
@@ -209,7 +209,7 @@ fn collect_added<N: NodeStore, T: TreeStore>(
     Ok(())
 }
 
-fn collect_removed<N: NodeStore, T: TreeStore>(
+fn collect_removed<N: NodeStore + ?Sized, T: TreeStore + ?Sized>(
     path: &str,
     hash: &ChunkHash,
     node_store: &N,
@@ -252,7 +252,7 @@ fn collect_removed<N: NodeStore, T: TreeStore>(
 
 /// Compare two Merkle trees at chunk level. Counts added, removed, and
 /// unchanged leaf chunks using set-based comparison on chunk hashes.
-fn diff_file_chunks<T: TreeStore>(
+fn diff_file_chunks<T: TreeStore + ?Sized>(
     old_root: &ChunkHash,
     new_root: &ChunkHash,
     tree_store: &T,
@@ -277,7 +277,7 @@ fn diff_file_chunks<T: TreeStore>(
 }
 
 /// Recursively collect all leaf chunk hashes from a Merkle tree.
-fn collect_leaves<T: TreeStore>(
+fn collect_leaves<T: TreeStore + ?Sized>(
     root: &ChunkHash,
     tree_store: &T,
 ) -> CasResult<Vec<ChunkHash>> {
@@ -300,7 +300,7 @@ fn collect_leaves<T: TreeStore>(
 }
 
 /// Count leaves without collecting them (for unchanged subtrees).
-fn count_leaves<T: TreeStore>(
+fn count_leaves<T: TreeStore + ?Sized>(
     root: &ChunkHash,
     tree_store: &T,
 ) -> CasResult<usize> {
@@ -308,7 +308,7 @@ fn count_leaves<T: TreeStore>(
 }
 
 /// Count unchanged chunks for a file node that didn't change.
-fn count_unchanged_if_file<N: NodeStore, T: TreeStore>(
+fn count_unchanged_if_file<N: NodeStore + ?Sized, T: TreeStore + ?Sized>(
     hash: &ChunkHash,
     node_store: &N,
     tree_store: &T,

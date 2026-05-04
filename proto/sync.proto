@@ -1,0 +1,241 @@
+syntax = "proto3";
+
+package axiom.sync.v1;
+
+// ──────────────────────────────────────────────
+// Common message types
+// ──────────────────────────────────────────────
+
+/// A 32-byte BLAKE3 object identifier.
+message ObjectId {
+    bytes hash = 1; // 32 bytes
+}
+
+/// A named ref and the version it currently points to.
+message RefInfo {
+    string name   = 1;
+    ObjectId target = 2;
+}
+
+/// A single object entry inside a Pack stream.
+message PackEntry {
+    ObjectType type = 1;
+    ObjectId   hash = 2;
+    bytes      data = 3; // zstd-compressed payload
+}
+
+/// Header sent as the first message of an UploadPack / CloneDownload stream.
+message PackHeader {
+    uint64 object_count       = 1; // total number of entries to follow
+    uint64 estimated_bytes    = 2; // informational size hint
+    string session_id         = 3;
+}
+
+enum ObjectType {
+    OBJECT_TYPE_UNSPECIFIED = 0;
+    OBJECT_TYPE_CHUNK       = 1;
+    OBJECT_TYPE_TREE_NODE   = 2;
+    OBJECT_TYPE_NODE_ENTRY  = 3;
+    OBJECT_TYPE_VERSION     = 4;
+}
+
+/// A requested ref update (push side).
+message RefUpdate {
+    string   ref_name  = 1;
+    ObjectId old_target = 2; // empty bytes → ref does not yet exist on remote
+    ObjectId new_target = 3;
+    bool     force     = 4;
+}
+
+/// Per-object-type list returned by NegotiatePush.
+message ObjectList {
+    ObjectType        type   = 1;
+    repeated ObjectId hashes = 2;
+}
+
+// ──────────────────────────────────────────────
+// ListRefs
+// ──────────────────────────────────────────────
+
+message ListRefsRequest {
+    string workspace_id = 1;
+    string tenant_id    = 2;
+}
+
+message ListRefsResponse {
+    repeated RefInfo refs = 1;
+}
+
+// ──────────────────────────────────────────────
+// NegotiatePush
+// ──────────────────────────────────────────────
+
+message NegotiatePushRequest {
+    string              workspace_id      = 1;
+    string              tenant_id         = 2;
+    repeated RefUpdate  ref_updates       = 3;
+    repeated ObjectId   local_versions    = 4; // all version IDs the client wants to push
+    // NEW (E05-S07) — client-side inventory of all reachable objects under
+    // the new ref tips (relative to remote_tips as the "have" boundary).
+    // Server uses these to compute exactly which objects it is missing.
+    // Empty in old-client messages → server falls back to conservative logic.
+    repeated ObjectList client_inventory  = 5;
+}
+
+message NegotiatePushResponse {
+    bool                 accepted      = 1;
+    string               session_id    = 2;
+    repeated ObjectList  need_objects  = 3; // objects the server is missing
+    string               reject_reason = 4; // set when accepted=false
+}
+
+// ──────────────────────────────────────────────
+// UploadPack  (client → server, client-streaming)
+// ──────────────────────────────────────────────
+
+/// Each message in the UploadPack stream is one of:
+///   first message  → header is set
+///   subsequent     → entry is set
+message UploadPackRequest {
+    oneof payload {
+        PackHeader header = 1;
+        PackEntry  entry  = 2;
+    }
+}
+
+message UploadPackResponse {
+    string session_id  = 1;
+    uint64 received    = 2;
+    uint64 stored      = 3;
+    uint64 duplicates  = 4;
+}
+
+// ──────────────────────────────────────────────
+// FinalizeRefs
+// ──────────────────────────────────────────────
+
+message FinalizeRefsRequest {
+    string             session_id   = 1;
+    string             workspace_id = 2;
+    string             tenant_id    = 3;
+    repeated RefUpdate ref_updates  = 4;
+}
+
+message RefUpdateResult {
+    string ref_name = 1;
+    string status   = 2; // "ok" | "non-fast-forward" | "error"
+    string message  = 3;
+}
+
+message FinalizeRefsResponse {
+    repeated RefUpdateResult results = 1;
+}
+
+// ──────────────────────────────────────────────
+// NegotiatePull
+// ──────────────────────────────────────────────
+
+message WantEntry {
+    string   ref_name    = 1;
+    ObjectId have        = 2; // local tip; empty → brand-new ref
+    ObjectId want        = 3; // remote tip to pull
+}
+
+message NegotiatePullRequest {
+    string             workspace_id  = 1;
+    string             tenant_id     = 2;
+    repeated WantEntry wants         = 3;
+    bytes              have_filter   = 4; // optional Bloom filter of local chunks
+}
+
+message NegotiatePullResponse {
+    string session_id        = 1;
+    uint64 total_objects     = 2;
+    uint64 estimated_bytes   = 3;
+}
+
+// ──────────────────────────────────────────────
+// DownloadPack  (server → client, server-streaming)
+// ──────────────────────────────────────────────
+
+message DownloadPackRequest {
+    string session_id    = 1;
+    string workspace_id  = 2;
+    string tenant_id     = 3;
+}
+
+/// Each message in the DownloadPack stream is one of:
+///   first message  → header is set
+///   subsequent     → entry is set
+message DownloadPackResponse {
+    oneof payload {
+        PackHeader header = 1;
+        PackEntry  entry  = 2;
+    }
+}
+
+// ──────────────────────────────────────────────
+// CloneInit
+// ──────────────────────────────────────────────
+
+message CloneInitRequest {
+    string          workspace_id = 1;
+    string          tenant_id    = 2;
+    optional uint32 depth        = 3; // None = full clone; Some(1) = shallow
+    repeated string refs         = 4; // empty = all refs
+}
+
+message CloneInitResponse {
+    string             session_id     = 1;
+    repeated RefInfo   refs           = 2;
+    uint64             total_objects  = 3;
+    uint64             total_bytes    = 4;
+}
+
+// ──────────────────────────────────────────────
+// CloneDownload  (server → client, server-streaming)
+// ──────────────────────────────────────────────
+
+message CloneDownloadRequest {
+    string session_id    = 1;
+    string workspace_id  = 2;
+    string tenant_id     = 3;
+}
+
+/// Same envelope as DownloadPack; first message is header, rest are entries.
+message CloneDownloadResponse {
+    oneof payload {
+        PackHeader header = 1;
+        PackEntry  entry  = 2;
+    }
+}
+
+// ──────────────────────────────────────────────
+// SyncService
+// ──────────────────────────────────────────────
+
+service SyncService {
+    /// List all refs in a remote workspace.
+    rpc ListRefs(ListRefsRequest) returns (ListRefsResponse);
+
+    /// Client presents ref updates + local version set; server returns missing objects.
+    rpc NegotiatePush(NegotiatePushRequest) returns (NegotiatePushResponse);
+
+    /// Client streams a pack of objects to the server (client-streaming).
+    rpc UploadPack(stream UploadPackRequest) returns (UploadPackResponse);
+
+    /// Client atomically updates refs after a successful UploadPack.
+    rpc FinalizeRefs(FinalizeRefsRequest) returns (FinalizeRefsResponse);
+
+    /// Client requests objects from server; server prepares a pack session.
+    rpc NegotiatePull(NegotiatePullRequest) returns (NegotiatePullResponse);
+
+    /// Server streams a pack of objects to the client (server-streaming).
+    rpc DownloadPack(DownloadPackRequest) returns (stream DownloadPackResponse);
+
+    /// Client initiates a full / shallow clone; server prepares the pack.
+    rpc CloneInit(CloneInitRequest) returns (CloneInitResponse);
+
+    /// Server streams all objects for a clone session (server-streaming).
+    rpc CloneDownload(CloneDownloadRequest) returns (stream CloneDownloadResponse);
+}

@@ -6,7 +6,10 @@ use crate::model::{
     ChunkHash, NodeEntry, Ref, RefKind, TreeNode, VersionId, VersionNode,
     hash_bytes, hash_children,
 };
-use super::traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry, SyncStore, ReachableObjects};
+use super::traits::{
+    ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo, PathEntry,
+    ObjectManifestRepo, SyncStore, ReachableObjects, WtCacheEntry, WtCacheRepo,
+};
 
 // ---------------------------------------------------------------------------
 // InMemoryChunkStore
@@ -264,6 +267,47 @@ impl PathIndexRepo for InMemoryPathIndex {
 }
 
 // ---------------------------------------------------------------------------
+// InMemoryManifestStore (E05-S03)
+// ---------------------------------------------------------------------------
+
+/// In-memory implementation of [`ObjectManifestRepo`] for use in tests.
+#[derive(Default)]
+pub struct InMemoryManifestStore {
+    inner: RwLock<HashMap<String, Vec<String>>>,
+}
+
+impl InMemoryManifestStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ObjectManifestRepo for InMemoryManifestStore {
+    fn manifest_append(&self, session_id: &str, hash_hexes: &[String]) -> CasResult<()> {
+        self.inner
+            .write()
+            .entry(session_id.to_string())
+            .or_default()
+            .extend_from_slice(hash_hexes);
+        Ok(())
+    }
+
+    fn manifest_load(&self, session_id: &str) -> CasResult<Vec<String>> {
+        Ok(self
+            .inner
+            .read()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn manifest_delete(&self, session_id: &str) -> CasResult<()> {
+        self.inner.write().remove(session_id);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 /// Combined in-memory store that provides chunk + simple object support,
 /// compatible with the v0 API surface. Will be deprecated in favor of
@@ -326,73 +370,95 @@ impl InMemorySyncStore {
 }
 
 impl SyncStore for InMemorySyncStore {
-    fn collect_reachable_objects(&self, roots: &[VersionId]) -> CasResult<ReachableObjects> {
-        let mut result = ReachableObjects::default();
+    fn collect_reachable_with_have(
+        &self,
+        want: &[VersionId],
+        have: &std::collections::HashSet<VersionId>,
+    ) -> CasResult<ReachableObjects> {
+        use crate::sync::reachable::{CancelToken, collect_reachable};
 
-        // BFS over version DAG
-        let mut version_queue: VecDeque<VersionId> = roots.iter().cloned().collect();
-        while let Some(vid) = version_queue.pop_front() {
-            if !result.versions.insert(vid.clone()) {
-                continue;
-            }
-            if let Some(version) = self.versions.get_version(&vid)? {
-                // Enqueue parents
-                for parent in &version.parents {
-                    if !result.versions.contains(parent) {
-                        version_queue.push_back(parent.clone());
-                    }
-                }
-                // Walk the directory tree from root node
-                let mut node_queue: VecDeque<ChunkHash> = VecDeque::new();
-                node_queue.push_back(version.root.clone());
-
-                while let Some(node_hash) = node_queue.pop_front() {
-                    if !result.node_hashes.insert(node_hash.clone()) {
-                        continue;
-                    }
-                    if let Some(entry) = self.nodes.get_node(&node_hash)? {
-                        match &entry.kind {
-                            NodeKind::File { root, .. } => {
-                                // Walk merkle tree
-                                let mut tree_queue: VecDeque<ChunkHash> = VecDeque::new();
-                                tree_queue.push_back(root.clone());
-                                while let Some(th) = tree_queue.pop_front() {
-                                    if !result.tree_hashes.insert(th.clone()) {
-                                        continue;
-                                    }
-                                    if let Some(tree_node) = self.trees.get_tree_node(&th)? {
-                                        match &tree_node.kind {
-                                            TreeNodeKind::Leaf { chunk } => {
-                                                result.chunk_hashes.insert(chunk.clone());
-                                            }
-                                            TreeNodeKind::Internal { children } => {
-                                                for child in children {
-                                                    if !result.tree_hashes.contains(child) {
-                                                        tree_queue.push_back(child.clone());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            NodeKind::Directory { children } => {
-                                for child_hash in children.values() {
-                                    if !result.node_hashes.contains(child_hash) {
-                                        node_queue.push_back(child_hash.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(result)
+        collect_reachable(
+            want,
+            have,
+            self.versions.as_ref(),
+            self.trees.as_ref(),
+            self.nodes.as_ref(),
+            &CancelToken::new(),
+        )
     }
 
     fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
         Ok(self.versions.versions.read().keys().cloned().collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InMemoryWtCache — trivial no-op cache for tests
+// ---------------------------------------------------------------------------
+
+/// A no-op working-tree cache used in tests.  It never returns a cache hit,
+/// which means `compute_status` always recomputes hashes from disk.  This is
+/// correct for tests (determinism over speed).
+#[derive(Default)]
+pub struct InMemoryWtCache;
+
+impl WtCacheRepo for InMemoryWtCache {
+    fn wt_cache_get(&self, _workspace_id: &str, _path: &str) -> CasResult<Option<WtCacheEntry>> {
+        Ok(None)
+    }
+    fn wt_cache_put(
+        &self,
+        _workspace_id: &str,
+        _path: &str,
+        _entry: &WtCacheEntry,
+    ) -> CasResult<()> {
+        Ok(())
+    }
+    fn wt_cache_clear(&self, _workspace_id: &str) -> CasResult<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HashMapWtCache — real in-memory cache for benchmarks
+// ---------------------------------------------------------------------------
+
+/// A HashMap-backed working-tree cache.  Suitable for benchmarks and
+/// integration tests that want to measure cache hit performance.
+#[derive(Default)]
+pub struct HashMapWtCache {
+    data: parking_lot::RwLock<HashMap<(String, String), WtCacheEntry>>,
+}
+
+impl HashMapWtCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl WtCacheRepo for HashMapWtCache {
+    fn wt_cache_get(&self, workspace_id: &str, path: &str) -> CasResult<Option<WtCacheEntry>> {
+        Ok(self
+            .data
+            .read()
+            .get(&(workspace_id.to_owned(), path.to_owned()))
+            .cloned())
+    }
+    fn wt_cache_put(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        entry: &WtCacheEntry,
+    ) -> CasResult<()> {
+        self.data
+            .write()
+            .insert((workspace_id.to_owned(), path.to_owned()), entry.clone());
+        Ok(())
+    }
+    fn wt_cache_clear(&self, workspace_id: &str) -> CasResult<()> {
+        self.data
+            .write()
+            .retain(|(ws, _), _| ws != workspace_id);
+        Ok(())
     }
 }

@@ -4,8 +4,10 @@ use axiom_core::chunker::{chunk_and_persist, ChunkPolicy};
 use axiom_core::merkle::{build_tree, rehydrate, DEFAULT_FAN_OUT};
 use axiom_core::model::chunk::ChunkDescriptor;
 use axiom_core::model::hash::hash_bytes;
+#[cfg(feature = "local")]
+use axiom_core::store::RocksDbCasStore;
 use axiom_core::store::{
-    ChunkStore, InMemoryChunkStore, InMemoryTreeStore, RocksDbCasStore, TreeStore,
+    ChunkStore, InMemoryChunkStore, InMemoryTreeStore, TreeStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -208,6 +210,7 @@ fn test_end_to_end_chunk_then_tree() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "local")]
 fn test_persistence_across_rocksdb_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("cas");

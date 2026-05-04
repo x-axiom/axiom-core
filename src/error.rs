@@ -22,6 +22,30 @@ pub enum CasError {
     #[error("store error: {0}")]
     Store(String),
 
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
+    #[error("tenant not found: {0}")]
+    TenantNotFound(String),
+
+    #[error("workspace not found: {0}")]
+    WorkspaceNotFound(String),
+
+    #[error("rate limit exceeded: {0}")]
+    RateLimitExceeded(String),
+
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
+
+    #[error("sync error: {0}")]
+    SyncError(String),
+
+    #[error("non-fast-forward: {0}")]
+    NonFastForward(String),
+
     #[error("serialization error: {0}")]
     SerdeJson(#[from] serde_json::Error),
 

@@ -1,3 +1,4 @@
+#![cfg(feature = "local")]
 //! Integration tests for streaming download and directory listing (AXIOM-111).
 
 use std::net::SocketAddr;
@@ -18,7 +19,7 @@ async fn start_server() -> (String, Client, tempfile::TempDir) {
     let cas = RocksDbCasStore::open(tmp.path().join("cas")).unwrap();
     let meta = SqliteMetadataStore::open(tmp.path().join("meta.db")).unwrap();
 
-    let app = build_router(AppState::new(cas, meta));
+    let app = build_router(AppState::local(cas, meta));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
