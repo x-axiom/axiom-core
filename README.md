@@ -4,7 +4,7 @@
 
 Axiom Core is a high-performance, versioned, content-addressed storage engine written in Rust.
 
-It brings Git-like ideas to large binary assets: immutable versions, content-based deduplication, branch and tag references, and Merkle-tree diffing. It can run as an HTTP service or be embedded directly in other applications such as the Axiom desktop app.
+It brings Git-like ideas to large binary assets: immutable versions, content-based deduplication, branch and tag references, and Merkle-tree diffing. It can run as an HTTP service or be embedded directly in other applications.
 
 ## Table of Contents
 
@@ -17,7 +17,6 @@ It brings Git-like ideas to large binary assets: immutable versions, content-bas
 - [HTTP API Overview](#http-api-overview)
 - [Development](#development)
 - [Contributing](#contributing)
-- [Related Projects](#related-projects)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -209,8 +208,6 @@ curl -X POST http://localhost:3000/api/v1/diff \
 | `fdb` | No | FoundationDB-backed tenant, auth, GC, and observability features |
 | `full` | No | Convenience flag for `local` + `cloud` |
 
-The desktop app in this monorepo builds Axiom Core with `--no-default-features --features local`.
-
 ## HTTP API Overview
 
 All `{ref}` parameters accept a version ID, branch name, or tag name.
@@ -273,11 +270,6 @@ Before opening a pull request:
 - Avoid bypassing storage traits in new code
 - Add a SQLite migration when schema changes require it
 - Keep documentation in sync with user-facing behavior
-
-## Related Projects
-
-- [`../axiom-desktop`](../axiom-desktop) - Tauri desktop application embedding Axiom Core
-- [`../axiom-docs`](../axiom-docs) - architecture and design documentation
 
 ## Roadmap
 

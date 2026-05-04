@@ -4,7 +4,7 @@
 
 Axiom Core 是一个使用 Rust 编写的高性能、版本化、内容寻址存储引擎。
 
-它把 Git 的核心思想带到了大体积二进制资产场景：版本不可变、内容按哈希去重、分支和标签可引用历史节点、Merkle Tree 支持高效 Diff。它既可以作为 HTTP 服务运行，也可以直接嵌入其他应用，例如本仓库中的 Axiom 桌面端。
+它把 Git 的核心思想带到了大体积二进制资产场景：版本不可变、内容按哈希去重、分支和标签可引用历史节点、Merkle Tree 支持高效 Diff。它既可以作为 HTTP 服务运行，也可以直接嵌入其他应用。
 
 ## 目录
 
@@ -17,7 +17,6 @@ Axiom Core 是一个使用 Rust 编写的高性能、版本化、内容寻址存
 - [HTTP API 概览](#http-api-概览)
 - [开发说明](#开发说明)
 - [贡献指南](#贡献指南)
-- [相关项目](#相关项目)
 - [路线图](#路线图)
 - [许可证](#许可证)
 
@@ -209,8 +208,6 @@ curl -X POST http://localhost:3000/api/v1/diff \
 | `fdb` | 否 | 基于 FoundationDB 的租户、认证、GC 与可观测性扩展 |
 | `full` | 否 | 便捷组合，等价于 `local` + `cloud` |
 
-本仓库中的桌面端默认以 `--no-default-features --features local` 方式构建 Axiom Core。
-
 ## HTTP API 概览
 
 所有 `{ref}` 参数都接受 version ID、branch 名称或 tag 名称。
@@ -273,11 +270,6 @@ cargo bench --bench working_tree_bench
 - 新增代码不要绕过现有存储 trait
 - 如果 schema 变化，补充对应的 SQLite migration
 - 让文档与实际行为保持一致
-
-## 相关项目
-
-- [`../axiom-desktop`](../axiom-desktop) - 嵌入 Axiom Core 的 Tauri 桌面应用
-- [`../axiom-docs`](../axiom-docs) - 架构与设计文档
 
 ## 路线图
 
