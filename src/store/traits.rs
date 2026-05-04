@@ -328,6 +328,8 @@ pub struct Remote {
 pub trait RemoteRepo: Send + Sync {
     /// Add a remote. Returns `CasError::AlreadyExists` if name is taken.
     fn add_remote(&self, remote: &Remote) -> CasResult<()>;
+    /// Update an existing remote in place.
+    fn update_remote(&self, remote: &Remote) -> CasResult<()>;
     /// Remove a remote and cascade-delete its remote_refs and sync_sessions.
     fn remove_remote(&self, name: &str) -> CasResult<()>;
     /// Get a remote by name.
@@ -339,6 +341,9 @@ pub trait RemoteRepo: Send + Sync {
 impl<T: RemoteRepo + ?Sized> RemoteRepo for Arc<T> {
     fn add_remote(&self, remote: &Remote) -> CasResult<()> {
         (**self).add_remote(remote)
+    }
+    fn update_remote(&self, remote: &Remote) -> CasResult<()> {
+        (**self).update_remote(remote)
     }
     fn remove_remote(&self, name: &str) -> CasResult<()> {
         (**self).remove_remote(name)

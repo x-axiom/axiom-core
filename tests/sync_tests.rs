@@ -660,6 +660,7 @@ async fn download_pack_streams_dependencies_before_referrers() {
             workspace_id: "default".into(),
             tenant_id: "test".into(),
             wants: vec![WantEntry {
+                ref_name: "main".into(),
                 want: Some(ObjectId {
                     hash: hex::decode(want.as_str()).unwrap(),
                 }),

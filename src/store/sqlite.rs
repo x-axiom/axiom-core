@@ -1150,6 +1150,50 @@ impl RemoteRepo for SqliteMetadataStore {
         Ok(())
     }
 
+    fn update_remote(&self, remote: &Remote) -> CasResult<()> {
+        let previous_auth_token = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT auth_token FROM remotes WHERE name = ?1",
+                params![remote.name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| CasError::Store(e.to_string()))?
+        }
+        .ok_or_else(|| CasError::NotFound(format!("remote '{}'", remote.name)))?;
+
+        let stored_auth_token = self.persist_remote_token(&remote.name, &remote.auth_token)?;
+
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE remotes
+                 SET url = ?2, auth_token = ?3, tenant_id = ?4, workspace_id = ?5, created_at = ?6
+                 WHERE name = ?1",
+                params![
+                    remote.name,
+                    remote.url,
+                    stored_auth_token,
+                    remote.tenant_id,
+                    remote.workspace_id,
+                    remote.created_at as i64,
+                ],
+            )
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        drop(conn);
+
+        if rows == 0 {
+            return Err(CasError::NotFound(format!("remote '{}'", remote.name)));
+        }
+
+        if previous_auth_token != stored_auth_token {
+            self.delete_remote_token_best_effort(&previous_auth_token);
+        }
+
+        Ok(())
+    }
+
     fn remove_remote(&self, name: &str) -> CasResult<()> {
         let stored_auth_token = {
             let conn = self.conn.lock();
@@ -1316,6 +1360,62 @@ mod remote_credential_tests {
             .unwrap();
         assert!(stored.starts_with(REMOTE_CREDENTIAL_PREFIX));
         assert_ne!(stored, "legacy-token");
+    }
+
+    #[test]
+    fn update_remote_overwrites_and_clears_keyring_backed_token() {
+        let store = SqliteMetadataStore::open_in_memory().unwrap();
+        store
+            .add_remote(&Remote {
+                name: "origin".into(),
+                url: "https://sync.example.com".into(),
+                auth_token: "secret-token".into(),
+                tenant_id: None,
+                workspace_id: None,
+                created_at: 1,
+            })
+            .unwrap();
+
+        store
+            .update_remote(&Remote {
+                name: "origin".into(),
+                url: "https://sync.example.com/v2".into(),
+                auth_token: "rotated-token".into(),
+                tenant_id: Some("tenant-a".into()),
+                workspace_id: Some("ws-a".into()),
+                created_at: 2,
+            })
+            .unwrap();
+
+        let updated = store.get_remote("origin").unwrap().unwrap();
+        assert_eq!(updated.url, "https://sync.example.com/v2");
+        assert_eq!(updated.auth_token, "rotated-token");
+        assert_eq!(updated.tenant_id.as_deref(), Some("tenant-a"));
+        assert_eq!(updated.workspace_id.as_deref(), Some("ws-a"));
+
+        store
+            .update_remote(&Remote {
+                name: "origin".into(),
+                url: "https://sync.example.com/v2".into(),
+                auth_token: String::new(),
+                tenant_id: Some("tenant-a".into()),
+                workspace_id: Some("ws-a".into()),
+                created_at: 2,
+            })
+            .unwrap();
+
+        let cleared = store.get_remote("origin").unwrap().unwrap();
+        assert_eq!(cleared.auth_token, "");
+
+        let conn = store.conn.lock();
+        let stored: String = conn
+            .query_row(
+                "SELECT auth_token FROM remotes WHERE name = 'origin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "");
     }
 }
 

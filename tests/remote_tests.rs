@@ -127,3 +127,39 @@ fn remove_remote_then_re_add_succeeds() {
     assert_eq!(got.url, "https://b.example.com");
 }
 
+#[test]
+fn update_remote_rewrites_existing_remote() {
+    let db = store();
+    db.add_remote(&make_remote("origin", "https://a.example.com")).unwrap();
+
+    let updated = Remote {
+        name: "origin".into(),
+        url: "https://b.example.com".into(),
+        auth_token: "new-token".into(),
+        tenant_id: Some("tenant-1".into()),
+        workspace_id: Some("ws-1".into()),
+        created_at: 2_000_000,
+    };
+    db.update_remote(&updated).unwrap();
+
+    let got = db.get_remote("origin").unwrap().unwrap();
+    assert_eq!(got, updated);
+}
+
+#[test]
+fn update_missing_remote_returns_not_found() {
+    let db = store();
+    let err = db
+        .update_remote(&Remote {
+            name: "origin".into(),
+            url: "https://sync.example.com".into(),
+            auth_token: String::new(),
+            tenant_id: None,
+            workspace_id: None,
+            created_at: 1,
+        })
+        .unwrap_err();
+
+    assert!(matches!(err, CasError::NotFound(_)), "got: {err:?}");
+}
+
