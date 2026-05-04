@@ -20,6 +20,7 @@ serde_json = "1"
 toml = "0.8"
 anyhow = "1"
 parking_lot = "0.12"
+dashmap = "6"
 criterion = "0.8.2"
 rocksdb = { version = "0.22", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }

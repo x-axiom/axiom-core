@@ -32,8 +32,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dashmap::DashMap;
 use futures_util::StreamExt;
-use parking_lot::Mutex;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::error::{CasError, CasResult};
@@ -120,15 +120,14 @@ pub struct PushServiceState {
 pub struct PushServiceHandler {
     state: PushServiceState,
     /// In-flight push sessions keyed by session_id.
-    sessions: Arc<Mutex<HashMap<String, PushSession>>>,
+    sessions: Arc<DashMap<String, PushSession>>,
     /// Background reaper task — aborted on drop.
     _reaper: tokio::task::AbortHandle,
 }
 
 impl PushServiceHandler {
     pub fn new(state: PushServiceState) -> Self {
-        let sessions: Arc<Mutex<HashMap<String, PushSession>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let sessions: Arc<DashMap<String, PushSession>> = Arc::new(DashMap::new());
 
         let ttl = state.session_ttl_secs;
         let interval = state.cleanup_interval_secs;
@@ -140,10 +139,15 @@ impl PushServiceHandler {
             loop {
                 tokio::time::sleep(interval_dur).await;
                 let now = now_secs();
-                let mut map = sessions_ref.lock();
-                let before = map.len();
-                map.retain(|_, s| now.saturating_sub(s.created_at) < ttl);
-                let expired = before - map.len();
+                let expired_keys: Vec<String> = sessions_ref
+                    .iter()
+                    .filter(|entry| now.saturating_sub(entry.value().created_at) >= ttl)
+                    .map(|entry| entry.key().clone())
+                    .collect();
+                let expired = expired_keys.len();
+                for key in expired_keys {
+                    sessions_ref.remove(&key);
+                }
                 if expired > 0 {
                     tracing::info!(n_expired = expired, "reaped stale push sessions");
                 }
@@ -499,17 +503,14 @@ impl SyncService for PushServiceHandler {
 
         // ③ Create session.
         let session_id = new_session_id();
-        {
-            let mut sessions = self.sessions.lock();
-            sessions.insert(
-                session_id.clone(),
-                PushSession {
-                    ref_updates: session_updates,
-                    expected_objects: total_objects,
-                    created_at: now_secs(),
-                },
-            );
-        }
+        self.sessions.insert(
+            session_id.clone(),
+            PushSession {
+                ref_updates: session_updates,
+                expected_objects: total_objects,
+                created_at: now_secs(),
+            },
+        );
 
         Ok(Response::new(NegotiatePushResponse {
             accepted: true,
@@ -540,14 +541,11 @@ impl SyncService for PushServiceHandler {
                     // Validate the session_id refers to a live NegotiatePush.
                     // Without this check, any client could push raw objects
                     // bypassing negotiation and the per-session quota.
-                    {
-                        let sessions = self.sessions.lock();
-                        if !sessions.contains_key(&hdr.session_id) {
-                            return Err(Status::not_found(format!(
-                                "unknown push session '{}'",
-                                hdr.session_id
-                            )));
-                        }
+                    if !self.sessions.contains_key(&hdr.session_id) {
+                        return Err(Status::not_found(format!(
+                            "unknown push session '{}'",
+                            hdr.session_id
+                        )));
                     }
                     session_id = hdr.session_id.clone();
                 }
@@ -575,7 +573,7 @@ impl SyncService for PushServiceHandler {
                         // Evict the session so the client cannot retry with the
                         // same session_id and continue accumulating bytes.
                         if !session_id.is_empty() {
-                            self.sessions.lock().remove(&session_id);
+                            self.sessions.remove(&session_id);
                         }
                         tracing::warn!(
                             session_id = %session_id,
@@ -687,10 +685,10 @@ impl SyncService for PushServiceHandler {
         // Look up (and remove) the push session. A missing session means the
         // client never called NegotiatePush — reject so the per-session
         // mismatch / quota guards below are never bypassed.
-        let session = {
-            let mut sessions = self.sessions.lock();
-            sessions.remove(&req.session_id)
-        }
+        let session = self
+            .sessions
+            .remove(&req.session_id)
+            .map(|(_, session)| session)
         .ok_or_else(|| {
             Status::not_found(format!("unknown push session '{}'", req.session_id))
         })?;
