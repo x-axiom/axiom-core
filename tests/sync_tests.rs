@@ -16,7 +16,7 @@
 
 #![cfg(feature = "cloud")]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,8 +39,10 @@ use axiom_core::sync::SyncServiceServer;
 use axiom_core::sync::proto::{
     CloneDownloadRequest, CloneDownloadResponse, CloneInitRequest, CloneInitResponse,
     DownloadPackRequest, DownloadPackResponse, FinalizeRefsRequest, FinalizeRefsResponse,
-    ListRefsRequest, ListRefsResponse, NegotiatePullRequest, NegotiatePullResponse,
+    ListRefsRequest, ListRefsResponse, NegotiatePullRequest, NegotiatePullResponse, ObjectId,
     NegotiatePushRequest, NegotiatePushResponse, UploadPackRequest, UploadPackResponse,
+    WantEntry,
+    download_pack_response::Payload as DownloadPayload,
 };
 use axiom_core::sync::proto::sync_service_server::SyncService;
 use axiom_core::store::memory::InMemoryPathIndex;
@@ -52,6 +54,7 @@ use axiom_core::sync::push_client::{PushClient, PushConfig};
 use axiom_core::sync::push_server::{PushServiceHandler, PushServiceState};
 use axiom_core::sync::bloom_negotiate::BloomFilter;
 
+use futures_util::StreamExt;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Endpoint, Server};
@@ -335,6 +338,209 @@ fn seed_branch(b: &Backends, branch: &str, data: &[u8], parents: Vec<VersionId>)
     vid
 }
 
+fn seed_deep_branch(b: &Backends, branch: &str) -> VersionId {
+    fn put_leaf_tree(b: &Backends, label: &str, data: &[u8]) -> blake3::Hash {
+        let chunk = b.chunks.put_chunk(data.to_vec()).unwrap();
+        let hash = blake3::hash(format!("leaf-{label}-{chunk}").as_bytes());
+        b.trees
+            .put_tree_node(&TreeNode {
+                hash,
+                kind: TreeNodeKind::Leaf { chunk },
+            })
+            .unwrap();
+        hash
+    }
+
+    fn put_internal_tree(
+        b: &Backends,
+        label: &str,
+        children: Vec<blake3::Hash>,
+    ) -> blake3::Hash {
+        let child_list = children
+            .iter()
+            .map(|hash| hash.to_hex().to_string())
+            .collect::<Vec<_>>()
+            .join(":");
+        let hash = blake3::hash(format!("tree-{label}-{child_list}").as_bytes());
+        b.trees
+            .put_tree_node(&TreeNode {
+                hash,
+                kind: TreeNodeKind::Internal { children },
+            })
+            .unwrap();
+        hash
+    }
+
+    fn put_file_node(
+        b: &Backends,
+        label: &str,
+        root: blake3::Hash,
+        size: u64,
+    ) -> blake3::Hash {
+        let hash = blake3::hash(format!("file-{label}-{root}-{size}").as_bytes());
+        b.nodes
+            .put_node(&NodeEntry {
+                hash,
+                kind: NodeKind::File { root, size },
+            })
+            .unwrap();
+        hash
+    }
+
+    fn put_dir_node(
+        b: &Backends,
+        label: &str,
+        children: BTreeMap<String, blake3::Hash>,
+    ) -> blake3::Hash {
+        let child_list = children
+            .iter()
+            .map(|(name, hash)| format!("{name}:{hash}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let hash = blake3::hash(format!("dir-{label}-{child_list}").as_bytes());
+        b.nodes
+            .put_node(&NodeEntry {
+                hash,
+                kind: NodeKind::Directory { children },
+            })
+            .unwrap();
+        hash
+    }
+
+    let part_a = b"deep-file-chunk-a";
+    let part_b = b"deep-file-chunk-b";
+    let part_c = b"deep-file-chunk-c";
+
+    let leaf_a = put_leaf_tree(b, "a", part_a);
+    let leaf_b = put_leaf_tree(b, "b", part_b);
+    let leaf_c = put_leaf_tree(b, "c", part_c);
+    let branch_tree = put_internal_tree(b, "branch", vec![leaf_a, leaf_b]);
+    let file_tree = put_internal_tree(b, "root", vec![branch_tree, leaf_c]);
+    let file_node = put_file_node(
+        b,
+        "artifact.bin",
+        file_tree,
+        (part_a.len() + part_b.len() + part_c.len()) as u64,
+    );
+
+    let level4 = put_dir_node(
+        b,
+        "level4",
+        BTreeMap::from([(String::from("artifact.bin"), file_node)]),
+    );
+    let level3 = put_dir_node(
+        b,
+        "level3",
+        BTreeMap::from([(String::from("level4"), level4)]),
+    );
+    let level2 = put_dir_node(
+        b,
+        "level2",
+        BTreeMap::from([(String::from("level3"), level3)]),
+    );
+    let level1 = put_dir_node(
+        b,
+        "level1",
+        BTreeMap::from([(String::from("level2"), level2)]),
+    );
+    let root = put_dir_node(
+        b,
+        "root",
+        BTreeMap::from([(String::from("level1"), level1)]),
+    );
+
+    let vid_hash = blake3::hash(format!("deep-version-{branch}-{root}").as_bytes());
+    let vid = VersionId(hex::encode(vid_hash.as_bytes()));
+    b.versions
+        .put_version(&VersionNode {
+            id: vid.clone(),
+            parents: vec![],
+            root,
+            message: format!("deep commit on {branch}"),
+            timestamp: 0,
+            metadata: HashMap::new(),
+        })
+        .unwrap();
+    b.refs
+        .put_ref(&Ref {
+            name: branch.into(),
+            kind: RefKind::Branch,
+            target: vid.clone(),
+        })
+        .unwrap();
+
+    vid
+}
+
+fn replay_download_entry_asserting_dependencies(
+    received: &Backends,
+    entry: axiom_core::sync::proto::PackEntry,
+) {
+    let oid = entry.hash.expect("entry hash");
+    let declared = blake3::Hash::from_bytes(oid.hash.as_slice().try_into().unwrap());
+    let raw = zstd::bulk::decompress(&entry.data, 64 * 1024 * 1024).expect("decompress pack entry");
+
+    match entry.r#type {
+        1 => {
+            assert_eq!(blake3::hash(&raw), declared);
+            received.chunks.put_chunk(raw).unwrap();
+        }
+        2 => {
+            let node: TreeNode = serde_json::from_slice(&raw).expect("tree node json");
+            assert_eq!(node.hash, declared);
+            match &node.kind {
+                TreeNodeKind::Leaf { chunk } => {
+                    assert!(
+                        received.chunks.get_chunk(chunk).unwrap().is_some(),
+                        "leaf tree arrived before chunk {chunk}"
+                    );
+                }
+                TreeNodeKind::Internal { children } => {
+                    for child in children {
+                        assert!(
+                            received.trees.get_tree_node(child).unwrap().is_some(),
+                            "internal tree arrived before child tree {child}"
+                        );
+                    }
+                }
+            }
+            received.trees.put_tree_node(&node).unwrap();
+        }
+        3 => {
+            let node: NodeEntry = serde_json::from_slice(&raw).expect("node entry json");
+            assert_eq!(node.hash, declared);
+            match &node.kind {
+                NodeKind::File { root, .. } => {
+                    assert!(
+                        received.trees.get_tree_node(root).unwrap().is_some(),
+                        "file node arrived before tree {root}"
+                    );
+                }
+                NodeKind::Directory { children } => {
+                    for child in children.values() {
+                        assert!(
+                            received.nodes.get_node(child).unwrap().is_some(),
+                            "directory arrived before child node {child}"
+                        );
+                    }
+                }
+            }
+            received.nodes.put_node(&node).unwrap();
+        }
+        4 => {
+            let version: VersionNode = serde_json::from_slice(&raw).expect("version json");
+            assert_eq!(version.id, VersionId(hex::encode(declared.as_bytes())));
+            assert!(
+                received.nodes.get_node(&version.root).unwrap().is_some(),
+                "version arrived before root node {}",
+                version.root
+            );
+            received.versions.put_version(&version).unwrap();
+        }
+        other => panic!("unexpected object type {other}"),
+    }
+}
+
 fn cfg_push(force: bool) -> PushConfig {
     PushConfig {
         remote_name: "origin".into(),
@@ -425,6 +631,77 @@ async fn push_then_pull_roundtrip_byte_for_byte() {
     assert_eq!(v_a.root, v_b.root);
     assert_eq!(v_a.message, v_b.message);
     assert_eq!(v_a.parents, v_b.parents);
+}
+
+#[tokio::test]
+async fn download_pack_streams_dependencies_before_referrers() {
+    let server = Backends::new();
+    let want = seed_deep_branch(&server, "main");
+
+    let sync_store: Arc<dyn axiom_core::store::traits::SyncStore> =
+        Arc::new(axiom_core::store::InMemorySyncStore::new(
+            server.versions.clone(),
+            server.trees.clone(),
+            server.nodes.clone(),
+        ));
+    let handler = PullServiceHandler::new(PullServiceState {
+        chunks: server.chunks.clone(),
+        trees: server.trees.clone(),
+        nodes: server.nodes.clone(),
+        versions: server.versions.clone(),
+        refs: server.refs.clone(),
+        sync: sync_store,
+        session_ttl_secs: 3600,
+        cleanup_interval_secs: 300,
+    });
+
+    let negotiate = handler
+        .negotiate_pull(Request::new(NegotiatePullRequest {
+            workspace_id: "default".into(),
+            tenant_id: "test".into(),
+            wants: vec![WantEntry {
+                want: Some(ObjectId {
+                    hash: hex::decode(want.as_str()).unwrap(),
+                }),
+                have: None,
+            }],
+            have_filter: vec![],
+        }))
+        .await
+        .expect("negotiate pull")
+        .into_inner();
+
+    assert_eq!(negotiate.total_objects, 15);
+
+    let mut stream = handler
+        .download_pack(Request::new(DownloadPackRequest {
+            session_id: negotiate.session_id,
+            workspace_id: "default".into(),
+            tenant_id: "test".into(),
+        }))
+        .await
+        .expect("download pack")
+        .into_inner();
+
+    let received = Backends::new();
+    let mut objects_seen = 0u64;
+
+    while let Some(message) = stream.next().await {
+        let message = message.expect("stream item");
+        match message.payload {
+            Some(DownloadPayload::Header(header)) => {
+                assert_eq!(header.object_count, 15);
+            }
+            Some(DownloadPayload::Entry(entry)) => {
+                replay_download_entry_asserting_dependencies(&received, entry);
+                objects_seen += 1;
+            }
+            None => panic!("missing download payload"),
+        }
+    }
+
+    assert_eq!(objects_seen, 15);
+    assert!(received.versions.get_version(&want).unwrap().is_some());
 }
 
 #[tokio::test]
