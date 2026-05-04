@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use crate::store::traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo};
+use crate::store::traits::{
+    ChunkStore, NodeStore, PathIndexRepo, RefRepo, TreeStore, VersionRepo,
+    WorkspaceRepo,
+};
 
 /// Shared application state available to all route handlers.
 ///
@@ -22,6 +25,8 @@ pub struct AppState {
     pub refs: Arc<dyn RefRepo>,
     /// Path-based metadata index.
     pub path_index: Arc<dyn PathIndexRepo>,
+    /// Workspace metadata repository when backend supports workspace CRUD.
+    pub workspaces: Option<Arc<dyn WorkspaceRepo>>,
 }
 
 impl AppState {
@@ -49,7 +54,8 @@ impl AppState {
             nodes: cas,
             versions: meta.clone(),
             refs: meta.clone(),
-            path_index: meta,
+            path_index: meta.clone(),
+            workspaces: Some(meta),
         }
     }
 
@@ -62,6 +68,7 @@ impl AppState {
             versions: Arc::new(crate::store::InMemoryVersionRepo::new()),
             refs: Arc::new(crate::store::InMemoryRefRepo::new()),
             path_index: Arc::new(crate::store::InMemoryPathIndex::new()),
+            workspaces: None,
         }
     }
 
@@ -80,6 +87,7 @@ impl AppState {
             versions: fdb.clone(),
             refs: fdb.clone(),
             path_index: fdb,
+            workspaces: None,
         }
     }
 
@@ -109,6 +117,7 @@ impl AppState {
             versions: meta.clone(),
             refs: meta.clone(),
             path_index: meta,
+            workspaces: None,
         }
     }
 }

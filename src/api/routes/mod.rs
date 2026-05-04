@@ -2,6 +2,7 @@
 
 pub mod health;
 pub mod objects;
+pub mod workspaces;
 pub mod versions;
 pub mod refs;
 pub mod diff;

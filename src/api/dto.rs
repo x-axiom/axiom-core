@@ -218,3 +218,62 @@ pub struct DirListingResponse {
     pub path: String,
     pub entries: Vec<DirChildEntry>,
 }
+
+// ---------------------------------------------------------------------------
+// Workspace contract (E09 Web Console)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CreateWorkspaceHttpRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct WorkspaceSummaryResponse {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Serialize)]
+pub struct WorkspaceTreeEntryResponse {
+    pub name: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct WorkspaceVersionResponse {
+    pub id: String,
+    pub parent_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    pub timestamp: String,
+}
+
+#[derive(Serialize)]
+pub struct WorkspaceVersionPageResponse {
+    pub items: Vec<WorkspaceVersionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct WorkspaceDiffEntryResponse {
+    pub path: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_size_bytes: Option<u64>,
+}

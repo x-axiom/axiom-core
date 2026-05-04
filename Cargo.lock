@@ -694,6 +694,7 @@ dependencies = [
  "tempfile",
  "testcontainers-modules",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tokio-stream",
  "tokio-test",

@@ -26,6 +26,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(routes::health::router())
         .nest("/api/v1/objects", routes::objects::router())
+        .nest("/api/v1/workspaces", routes::workspaces::router())
         .nest("/api/v1/versions", routes::versions::router())
         .nest("/api/v1/refs", routes::refs::router())
         .nest("/api/v1/diff", routes::diff::router())

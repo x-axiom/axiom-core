@@ -53,6 +53,7 @@ rand = { version = "0.8", optional = true }
 fred = { version = "9", optional = true }
 prometheus = { version = "0.13", optional = true }
 keyring = "3"
+time = { version = "0.3", features = ["formatting"] }
 
 [build-dependencies]
 tonic-build = "0.12"

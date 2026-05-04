@@ -34,7 +34,15 @@ async fn download_file(
     State(state): State<AppState>,
     Path((ref_str, file_path)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let v = super::helpers::resolve_version_node(&ref_str, state.versions.as_ref(), state.refs.as_ref())?;
+    download_file_response(&state, &ref_str, &file_path)
+}
+
+pub fn download_file_response(
+    state: &AppState,
+    ref_str: &str,
+    file_path: &str,
+) -> Result<Response, ApiError> {
+    let v = super::helpers::resolve_version_node(ref_str, state.versions.as_ref(), state.refs.as_ref())?;
     let version_id = v.id;
 
     // Look up path in the path index.
