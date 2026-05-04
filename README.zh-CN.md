@@ -1,74 +1,176 @@
 # Axiom Core
 
-高性能、版本化、内容寻址的大对象存储引擎，Rust 实现。
+[English](README.md)
 
-Axiom 以存储代码的方式来存储文件：每个版本不可变，每个字节按内容哈希去重，分支和 Diff 是一等公民。与 Git 不同，它专为大型二进制资产（数据集、模型权重、媒体文件）设计，可通过 REST API 使用，也可以直接嵌入 Tauri 桌面应用。
+Axiom Core 是一个使用 Rust 编写的高性能、版本化、内容寻址存储引擎。
 
-**与同类方案对比：**
-| | Axiom Core | Git LFS | DVC | 纯 S3 |
-|---|---|---|---|---|
-| 内容寻址 | ✅ BLAKE3 | ✅ | ✅ | ❌ |
-| 内置版本管理 | ✅ | 依赖 Git | 依赖 Git | ❌ |
-| 服务端 Diff | ✅ Merkle | ❌ | ❌ | ❌ |
-| 去重 | ✅ chunk 级 | ❌ | ❌ | ❌ |
-| 可嵌入（无 HTTP） | ✅ Tauri IPC | ❌ | ❌ | ❌ |
-| 多租户 / SaaS | ✅ (`fdb`) | ❌ | ❌ | ✅ |
+它把 Git 的核心思想带到了大体积二进制资产场景：版本不可变、内容按哈希去重、分支和标签可引用历史节点、Merkle Tree 支持高效 Diff。它既可以作为 HTTP 服务运行，也可以直接嵌入其他应用，例如本仓库中的 Axiom 桌面端。
 
-## 功能
+## 目录
 
-**存储与版本管理**
-- FastCDC chunk 级去重（16 KB – 256 KB）— 相同内容全局只存一份
-- Merkle Tree（默认扇出 64）— diff 复杂度 O(变更文件数)，而非 O(总文件数)
-- 不可变版本节点 + 可移动 branch/tag ref — 与 Git commit 相同的心智模型
-- RocksDB 内容存储（chunk、tree、node），支持崩溃恢复
-- SQLite 元数据存储（version、ref、path index），WAL 模式 + schema 迁移
+- [为什么选择 Axiom Core](#为什么选择-axiom-core)
+- [核心能力](#核心能力)
+- [架构](#架构)
+- [仓库结构](#仓库结构)
+- [快速开始](#快速开始)
+- [功能开关](#功能开关)
+- [HTTP API 概览](#http-api-概览)
+- [开发说明](#开发说明)
+- [贡献指南](#贡献指南)
+- [相关项目](#相关项目)
+- [路线图](#路线图)
+- [许可证](#许可证)
 
-**开发者工作流**
-- `checkout_to_path` — 将任意版本物化到本地磁盘；Safe 模式跳过本地修改文件，Force 模式强制覆盖
-- `compute_status` — 对比工作目录与 HEAD（Added / Modified / Deleted / Untracked）
-- branch/tag CRUD、分页历史、ref 感知 diff
-- 流式上传（单文件或目录）与流式下载
+## 为什么选择 Axiom Core
 
-**运维**
-- 软删除回收站，分级保留策略（Free: 7 天 / Pro: 30 天 / 自定义）
-- 带优雅期保护的标记-清除 GC（`fdb` feature）
-- S3 智能分层生命周期策略（`cloud` feature）
-- 每日 GC cron 调度器，FDB 分布式锁 + Prometheus 指标（`fdb` feature）
+Axiom Core 适合这样一类场景：普通对象存储缺少版本语义，而 Git 一类工具又不适合直接管理大型二进制文件。
 
-**分布式 / SaaS**（`fdb` feature）
-- 多租户模型，FoundationDB 存储后端
-- JWT 认证、RBAC、axum 中间件
-- 可达对象 BFS 同步、快进检测、远端追踪 ref
+- 使用 BLAKE3 做内容寻址
+- 基于 chunk 的去重，可跨版本复用重复内容
+- 版本节点不可变，分支和标签作为可移动引用
+- 基于 Merkle Tree 的高效变更检测和 Diff
+- 通过 trait 抽象解耦上层逻辑与底层存储实现
+- 同时覆盖本地单机模式和面向云的扩展能力
 
-**304+ 自动化测试**，覆盖所有层次。
+### 方案对比
 
-## 环境依赖
+| 能力 | Axiom Core | Git LFS | DVC | 纯 S3 |
+| --- | --- | --- | --- | --- |
+| 内容寻址存储 | 是，BLAKE3 | 部分支持 | 部分支持 | 否 |
+| 内建版本图 | 是 | 依赖 Git | 依赖 Git | 否 |
+| 服务端 Diff | 是，基于 Merkle | 否 | 否 | 否 |
+| Chunk 级去重 | 是 | 否 | 否 | 否 |
+| 无 HTTP 嵌入 | 是 | 否 | 否 | 否 |
+| 多租户 SaaS 路径 | 是，依赖 `fdb` | 否 | 否 | 部分支持 |
 
-| 依赖 | 适用范围 | 安装方式 |
-|---|---|---|
-| Rust stable | 全部 | [rustup.rs](https://rustup.rs) |
-| RocksDB 系统库 | `local`（默认） | `brew install rocksdb` / `apt install librocksdb-dev` |
-| SQLite | `local`（默认） | 通常已预装 |
-| protoc | `cloud` feature | `brew install protobuf` / `apt install protobuf-compiler` |
-| FoundationDB 客户端 | `fdb` feature | [apple/foundationdb releases](https://github.com/apple/foundationdb/releases) |
+## 核心能力
+
+### 存储与版本管理
+
+- 基于 FastCDC 的内容定义分块与 chunk 级去重
+- 使用 RocksDB 保存 chunk、tree、node 等内容寻址对象
+- 使用 SQLite 保存 version、ref、path index 和 workspace 元数据
+- 版本节点不可变，分支和标签以引用的形式指向版本
+- 统一使用 BLAKE3 哈希标识对象
+
+### 开发者工作流
+
+- 支持上传单文件或整目录快照
+- 支持浏览版本树、查看元数据、下载文件内容
+- 支持比较两个版本、分支或标签之间的差异
+- 支持把任意版本 checkout 到本地工作目录
+- 支持对比工作目录与当前 HEAD 的状态差异
+
+### 分布式与 SaaS 扩展
+
+- `cloud` feature 提供 gRPC 同步能力
+- `fdb` feature 提供基于 FoundationDB 的多租户扩展路径
+- 包含 JWT 认证、RBAC、远端 ref 与同步会话支持
+- 面向复杂部署提供 GC、保留期和生命周期管理能力
+
+## 架构
+
+```text
+HTTP API (axum)
+    |
+服务层
+    |-- commit.rs
+    |-- diff_engine.rs
+    |-- namespace.rs
+    |-- checkout.rs
+    |-- working_tree.rs
+    |-- sync/
+    |-- gc/
+    |
+存储 Trait (src/store/traits.rs)
+    |-- ChunkStore
+    |-- TreeStore
+    |-- NodeStore
+    |-- VersionRepo
+    |-- RefRepo
+    |-- PathIndexRepo
+    |-- WorkspaceRepo
+    |-- SyncStore
+    |
+实现层
+    |-- RocksDB CAS store
+    |-- SQLite metadata store
+    |-- 用于测试的内存存储
+```
+
+所有存储访问都通过 `src/store/traits.rs` 中定义的 trait 完成。服务层和 API 层应依赖 trait，而不是直接耦合具体后端类型。`AppState` 负责组装并暴露这些共享后端。
+
+## 仓库结构
+
+```text
+src/
+  api/          axum 路由、请求处理、DTO 和错误映射
+  auth/         JWT、RBAC、中间件
+  gc/           回收站、保留策略、垃圾回收、调度器
+  model/        ChunkHash、VersionNode、Ref 等领域模型
+  store/        存储 trait 与后端实现
+  sync/         同步协议支持、远端 ref、会话状态
+  tenant/       基于 FoundationDB 的多租户支持
+  checkout.rs   将存储内容物化到本地文件系统
+  chunker.rs    FastCDC 内容定义分块
+  commit.rs     创建版本、管理 ref、遍历历史
+  diff_engine.rs
+  merkle.rs     构建和遍历 Merkle Tree
+  namespace.rs  构建目录树命名空间
+  working_tree.rs
+tests/          集成测试
+benches/        Criterion 基准测试
+proto/          同步相关 gRPC 定义
+```
 
 ## 快速开始
 
-### 启动 HTTP 服务器
+### 环境依赖
+
+| 依赖 | 用途 | 说明 |
+| --- | --- | --- |
+| Rust stable | 所有构建 | 从 [rustup.rs](https://rustup.rs) 安装 |
+| RocksDB | `local` feature | `brew install rocksdb` 或发行版对应包 |
+| SQLite CLI | 可选 | 用于手动查看元数据，不是构建必需项 |
+| `protoc` | `cloud` feature | `brew install protobuf` 或发行版对应包 |
+| FoundationDB client | `fdb` feature | 仅在 FoundationDB 相关流程中需要 |
+
+### 构建
 
 ```bash
-cargo run --release
-# → 监听 http://localhost:3000
+# 默认单机构建
+cargo build
+
+# 启用本地和云相关 feature
+cargo build --features full
+
+# 启用 FoundationDB 扩展能力
+cargo build --features fdb
 ```
 
-### 上传文件
+### 启动服务
 
 ```bash
-# 单文件
+# 使用默认 .axiom/ 目录启动本地模式
+cargo run --release
+
+# 自定义数据目录和监听地址
+cargo run --release -- --data-dir .axiom-dev --listen 127.0.0.1:3000
+
+# 查看完整 CLI 选项
+cargo run --release -- --help
+```
+
+服务默认监听 `0.0.0.0:3000`，本地数据默认写入 `.axiom/`。
+
+### 上传数据
+
+```bash
+# 上传单文件
 curl -X POST 'http://localhost:3000/api/v1/upload/file?path=hello.txt&message=first+commit' \
   --data-binary 'Hello, Axiom!'
 
-# 目录（多文件）
+# 上传目录快照
 curl -X POST http://localhost:3000/api/v1/upload/directory \
   -H 'Content-Type: application/json' \
   -d '{
@@ -80,174 +182,111 @@ curl -X POST http://localhost:3000/api/v1/upload/directory \
   }'
 ```
 
-### 浏览与下载
+### 浏览与 Diff
 
 ```bash
-curl http://localhost:3000/api/v1/version/main/ls               # 列出根目录
-curl http://localhost:3000/api/v1/version/main/file/hello.txt  # 下载文件
-curl http://localhost:3000/api/v1/versions/main/history        # 查看历史
-```
+# 列出 main 引用下的根目录
+curl http://localhost:3000/api/v1/version/main/ls
 
-### Diff 两个版本
+# 下载指定版本中的文件
+curl http://localhost:3000/api/v1/version/main/file/hello.txt
 
-```bash
+# 查看版本历史
+curl http://localhost:3000/api/v1/versions/main/history
+
+# 比较两个引用
 curl -X POST http://localhost:3000/api/v1/diff \
   -H 'Content-Type: application/json' \
   -d '{"old_version": "v1.0", "new_version": "main"}'
 ```
 
-## API 端点
+## 功能开关
 
-所有 `{ref}` 参数均接受 version ID、branch 名称或 tag 名称。
+| Flag | 默认启用 | 作用 |
+| --- | --- | --- |
+| `local` | 是 | 用于本地或嵌入式场景的 RocksDB CAS 与 SQLite 元数据存储 |
+| `cloud` | 否 | gRPC 同步和面向云的扩展能力 |
+| `fdb` | 否 | 基于 FoundationDB 的租户、认证、GC 与可观测性扩展 |
+| `full` | 否 | 便捷组合，等价于 `local` + `cloud` |
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/health` | 健康检查 |
-| POST | `/api/v1/upload/file` | 单文件上传（raw body）|
-| POST | `/api/v1/upload/directory` | 多文件上传（JSON + base64）|
-| GET | `/api/v1/version/{ref}/file/{path}` | 下载文件内容 |
-| GET | `/api/v1/version/{ref}/ls` | 列出根目录 |
-| GET | `/api/v1/version/{ref}/ls/{path}` | 列出子目录 |
-| GET | `/api/v1/versions/{ref}` | 按 ID、branch 或 tag 获取版本 |
-| GET | `/api/v1/versions/{ref}/history` | 分页版本历史 |
-| GET | `/api/v1/versions/{ref}/path/{path}` | Node 元数据（hash、size、type）|
-| POST | `/api/v1/versions` | 创建版本记录 |
-| GET | `/api/v1/refs` | 列出 ref（可按 kind 过滤）|
-| POST | `/api/v1/refs` | 创建 branch 或 tag |
-| GET | `/api/v1/refs/{name}` | 获取 ref 详情 |
-| PUT | `/api/v1/refs/{name}` | 更新 branch 目标 |
-| DELETE | `/api/v1/refs/{name}` | 删除 branch |
-| GET | `/api/v1/refs/{name}/resolve` | 将 ref 解析为 version |
-| POST | `/api/v1/diff` | Diff 两个版本 |
-| GET | `/api/v1/objects/{hash}` | 获取对象信息 |
+本仓库中的桌面端默认以 `--no-default-features --features local` 方式构建 Axiom Core。
 
-## Feature Flags
+## HTTP API 概览
 
-| Flag | 默认 | 说明 |
-|------|------|------|
-| `local` | ✅ | RocksDB CAS + SQLite 元数据（单节点）|
-| `cloud` | — | gRPC 同步（`proto/sync.proto`）、S3 生命周期策略 |
-| `fdb` | — | FoundationDB：多租户、引用计数、标记-清除 GC、Prometheus 指标 |
-| `full` | — | `local` + `cloud` |
+所有 `{ref}` 参数都接受 version ID、branch 名称或 tag 名称。
 
-Desktop 应用始终以 `--no-default-features --features local` 构建。
+| 领域 | 代表性接口 |
+| --- | --- |
+| 健康检查 | `GET /health` |
+| 上传 | `POST /api/v1/upload/file`、`POST /api/v1/upload/directory` |
+| 浏览 | `GET /api/v1/version/{ref}/ls`、`GET /api/v1/version/{ref}/file/{path}` |
+| 历史 | `GET /api/v1/versions/{ref}`、`GET /api/v1/versions/{ref}/history` |
+| 路径元数据 | `GET /api/v1/versions/{ref}/path/{path}` |
+| 引用管理 | `GET /api/v1/refs`、`POST /api/v1/refs`、`PUT /api/v1/refs/{name}` |
+| Diff | `POST /api/v1/diff` |
+| 对象查询 | `GET /api/v1/objects/{hash}` |
 
-## 架构
+具体路由实现位于 `src/api/routes/`。
 
-```
-┌─────────────────────────────────────────────┐
-│              HTTP API (axum)                 │
-│   upload · download · versions · refs · diff│
-├─────────────────────────────────────────────┤
-│           Service Layer                      │
-│   CommitService · DiffEngine · Namespace    │
-│   Checkout · WorkingTree · GC · Auth · Sync │
-├──────────────────────┬──────────────────────┤
-│   RocksDB CAS        │   SQLite Metadata    │
-│   chunks · trees     │   versions · refs    │
-│   nodes              │   path index         │
-└──────────────────────┴──────────────────────┘
-```
+## 开发说明
 
-所有存储操作都通过 `src/store/traits.rs` 中定义的 trait 进行——后端可替换，不影响上层代码。`Arc<T>` blanket impl 定义在 `store/traits.rs` 末尾，使 `Arc<dyn MyTrait>` 直接可用。
-
-## 项目结构
-
-```
-src/
-  api/          # axum 路由、DTO、错误映射
-    routes/     # 每个路由组一个文件
-  model/        # 领域类型（ChunkHash、VersionNode、Ref、DiffResult …）
-  store/
-    traits.rs   # 所有存储 trait 定义
-    rocksdb.rs  # CAS 后端（chunk、tree、node）
-    sqlite.rs   # 元数据后端（version、ref、path index、workspace）
-    memory.rs   # 测试用内存后端
-  chunker.rs    # FastCDC 内容定义分块
-  merkle.rs     # Merkle tree build / rehydrate
-  namespace.rs  # 目录树构建
-  commit.rs     # 版本创建、ref CRUD、历史遍历
-  diff_engine.rs
-  checkout.rs   # 版本 → 本地文件系统物化
-  working_tree.rs  # 对比本地变更状态与 HEAD
-  sync/         # 可达 BFS、快进检测、远端 ref、同步会话日志
-  auth/         # JWT、RBAC、axum 中间件
-  tenant/       # 多租户模型 + FDB repo  [fdb]
-  gc/           # 回收站、标记-清除、lifecycle、调度器
-tests/          # 集成测试（每个模块一个文件）
-benches/        # criterion 基准测试
-proto/          # gRPC 定义（sync.proto）  [cloud]
-```
-
-## 贡献指南
-
-### 开发环境搭建
+### 测试
 
 ```bash
-# 克隆并构建（默认 features）
-git clone https://github.com/your-org/axiom
-cd axiom/axiom-core
-cargo build
-
-# 包含所有稳定 feature
-cargo build --features full
-
-# 包含 FDB feature（需要本地安装 FoundationDB 客户端）
-cargo build --features fdb
-```
-
-### 运行测试
-
-```bash
-# 单元 + 集成测试（无需外部服务）
+# 运行默认 feature 下的全部测试
 cargo test
 
-# 包含 cloud feature 测试
+# 运行 cloud 相关测试
 cargo test --features full
 
-# 运行指定测试文件
+# 运行指定集成测试文件
 cargo test --test commit_tests
 
 # 按名称运行单个测试
 cargo test version_history_is_paginated
 ```
 
-> **注意：** `--features fdb` 的测试需要运行中的 FoundationDB 集群。`foundationdb-sys` 的构建脚本在部分平台上存在已知的上游 embedded-include 路径问题，不影响 `local` 或 `full` 构建。
-
-### 运行基准测试
+### 基准测试
 
 ```bash
 cargo bench --bench poc_benchmark
 cargo bench --bench cas-benchmark
+cargo bench --bench working_tree_bench
 ```
 
-### 代码约定
+### 项目约定
 
-- **存储必须通过 trait** — 服务层和 API 层不直接调用 `RocksDbCasStore` 或 `SqliteMetadataStore`，只使用 `store/traits.rs` 中的 trait。
-- **`Arc` blanket impl** — 每添加一个新 trait，都在 `store/traits.rs` 末尾补充对应的 blanket impl，使 `Arc<dyn MyTrait>` 开箱即用。
-- **错误类型** — 所有可能失败的操作返回 `CasResult<T>`（即 `Result<T, CasError>`，定义于 `error.rs`）。
-- **内容哈希** — 始终使用 `ChunkHash`（BLAKE3），不直接用裸 `Vec<u8>` 表示哈希。
-- **测试用内存 State** — 使用 `AppState::memory()` 获取完全内存态，无需临时文件或外部进程。
-- **集成测试** — 放在 `tests/`，不放在 `src/` 内。每个文件覆盖一个模块层。
+- 存储访问统一收敛在 `src/store/traits.rs` 中定义的 trait 上
+- 测试优先使用 `AppState::memory()` 构建全内存环境
+- 集成测试放在 `tests/`，不要放入 `src/`
+- 可能失败的存储和服务操作统一返回 `CasResult<T>`
+- `ChunkHash` 与 `VersionId` 是对象标识的唯一权威类型
 
-### PR 检查清单
+## 贡献指南
 
-- [ ] `cargo test` 在默认 features 下通过
-- [ ] `cargo clippy` 无新增警告
-- [ ] 新的公开 API 至少有一个测试用例
-- [ ] schema 变更需在 `store/sqlite.rs` 中添加对应迁移函数（`migrate_vN`）
+欢迎提交 issue 和 pull request。
 
-## 设计原则
+提交 PR 前，建议至少完成以下检查：
 
-- **内容寻址** — chunk、tree、node 均以 BLAKE3 哈希寻址；相同字节全局只存一份
-- **版本不可变** — 版本节点永不修改，branch 是可移动的命名指针
-- **Trait 存储抽象** — 所有存储通过 trait 访问，可替换后端而不改动上层代码
-- **默认去重** — 相同内容跨版本、跨工作区共享存储
+- 确认相关测试通过
+- 为行为变化补充或更新测试
+- 新增代码不要绕过现有存储 trait
+- 如果 schema 变化，补充对应的 SQLite migration
+- 让文档与实际行为保持一致
+
+## 相关项目
+
+- [`../axiom-desktop`](../axiom-desktop) - 嵌入 Axiom Core 的 Tauri 桌面应用
+- [`../axiom-docs`](../axiom-docs) - 架构与设计文档
 
 ## 路线图
 
-1. Merge commit 支持
-2. CLI 工具（`axiom` 二进制）
-3. gRPC 同步端到端打通（`cloud` feature）
-4. Web 控制台（SaaS）
-5. 计费与配额管理
+1. 支持 merge commit
+2. 提供独立 CLI 工具
+3. 打通端到端 gRPC 同步流程
+4. 提供 Web 管理控制台
+5. 完善计费与配额能力
+
+## 许可证
+
+本项目基于 [Apache License 2.0](LICENSE) 发布。
