@@ -52,6 +52,7 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"], optional = t
 rand = { version = "0.8", optional = true }
 fred = { version = "9", optional = true }
 prometheus = { version = "0.13", optional = true }
+keyring = "3"
 
 [build-dependencies]
 tonic-build = "0.12"

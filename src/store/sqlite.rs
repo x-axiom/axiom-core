@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use keyring::Entry;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 
@@ -18,6 +20,8 @@ use super::traits::{
 
 /// Current schema version. Bump this when adding new migrations.
 const CURRENT_SCHEMA_VERSION: u32 = 8;
+const REMOTE_CREDENTIAL_PREFIX: &str = "keyring:v1:";
+const REMOTE_CREDENTIAL_SERVICE_PREFIX: &str = "axiom.remote-credentials.";
 
 /// Apply all pending migrations up to `CURRENT_SCHEMA_VERSION`.
 fn run_migrations(conn: &Connection) -> CasResult<()> {
@@ -414,11 +418,91 @@ fn migrate_v5(conn: &Connection) -> CasResult<()> {
 /// `PathIndexRepo`. All three share one database file.
 pub struct SqliteMetadataStore {
     conn: Arc<Mutex<Connection>>,
+    credential_backend: RemoteCredentialBackend,
+}
+
+enum RemoteCredentialBackend {
+    Keyring { service: String },
+    Memory(Arc<Mutex<HashMap<String, String>>>),
+}
+
+impl RemoteCredentialBackend {
+    fn lookup_key(remote_name: &str) -> String {
+        format!("{REMOTE_CREDENTIAL_PREFIX}{remote_name}")
+    }
+
+    fn is_lookup_key(value: &str) -> bool {
+        value.starts_with(REMOTE_CREDENTIAL_PREFIX)
+    }
+
+    fn store(&self, remote_name: &str, token: &str) -> CasResult<String> {
+        if token.is_empty() {
+            return Ok(String::new());
+        }
+
+        let lookup_key = Self::lookup_key(remote_name);
+        match self {
+            Self::Keyring { service } => {
+                let entry = Entry::new(service, &lookup_key)
+                    .map_err(|e| CasError::Store(format!("keyring open: {e}")))?;
+                entry
+                    .set_password(token)
+                    .map_err(|e| CasError::Store(format!("keyring store: {e}")))?;
+            }
+            Self::Memory(vault) => {
+                vault.lock().insert(lookup_key.clone(), token.to_string());
+            }
+        }
+
+        Ok(lookup_key)
+    }
+
+    fn load(&self, lookup_key: &str) -> CasResult<String> {
+        if lookup_key.is_empty() {
+            return Ok(String::new());
+        }
+
+        match self {
+            Self::Keyring { service } => {
+                let entry = Entry::new(service, lookup_key)
+                    .map_err(|e| CasError::Store(format!("keyring open: {e}")))?;
+                entry
+                    .get_password()
+                    .map_err(|e| CasError::Store(format!("keyring load: {e}")))
+            }
+            Self::Memory(vault) => vault
+                .lock()
+                .get(lookup_key)
+                .cloned()
+                .ok_or_else(|| CasError::Store(format!("missing credential for lookup key '{lookup_key}'"))),
+        }
+    }
+
+    fn delete_best_effort(&self, lookup_key: &str) {
+        if lookup_key.is_empty() {
+            return;
+        }
+
+        match self {
+            Self::Keyring { service } => {
+                let Ok(entry) = Entry::new(service, lookup_key) else {
+                    return;
+                };
+                if let Err(e) = entry.delete_credential() {
+                    tracing::warn!(lookup_key, error = %e, "failed to delete remote credential from keyring");
+                }
+            }
+            Self::Memory(vault) => {
+                vault.lock().remove(lookup_key);
+            }
+        }
+    }
 }
 
 impl SqliteMetadataStore {
     /// Open (or create) a SQLite metadata store at the given file path.
     pub fn open<P: AsRef<Path>>(path: P) -> CasResult<Self> {
+        let path = path.as_ref();
         let conn =
             Connection::open(path).map_err(|e| CasError::Store(e.to_string()))?;
 
@@ -430,6 +514,9 @@ impl SqliteMetadataStore {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            credential_backend: RemoteCredentialBackend::Keyring {
+                service: remote_credential_service(path),
+            },
         })
     }
 
@@ -445,8 +532,53 @@ impl SqliteMetadataStore {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            credential_backend: RemoteCredentialBackend::Memory(Arc::new(Mutex::new(
+                HashMap::new(),
+            ))),
         })
     }
+
+    fn persist_remote_token(&self, remote_name: &str, token: &str) -> CasResult<String> {
+        self.credential_backend.store(remote_name, token)
+    }
+
+    fn resolve_remote_token(&self, remote_name: &str, stored_value: String) -> CasResult<String> {
+        if stored_value.is_empty() {
+            return Ok(String::new());
+        }
+
+        if RemoteCredentialBackend::is_lookup_key(&stored_value) {
+            return self.credential_backend.load(&stored_value);
+        }
+
+        // Legacy row: migrate plaintext out of SQLite on first read.
+        let lookup_key = self.credential_backend.store(remote_name, &stored_value)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE remotes SET auth_token = ?2 WHERE name = ?1",
+            params![remote_name, lookup_key],
+        )
+        .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(stored_value)
+    }
+
+    fn delete_remote_token_best_effort(&self, stored_value: &str) {
+        if RemoteCredentialBackend::is_lookup_key(stored_value) {
+            self.credential_backend.delete_best_effort(stored_value);
+        }
+    }
+}
+
+fn remote_credential_service(path: &Path) -> String {
+    let material = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    format!(
+        "{REMOTE_CREDENTIAL_SERVICE_PREFIX}{}",
+        blake3::hash(material.as_bytes()).to_hex()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -991,6 +1123,7 @@ impl crate::store::traits::WorkspaceRepo for SqliteMetadataStore {
 
 impl RemoteRepo for SqliteMetadataStore {
     fn add_remote(&self, remote: &Remote) -> CasResult<()> {
+        let stored_auth_token = self.persist_remote_token(&remote.name, &remote.auth_token)?;
         let conn = self.conn.lock();
         let rows = conn
             .execute(
@@ -999,7 +1132,7 @@ impl RemoteRepo for SqliteMetadataStore {
                 params![
                     remote.name,
                     remote.url,
-                    remote.auth_token,
+                    stored_auth_token,
                     remote.tenant_id,
                     remote.workspace_id,
                     remote.created_at as i64,
@@ -1018,12 +1151,28 @@ impl RemoteRepo for SqliteMetadataStore {
     }
 
     fn remove_remote(&self, name: &str) -> CasResult<()> {
+        let stored_auth_token = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT auth_token FROM remotes WHERE name = ?1",
+                params![name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| CasError::Store(e.to_string()))?
+        };
+
         let conn = self.conn.lock();
         // FKs on remote_refs and sync_sessions are declared with
         // ON DELETE CASCADE (schema v4), so a single delete on `remotes`
         // is enough to clean both child tables.
         conn.execute("DELETE FROM remotes WHERE name = ?1", params![name])
             .map_err(|e| CasError::Store(e.to_string()))?;
+        drop(conn);
+
+        if let Some(stored_auth_token) = stored_auth_token {
+            self.delete_remote_token_best_effort(&stored_auth_token);
+        }
         Ok(())
     }
 
@@ -1035,18 +1184,33 @@ impl RemoteRepo for SqliteMetadataStore {
                  FROM remotes WHERE name = ?1",
             )
             .map_err(|e| CasError::Store(e.to_string()))?;
-        stmt.query_row(params![name], |row| {
+        let row = stmt
+            .query_row(params![name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .optional()
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        drop(stmt);
+        drop(conn);
+
+        row.map(|(name, url, stored_auth_token, tenant_id, workspace_id, created_at)| {
             Ok(Remote {
-                name: row.get(0)?,
-                url: row.get(1)?,
-                auth_token: row.get(2)?,
-                tenant_id: row.get(3)?,
-                workspace_id: row.get(4)?,
-                created_at: row.get::<_, i64>(5)? as u64,
+                name: name.clone(),
+                url,
+                auth_token: self.resolve_remote_token(&name, stored_auth_token)?,
+                tenant_id,
+                workspace_id,
+                created_at: created_at as u64,
             })
         })
-        .optional()
-        .map_err(|e| CasError::Store(e.to_string()))
+        .transpose()
     }
 
     fn list_remotes(&self) -> CasResult<Vec<Remote>> {
@@ -1059,21 +1223,99 @@ impl RemoteRepo for SqliteMetadataStore {
             .map_err(|e| CasError::Store(e.to_string()))?;
         let rows = stmt
             .query_map([], |row| {
-                Ok(Remote {
-                    name: row.get(0)?,
-                    url: row.get(1)?,
-                    auth_token: row.get(2)?,
-                    tenant_id: row.get(3)?,
-                    workspace_id: row.get(4)?,
-                    created_at: row.get::<_, i64>(5)? as u64,
-                })
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
             })
             .map_err(|e| CasError::Store(e.to_string()))?;
-        let mut out = Vec::new();
+        let mut raw = Vec::new();
         for r in rows {
-            out.push(r.map_err(|e| CasError::Store(e.to_string()))?);
+            raw.push(r.map_err(|e| CasError::Store(e.to_string()))?);
+        }
+
+        drop(stmt);
+        drop(conn);
+
+        let mut out = Vec::with_capacity(raw.len());
+        for (name, url, stored_auth_token, tenant_id, workspace_id, created_at) in raw {
+            out.push(Remote {
+                auth_token: self.resolve_remote_token(&name, stored_auth_token)?,
+                name,
+                url,
+                tenant_id,
+                workspace_id,
+                created_at: created_at as u64,
+            });
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod remote_credential_tests {
+    use super::*;
+
+    #[test]
+    fn add_remote_stores_lookup_key_not_plaintext() {
+        let store = SqliteMetadataStore::open_in_memory().unwrap();
+        store
+            .add_remote(&Remote {
+                name: "origin".into(),
+                url: "https://sync.example.com".into(),
+                auth_token: "secret-token".into(),
+                tenant_id: None,
+                workspace_id: None,
+                created_at: 1,
+            })
+            .unwrap();
+
+        let conn = store.conn.lock();
+        let stored: String = conn
+            .query_row(
+                "SELECT auth_token FROM remotes WHERE name = 'origin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.starts_with(REMOTE_CREDENTIAL_PREFIX));
+        assert_ne!(stored, "secret-token");
+        drop(conn);
+
+        let remote = store.get_remote("origin").unwrap().unwrap();
+        assert_eq!(remote.auth_token, "secret-token");
+    }
+
+    #[test]
+    fn get_remote_migrates_legacy_plaintext_token() {
+        let store = SqliteMetadataStore::open_in_memory().unwrap();
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "INSERT INTO remotes (name, url, auth_token, tenant_id, workspace_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params!["origin", "https://sync.example.com", "legacy-token", Option::<String>::None, Option::<String>::None, 1i64],
+            )
+            .unwrap();
+        }
+
+        let remote = store.get_remote("origin").unwrap().unwrap();
+        assert_eq!(remote.auth_token, "legacy-token");
+
+        let conn = store.conn.lock();
+        let stored: String = conn
+            .query_row(
+                "SELECT auth_token FROM remotes WHERE name = 'origin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.starts_with(REMOTE_CREDENTIAL_PREFIX));
+        assert_ne!(stored, "legacy-token");
     }
 }
 
