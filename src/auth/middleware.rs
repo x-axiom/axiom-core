@@ -36,7 +36,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
@@ -45,9 +44,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use tower::{Layer, Service};
 
-use crate::auth::jwt::JwtService;
 use crate::auth::rbac::AuthContext;
 use crate::tenant::model::Role;
+
+#[cfg(feature = "fdb")]
+use crate::auth::jwt::JwtService;
+#[cfg(feature = "fdb")]
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Helper: parse a role string from a JWT claim
@@ -101,6 +104,120 @@ fn role_level(r: &Role) -> u8 {
 // AuthLayer
 // ---------------------------------------------------------------------------
 
+/// Tower [`Layer`] that trusts identity headers already injected by
+/// axiom-gateway after JWT verification.
+///
+/// Required headers:
+/// - `x-user-id`
+/// - `x-tenant-id`
+/// - `x-org-id`
+/// - `x-roles` (comma-separated) or `x-role`
+#[derive(Clone, Default)]
+pub struct TrustedGatewayAuthLayer;
+
+impl TrustedGatewayAuthLayer {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl<S> Layer<S> for TrustedGatewayAuthLayer {
+    type Service = TrustedGatewayAuthMiddleware<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TrustedGatewayAuthMiddleware { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct TrustedGatewayAuthMiddleware<S> {
+    inner: S,
+}
+
+impl<S> Service<Request<Body>> for TrustedGatewayAuthMiddleware<S>
+where
+    S: Service<Request<Body>, Response = Response> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+        match extract_trusted_auth_context(req.headers()) {
+            Err(resp) => Box::pin(async move { Ok(resp) }),
+            Ok(ctx) => {
+                req.extensions_mut().insert(ctx);
+                let fut = self.inner.call(req);
+                Box::pin(async move { fut.await })
+            }
+        }
+    }
+}
+
+fn extract_required_header(
+    headers: &axum::http::HeaderMap,
+    name: &'static str,
+) -> Result<String, Response> {
+    let value = headers.get(name).ok_or_else(|| {
+        (StatusCode::UNAUTHORIZED, format!("missing {name} header")).into_response()
+    })?;
+
+    let value = value.to_str().map_err(|_| {
+        (StatusCode::UNAUTHORIZED, format!("{name} header is not valid UTF-8")).into_response()
+    })?;
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, format!("{name} header is empty")).into_response());
+    }
+
+    Ok(trimmed.to_owned())
+}
+
+fn extract_forwarded_roles(headers: &axum::http::HeaderMap) -> Result<Vec<String>, Response> {
+    if let Some(value) = headers.get("x-roles") {
+        let raw = value.to_str().map_err(|_| {
+            (StatusCode::UNAUTHORIZED, "x-roles header is not valid UTF-8").into_response()
+        })?;
+        let roles = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|role| !role.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if !roles.is_empty() {
+            return Ok(roles);
+        }
+    }
+
+    Ok(vec![extract_required_header(headers, "x-role")?])
+}
+
+fn extract_trusted_auth_context(
+    headers: &axum::http::HeaderMap,
+) -> Result<AuthContext, Response> {
+    let user_id = extract_required_header(headers, "x-user-id")?;
+    let tenant_id = extract_required_header(headers, "x-tenant-id")?;
+    let org_id = extract_required_header(headers, "x-org-id")?;
+    let roles = extract_forwarded_roles(headers)?;
+
+    Ok(AuthContext {
+        user_id,
+        tenant_id,
+        org_id,
+        role: effective_role(&roles),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// JWT AuthLayer
+// ---------------------------------------------------------------------------
+
 /// Tower [`Layer`] that enforces JWT authentication on every request.
 ///
 /// Wrap individual routes or the entire router:
@@ -110,16 +227,19 @@ fn role_level(r: &Role) -> u8 {
 ///     .route_layer(AuthLayer::new(jwt))
 /// ```
 #[derive(Clone)]
+#[cfg(feature = "fdb")]
 pub struct AuthLayer {
     jwt: Arc<JwtService>,
 }
 
+#[cfg(feature = "fdb")]
 impl AuthLayer {
     pub fn new(jwt: Arc<JwtService>) -> Self {
         Self { jwt }
     }
 }
 
+#[cfg(feature = "fdb")]
 impl<S> Layer<S> for AuthLayer {
     type Service = AuthMiddleware<S>;
 
@@ -137,11 +257,13 @@ impl<S> Layer<S> for AuthLayer {
 
 /// Tower [`Service`] that verifies the JWT and injects [`AuthContext`].
 #[derive(Clone)]
+#[cfg(feature = "fdb")]
 pub struct AuthMiddleware<S> {
     inner: S,
     jwt: Arc<JwtService>,
 }
 
+#[cfg(feature = "fdb")]
 impl<S> Service<Request<Body>> for AuthMiddleware<S>
 where
     S: Service<Request<Body>, Response = Response> + Clone + Send + 'static,
@@ -192,6 +314,7 @@ where
 /// Extract the raw token string from `Authorization: Bearer <token>`.
 ///
 /// Returns `Err(Response)` with a 401 status on any parsing failure.
+#[cfg(feature = "fdb")]
 fn extract_bearer(headers: &axum::http::HeaderMap) -> Result<String, Response> {
     let header_value = headers
         .get(axum::http::header::AUTHORIZATION)

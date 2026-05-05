@@ -5,7 +5,7 @@
 //! existing global stores, falling back to the legacy `main` ref for the
 //! seeded `default` workspace when no workspace head has been persisted yet.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Json, Router};
@@ -19,6 +19,7 @@ use crate::api::dto::{
 };
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::state::AppState;
+use crate::auth::rbac::{AuthContext, Permission};
 use crate::error::CasError;
 use crate::store::traits::{Workspace, WorkspaceRepo};
 
@@ -155,9 +156,39 @@ fn parse_cursor(cursor: Option<&str>) -> ApiResult<usize> {
     }
 }
 
+fn auth_context(auth: Option<Extension<AuthContext>>) -> Option<AuthContext> {
+    auth.map(|Extension(ctx)| ctx)
+}
+
+fn ensure_permission(
+    state: &AppState,
+    auth: Option<&AuthContext>,
+    permission: Permission,
+) -> ApiResult<()> {
+    if state.http_auth_mode == crate::api::state::HttpAuthMode::Disabled {
+        return Ok(());
+    }
+
+    let auth = auth.ok_or_else(|| {
+        ApiError(CasError::Unauthorized("missing auth context".into()))
+    })?;
+
+    if auth.can(permission) {
+        Ok(())
+    } else {
+        Err(ApiError(CasError::Forbidden(format!(
+            "role '{:?}' lacks '{:?}' permission",
+            auth.role, permission
+        ))))
+    }
+}
+
 async fn list_workspaces(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
 ) -> ApiResult<Json<Vec<WorkspaceSummaryResponse>>> {
+    let auth = auth_context(auth);
+    ensure_permission(&state, auth.as_ref(), Permission::Read)?;
     let workspaces = workspace_repo(&state)?
         .list_workspaces()
         .map_err(ApiError::from)?;
@@ -171,8 +202,11 @@ async fn list_workspaces(
 
 async fn create_workspace(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
     Json(req): Json<CreateWorkspaceHttpRequest>,
 ) -> ApiResult<Json<WorkspaceSummaryResponse>> {
+    let auth = auth_context(auth);
+    ensure_permission(&state, auth.as_ref(), Permission::Write)?;
     let name = req.name.trim();
     if name.is_empty() {
         return Err(ApiError(CasError::InvalidObject(
@@ -208,8 +242,11 @@ async fn create_workspace(
 
 async fn delete_workspace(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
     Path(workspace_id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    let auth = auth_context(auth);
+    ensure_permission(&state, auth.as_ref(), Permission::Delete)?;
     if workspace_id == "default" {
         return Err(ApiError(CasError::InvalidObject(
             "cannot delete the default workspace".into(),
@@ -224,15 +261,21 @@ async fn delete_workspace(
 
 async fn list_tree_root(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
     Path(workspace_id): Path<String>,
 ) -> ApiResult<Json<Vec<WorkspaceTreeEntryResponse>>> {
+    let auth = auth_context(auth);
+    ensure_permission(&state, auth.as_ref(), Permission::Read)?;
     list_tree_impl(&state, &workspace_id, "").map(Json)
 }
 
 async fn list_tree_at_path(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
     Path((workspace_id, path)): Path<(String, String)>,
 ) -> ApiResult<Json<Vec<WorkspaceTreeEntryResponse>>> {
+    let auth = auth_context(auth);
+    ensure_permission(&state, auth.as_ref(), Permission::Read)?;
     list_tree_impl(&state, &workspace_id, &path).map(Json)
 }
 
@@ -261,8 +304,11 @@ fn list_tree_impl(
 
 async fn download_workspace_file(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
     Path((workspace_id, file_path)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
+    let auth = auth_context(auth);
+    ensure_permission(&state, auth.as_ref(), Permission::Read)?;
     let workspace = load_workspace(&state, &workspace_id)?;
     let selector = workspace_head_selector(&state, &workspace)?.ok_or_else(|| {
         ApiError(CasError::NotFound(format!(
@@ -275,9 +321,12 @@ async fn download_workspace_file(
 
 async fn list_versions(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
     Path(workspace_id): Path<String>,
     Query(query): Query<VersionsQuery>,
 ) -> ApiResult<Json<WorkspaceVersionPageResponse>> {
+    let auth = auth_context(auth);
+    ensure_permission(&state, auth.as_ref(), Permission::Read)?;
     let workspace = load_workspace(&state, &workspace_id)?;
     let offset = parse_cursor(query.cursor.as_deref())?;
     let Some(selector) = workspace_head_selector(&state, &workspace)? else {
@@ -307,9 +356,12 @@ async fn list_versions(
 
 async fn diff_versions(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
     Path(workspace_id): Path<String>,
     Query(query): Query<DiffQuery>,
 ) -> ApiResult<Json<Vec<WorkspaceDiffEntryResponse>>> {
+    let auth = auth_context(auth);
+    ensure_permission(&state, auth.as_ref(), Permission::Read)?;
     let _workspace = load_workspace(&state, &workspace_id)?;
     let diff = super::diff::diff_versions_service(&state, &query.from, &query.to)?;
     Ok(Json(

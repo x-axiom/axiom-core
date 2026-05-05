@@ -14,7 +14,9 @@ use axum::routing::get;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use state::AppState;
+use crate::auth::middleware::TrustedGatewayAuthLayer;
+
+use state::{AppState, HttpAuthMode};
 
 /// Build the full axum `Router` with all route groups and middleware.
 pub fn build_router(state: AppState) -> Router {
@@ -23,8 +25,7 @@ pub fn build_router(state: AppState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    Router::new()
-        .merge(routes::health::router())
+    let protected_api = Router::new()
         .nest("/api/v1/objects", routes::objects::router())
         .nest("/api/v1/workspaces", routes::workspaces::router())
         .nest("/api/v1/versions", routes::versions::router())
@@ -32,7 +33,18 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/v1/diff", routes::diff::router())
         .nest("/api/v1/upload", routes::upload::router())
         .nest("/api/v1", routes::download::router())
-        .route("/api", get(api_index))
+        .route("/api", get(api_index));
+
+    let protected_api = match state.http_auth_mode {
+        HttpAuthMode::Disabled => protected_api,
+        HttpAuthMode::TrustedGatewayHeaders => {
+            protected_api.layer(TrustedGatewayAuthLayer::new())
+        }
+    };
+
+    Router::new()
+        .merge(routes::health::router())
+        .merge(protected_api)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

@@ -7,6 +7,12 @@ use crate::store::traits::{
     WorkspaceRepo,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpAuthMode {
+    Disabled,
+    TrustedGatewayHeaders,
+}
+
 /// Shared application state available to all route handlers.
 ///
 /// Wraps the storage backends as trait objects in `Arc` so the state can be
@@ -27,6 +33,8 @@ pub struct AppState {
     pub path_index: Arc<dyn PathIndexRepo>,
     /// Workspace metadata repository when backend supports workspace CRUD.
     pub workspaces: Option<Arc<dyn WorkspaceRepo>>,
+    /// HTTP auth integration mode for protected REST routes.
+    pub http_auth_mode: HttpAuthMode,
 }
 
 impl AppState {
@@ -56,6 +64,7 @@ impl AppState {
             refs: meta.clone(),
             path_index: meta.clone(),
             workspaces: Some(meta),
+            http_auth_mode: HttpAuthMode::Disabled,
         }
     }
 
@@ -69,6 +78,7 @@ impl AppState {
             refs: Arc::new(crate::store::InMemoryRefRepo::new()),
             path_index: Arc::new(crate::store::InMemoryPathIndex::new()),
             workspaces: None,
+            http_auth_mode: HttpAuthMode::Disabled,
         }
     }
 
@@ -88,6 +98,7 @@ impl AppState {
             refs: fdb.clone(),
             path_index: fdb,
             workspaces: None,
+            http_auth_mode: HttpAuthMode::TrustedGatewayHeaders,
         }
     }
 
@@ -118,6 +129,12 @@ impl AppState {
             refs: meta.clone(),
             path_index: meta,
             workspaces: None,
+            http_auth_mode: HttpAuthMode::TrustedGatewayHeaders,
         }
+    }
+
+    pub fn with_http_auth(mut self, http_auth_mode: HttpAuthMode) -> Self {
+        self.http_auth_mode = http_auth_mode;
+        self
     }
 }
