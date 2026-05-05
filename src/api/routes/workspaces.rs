@@ -7,14 +7,17 @@
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
+use axum::routing::{patch, post};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
 use serde::Deserialize;
+use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::api::dto::{
-    CreateWorkspaceHttpRequest, WorkspaceDiffEntryResponse, WorkspaceSummaryResponse,
+    CreateWorkspaceHttpRequest, InviteWorkspaceMemberRequest, UpdateWorkspaceMemberRoleRequest,
+    WorkspaceDiffEntryResponse, WorkspaceMemberResponse, WorkspaceSummaryResponse,
     WorkspaceTreeEntryResponse, WorkspaceVersionPageResponse, WorkspaceVersionResponse,
 };
 use crate::api::error::{ApiError, ApiResult};
@@ -22,11 +25,22 @@ use crate::api::state::AppState;
 use crate::auth::rbac::{AuthContext, Permission};
 use crate::error::CasError;
 use crate::store::traits::{Workspace, WorkspaceRepo};
+use crate::tenant::model::Role;
+use crate::tenant::model::{
+    Membership, OrgId, User, UserId, Workspace as TenantWorkspace, WorkspaceId,
+};
+use crate::tenant::TenantDirectory;
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_workspaces).post(create_workspace))
         .route("/{workspace_id}", delete(delete_workspace))
+        .route("/{workspace_id}/members", get(list_members))
+        .route("/{workspace_id}/members/invite", post(invite_member))
+        .route(
+            "/{workspace_id}/members/{member_id}",
+            patch(update_member_role).delete(remove_member),
+        )
         .route("/{workspace_id}/tree", get(list_tree_root))
         .route("/{workspace_id}/tree/{*path}", get(list_tree_at_path))
         .route("/{workspace_id}/download/{*path}", get(download_workspace_file))
@@ -57,6 +71,13 @@ fn workspace_repo(state: &AppState) -> ApiResult<&dyn WorkspaceRepo> {
         .workspaces
         .as_deref()
         .ok_or_else(|| ApiError(CasError::Store("workspace API unavailable for this backend".into())))
+}
+
+fn tenant_directory(state: &AppState) -> ApiResult<&dyn TenantDirectory> {
+    state
+    .tenant_directory
+        .as_deref()
+        .ok_or_else(|| ApiError(CasError::Store("tenant API unavailable for this backend".into())))
 }
 
 fn load_workspace(state: &AppState, workspace_id: &str) -> ApiResult<Workspace> {
@@ -145,6 +166,16 @@ fn workspace_to_summary(state: &AppState, workspace: Workspace) -> WorkspaceSumm
     }
 }
 
+fn tenant_workspace_to_summary(workspace: TenantWorkspace) -> WorkspaceSummaryResponse {
+    WorkspaceSummaryResponse {
+        id: workspace.id.0,
+        name: workspace.name,
+        size_bytes: None,
+        created_at: iso_timestamp(workspace.created_at),
+        updated_at: iso_timestamp(workspace.created_at),
+    }
+}
+
 fn parse_cursor(cursor: Option<&str>) -> ApiResult<usize> {
     match cursor {
         Some(raw) if !raw.is_empty() => raw.parse::<usize>().map_err(|_| {
@@ -183,12 +214,167 @@ fn ensure_permission(
     }
 }
 
+fn require_auth(auth: Option<&AuthContext>) -> ApiResult<&AuthContext> {
+    auth.ok_or_else(|| ApiError(CasError::Unauthorized("missing auth context".into())))
+}
+
+fn ensure_member_management_permission(auth: Option<&AuthContext>) -> ApiResult<&AuthContext> {
+    let auth = require_auth(auth)?;
+    if matches!(auth.role, Role::Owner | Role::Admin) {
+        Ok(auth)
+    } else {
+        Err(ApiError(CasError::Forbidden(
+            "member management requires owner or admin role".into(),
+        )))
+    }
+}
+
+#[cfg_attr(not(feature = "fdb"), allow(dead_code))]
+fn member_role_from_api(role: &str) -> ApiResult<Role> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "owner" => Ok(Role::Owner),
+        "admin" => Ok(Role::Admin),
+        "member" => Ok(Role::Member),
+        "viewer" => Ok(Role::Viewer),
+        other => Err(ApiError(CasError::InvalidObject(format!(
+            "unsupported member role '{other}'"
+        )))),
+    }
+}
+
+#[cfg_attr(not(feature = "fdb"), allow(dead_code))]
+fn member_role_to_api(role: &Role) -> &'static str {
+    match role {
+        Role::Owner => "owner",
+        Role::Admin => "admin",
+        Role::Member => "member",
+        Role::Viewer => "viewer",
+    }
+}
+
+#[cfg_attr(not(feature = "fdb"), allow(dead_code))]
+fn derive_display_name(email: &str) -> String {
+    let local = email.split('@').next().unwrap_or(email).trim();
+    if local.is_empty() {
+        return email.to_owned();
+    }
+
+    local
+        .split(['.', '_', '-'])
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            let mut chars = segment.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut word = first.to_ascii_uppercase().to_string();
+                    word.push_str(chars.as_str());
+                    word
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn load_tenant_workspace(
+    state: &AppState,
+    auth: Option<&AuthContext>,
+    workspace_id: &str,
+) -> ApiResult<TenantWorkspace> {
+    let auth = require_auth(auth)?;
+    let workspace = tenant_directory(state)?
+        .get_workspace(&WorkspaceId::from(workspace_id))
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError(CasError::WorkspaceNotFound(workspace_id.to_owned())))?;
+
+    if workspace.org_id.as_str() != auth.org_id {
+        return Err(ApiError(CasError::Forbidden(format!(
+            "workspace '{}' is outside current org scope",
+            workspace_id
+        ))));
+    }
+
+    Ok(workspace)
+}
+
+fn membership_to_response(
+    directory: &dyn TenantDirectory,
+    membership: Membership,
+) -> ApiResult<WorkspaceMemberResponse> {
+    let user = directory
+        .get_user(&membership.user_id)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError(CasError::NotFound(format!(
+            "user '{}' missing for membership",
+            membership.user_id
+        ))))?;
+    Ok(user_to_member_response(user, membership.role))
+}
+
+fn user_to_member_response(user: User, role: Role) -> WorkspaceMemberResponse {
+    WorkspaceMemberResponse {
+        id: user.id.0,
+        email: user.email,
+        name: user.display_name,
+        avatar_url: None,
+        role: member_role_to_api(&role).to_owned(),
+        joined_at: iso_timestamp(user.created_at),
+    }
+}
+
+fn ensure_not_last_owner(
+    directory: &dyn TenantDirectory,
+    org_id: &OrgId,
+    membership: &Membership,
+    next_role: Option<&Role>,
+) -> ApiResult<()> {
+    if membership.role != Role::Owner {
+        return Ok(());
+    }
+
+    if matches!(next_role, Some(Role::Owner)) {
+        return Ok(());
+    }
+
+    let owner_count = directory
+        .list_members_of_org(org_id)
+        .map_err(ApiError::from)?
+        .into_iter()
+        .filter(|entry| entry.role == Role::Owner)
+        .count();
+    if owner_count <= 1 {
+        return Err(ApiError(CasError::Forbidden(
+            "cannot remove or demote the last owner".into(),
+        )));
+    }
+
+    Ok(())
+}
+
 async fn list_workspaces(
     State(state): State<AppState>,
     auth: Option<Extension<AuthContext>>,
 ) -> ApiResult<Json<Vec<WorkspaceSummaryResponse>>> {
     let auth = auth_context(auth);
     ensure_permission(&state, auth.as_ref(), Permission::Read)?;
+
+    if state.http_auth_mode != crate::api::state::HttpAuthMode::Disabled {
+        if let Some(auth) = auth.as_ref() {
+            if let Some(directory) = state.tenant_directory.as_deref() {
+                let workspaces = directory
+                    .list_workspaces_by_org(&OrgId::from(auth.org_id.as_str()))
+                    .map_err(ApiError::from)?;
+                return Ok(Json(
+                    workspaces
+                        .into_iter()
+                        .map(tenant_workspace_to_summary)
+                        .collect(),
+                ));
+            }
+        }
+    }
+
     let workspaces = workspace_repo(&state)?
         .list_workspaces()
         .map_err(ApiError::from)?;
@@ -212,6 +398,24 @@ async fn create_workspace(
         return Err(ApiError(CasError::InvalidObject(
             "workspace name must not be empty".into(),
         )));
+    }
+
+    if state.http_auth_mode != crate::api::state::HttpAuthMode::Disabled {
+        if let Some(directory) = state.tenant_directory.as_deref() {
+            let auth = require_auth(auth.as_ref())?;
+            let org_id = OrgId::from(auth.org_id.as_str());
+            let existing = directory
+                .list_workspaces_by_org(&org_id)
+                .map_err(ApiError::from)?;
+            if existing.iter().any(|workspace| workspace.name == name) {
+                return Err(ApiError(CasError::AlreadyExists));
+            }
+
+            let workspace = directory
+                .create_workspace(&org_id, name, 0)
+                .map_err(ApiError::from)?;
+            return Ok(Json(tenant_workspace_to_summary(workspace)));
+        }
     }
 
     let repo = workspace_repo(&state)?;
@@ -253,10 +457,131 @@ async fn delete_workspace(
         )));
     }
 
+    if state.http_auth_mode != crate::api::state::HttpAuthMode::Disabled {
+        if state.tenant_directory.is_some() {
+            let workspace = load_tenant_workspace(&state, auth.as_ref(), &workspace_id)?;
+            tenant_directory(&state)?
+                .delete_workspace(&WorkspaceId::from(workspace_id.as_str()), &workspace.org_id)
+                .map_err(ApiError::from)?;
+            return Ok(StatusCode::NO_CONTENT);
+        }
+    }
+
     workspace_repo(&state)?
         .delete_workspace(&workspace_id)
         .map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_members(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
+    Path(workspace_id): Path<String>,
+) -> ApiResult<Json<Vec<WorkspaceMemberResponse>>> {
+    let auth = auth_context(auth);
+    ensure_permission(&state, auth.as_ref(), Permission::Read)?;
+    let workspace = load_tenant_workspace(&state, auth.as_ref(), &workspace_id)?;
+    let directory = tenant_directory(&state)?;
+    let members = directory
+        .list_members_of_org(&workspace.org_id)
+        .map_err(ApiError::from)?
+        .into_iter()
+        .map(|membership| membership_to_response(directory, membership))
+        .collect::<ApiResult<Vec<_>>>()?;
+    Ok(Json(members))
+}
+
+async fn invite_member(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
+    Path(workspace_id): Path<String>,
+    Json(req): Json<InviteWorkspaceMemberRequest>,
+) -> ApiResult<Json<WorkspaceMemberResponse>> {
+    let auth = auth_context(auth);
+    ensure_member_management_permission(auth.as_ref())?;
+    let workspace = load_tenant_workspace(&state, auth.as_ref(), &workspace_id)?;
+    let email = req.email.trim().to_ascii_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        return Err(ApiError(CasError::InvalidObject(
+            "member email must be a valid address".into(),
+        )));
+    }
+
+    let role = member_role_from_api(&req.role)?;
+    let directory = tenant_directory(&state)?;
+    let user = match directory.get_user_by_email(&email).map_err(ApiError::from)? {
+        Some(user) => user,
+        None => directory
+            .create_user(&email, &derive_display_name(&email))
+            .map_err(ApiError::from)?,
+    };
+
+    if directory
+        .get_membership(&user.id, &workspace.org_id)
+        .map_err(ApiError::from)?
+        .is_some()
+    {
+        return Err(ApiError(CasError::AlreadyExists));
+    }
+
+    directory.put_membership(&user.id, &workspace.org_id, role.clone())
+        .map_err(ApiError::from)?;
+    Ok(Json(user_to_member_response(user, role)))
+}
+
+async fn update_member_role(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
+    Path((workspace_id, member_id)): Path<(String, String)>,
+    Json(req): Json<UpdateWorkspaceMemberRoleRequest>,
+) -> ApiResult<Json<WorkspaceMemberResponse>> {
+    let auth = auth_context(auth);
+    ensure_member_management_permission(auth.as_ref())?;
+    let workspace = load_tenant_workspace(&state, auth.as_ref(), &workspace_id)?;
+    let role = member_role_from_api(&req.role)?;
+    let directory = tenant_directory(&state)?;
+    let user_id = UserId::from(member_id.as_str());
+    let membership = directory
+        .get_membership(&user_id, &workspace.org_id)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError(CasError::NotFound(format!(
+            "member '{}' not found",
+            member_id
+        ))))?;
+    ensure_not_last_owner(directory, &workspace.org_id, &membership, Some(&role))?;
+    let user = directory
+        .get_user(&user_id)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError(CasError::NotFound(format!(
+            "user '{}' not found",
+            member_id
+        ))))?;
+    directory.put_membership(&user_id, &workspace.org_id, role.clone())
+        .map_err(ApiError::from)?;
+    Ok(Json(user_to_member_response(user, role)))
+}
+
+async fn remove_member(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
+    Path((workspace_id, member_id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    let auth = auth_context(auth);
+    ensure_member_management_permission(auth.as_ref())?;
+    let workspace = load_tenant_workspace(&state, auth.as_ref(), &workspace_id)?;
+    let directory = tenant_directory(&state)?;
+    let user_id = UserId::from(member_id.as_str());
+    let membership = directory
+        .get_membership(&user_id, &workspace.org_id)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError(CasError::NotFound(format!(
+            "member '{}' not found",
+            member_id
+        ))))?;
+    ensure_not_last_owner(directory, &workspace.org_id, &membership, None)?;
+    directory.delete_membership(&user_id, &workspace.org_id)
+        .map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({})))
 }
 
 async fn list_tree_root(
@@ -375,4 +700,32 @@ async fn diff_versions(
             })
             .collect(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{derive_display_name, member_role_from_api, member_role_to_api};
+    use crate::tenant::model::Role;
+
+    #[test]
+    fn derive_display_name_from_email_local_part() {
+        assert_eq!(derive_display_name("jane_doe@example.com"), "Jane Doe");
+        assert_eq!(derive_display_name("ops-team@example.com"), "Ops Team");
+    }
+
+    #[test]
+    fn member_role_round_trips_api_shape() {
+        let owner = match member_role_from_api("owner") {
+            Ok(role) => role,
+            Err(_) => panic!("owner should parse"),
+        };
+        let viewer = match member_role_from_api("viewer") {
+            Ok(role) => role,
+            Err(_) => panic!("viewer should parse"),
+        };
+        assert_eq!(owner, Role::Owner);
+        assert_eq!(viewer, Role::Viewer);
+        assert_eq!(member_role_to_api(&Role::Admin), "admin");
+        assert_eq!(member_role_to_api(&Role::Member), "member");
+    }
 }

@@ -53,6 +53,57 @@ pub struct TenantRepo {
     db: Arc<Database>,
 }
 
+impl super::TenantDirectory for TenantRepo {
+    fn get_workspace(&self, id: &WorkspaceId) -> CasResult<Option<Workspace>> {
+        TenantRepo::get_workspace(self, id)
+    }
+
+    fn list_workspaces_by_org(&self, org_id: &OrgId) -> CasResult<Vec<Workspace>> {
+        TenantRepo::list_workspaces_by_org(self, org_id)
+    }
+
+    fn create_workspace(
+        &self,
+        org_id: &OrgId,
+        name: &str,
+        storage_quota: u64,
+    ) -> CasResult<Workspace> {
+        TenantRepo::create_workspace(self, org_id, name, storage_quota)
+    }
+
+    fn delete_workspace(&self, id: &WorkspaceId, org_id: &OrgId) -> CasResult<()> {
+        TenantRepo::delete_workspace(self, id, org_id)
+    }
+
+    fn get_user(&self, id: &UserId) -> CasResult<Option<User>> {
+        TenantRepo::get_user(self, id)
+    }
+
+    fn get_user_by_email(&self, email: &str) -> CasResult<Option<User>> {
+        TenantRepo::get_user_by_email(self, email)
+    }
+
+    fn create_user(&self, email: &str, display_name: &str) -> CasResult<User> {
+        TenantRepo::create_user(self, email, display_name)
+    }
+
+    fn get_membership(&self, user_id: &UserId, org_id: &OrgId) -> CasResult<Option<Membership>> {
+        TenantRepo::get_membership(self, user_id, org_id)
+    }
+
+    fn list_members_of_org(&self, org_id: &OrgId) -> CasResult<Vec<Membership>> {
+        TenantRepo::list_members_of_org(self, org_id)
+    }
+
+    fn put_membership(&self, user_id: &UserId, org_id: &OrgId, role: Role) -> CasResult<Membership> {
+        TenantRepo::put_membership(self, user_id, org_id, role)
+    }
+
+    fn delete_membership(&self, user_id: &UserId, org_id: &OrgId) -> CasResult<()> {
+        TenantRepo::delete_membership(self, user_id, org_id)
+    }
+}
+
 impl TenantRepo {
     /// Connect to the FDB cluster.
     ///

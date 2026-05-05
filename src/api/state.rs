@@ -6,6 +6,7 @@ use crate::store::traits::{
     ChunkStore, NodeStore, PathIndexRepo, RefRepo, TreeStore, VersionRepo,
     WorkspaceRepo,
 };
+use crate::tenant::TenantDirectory;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpAuthMode {
@@ -33,6 +34,8 @@ pub struct AppState {
     pub path_index: Arc<dyn PathIndexRepo>,
     /// Workspace metadata repository when backend supports workspace CRUD.
     pub workspaces: Option<Arc<dyn WorkspaceRepo>>,
+    /// Tenant/member directory for SaaS workspace and team management.
+    pub tenant_directory: Option<Arc<dyn TenantDirectory>>,
     /// HTTP auth integration mode for protected REST routes.
     pub http_auth_mode: HttpAuthMode,
 }
@@ -64,6 +67,7 @@ impl AppState {
             refs: meta.clone(),
             path_index: meta.clone(),
             workspaces: Some(meta),
+            tenant_directory: None,
             http_auth_mode: HttpAuthMode::Disabled,
         }
     }
@@ -78,6 +82,7 @@ impl AppState {
             refs: Arc::new(crate::store::InMemoryRefRepo::new()),
             path_index: Arc::new(crate::store::InMemoryPathIndex::new()),
             workspaces: None,
+            tenant_directory: None,
             http_auth_mode: HttpAuthMode::Disabled,
         }
     }
@@ -98,6 +103,7 @@ impl AppState {
             refs: fdb.clone(),
             path_index: fdb,
             workspaces: None,
+            tenant_directory: None,
             http_auth_mode: HttpAuthMode::TrustedGatewayHeaders,
         }
     }
@@ -129,12 +135,18 @@ impl AppState {
             refs: meta.clone(),
             path_index: meta,
             workspaces: None,
+            tenant_directory: None,
             http_auth_mode: HttpAuthMode::TrustedGatewayHeaders,
         }
     }
 
     pub fn with_http_auth(mut self, http_auth_mode: HttpAuthMode) -> Self {
         self.http_auth_mode = http_auth_mode;
+        self
+    }
+
+    pub fn with_tenant_directory(mut self, tenant_directory: Arc<dyn TenantDirectory>) -> Self {
+        self.tenant_directory = Some(tenant_directory);
         self
     }
 }

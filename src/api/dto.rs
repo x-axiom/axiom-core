@@ -241,6 +241,28 @@ pub struct WorkspaceSummaryResponse {
 }
 
 #[derive(Serialize)]
+pub struct WorkspaceMemberResponse {
+    pub id: String,
+    pub email: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    pub role: String,
+    pub joined_at: String,
+}
+
+#[derive(Deserialize)]
+pub struct InviteWorkspaceMemberRequest {
+    pub email: String,
+    pub role: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateWorkspaceMemberRoleRequest {
+    pub role: String,
+}
+
+#[derive(Serialize)]
 pub struct WorkspaceTreeEntryResponse {
     pub name: String,
     pub kind: String,
