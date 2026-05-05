@@ -17,3 +17,4 @@ pub mod version;
 pub mod tenant;
 pub mod auth;
 pub mod gc;
+pub mod telemetry;

@@ -10,6 +10,16 @@ use serde::{Deserialize, Serialize};
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checks: Option<Vec<HealthCheckResponse>>,
+}
+
+#[derive(Serialize)]
+pub struct HealthCheckResponse {
+    pub name: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

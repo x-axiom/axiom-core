@@ -12,9 +12,9 @@ use axum::Router;
 use axum::response::Html;
 use axum::routing::get;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::TraceLayer;
 
 use crate::auth::middleware::TrustedGatewayAuthLayer;
+use crate::telemetry;
 
 use state::{AppState, HttpAuthMode};
 
@@ -46,7 +46,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(routes::health::router())
         .merge(protected_api)
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(telemetry::observe_http_request))
         .with_state(state)
 }
 

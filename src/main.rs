@@ -1,7 +1,7 @@
 use axiom_core::api::{build_router, state::AppState};
 use axiom_core::store::StoreFactory;
+use axiom_core::telemetry;
 use clap::{Parser, ValueEnum};
-use tracing_subscriber::EnvFilter;
 
 /// Axiom — high-performance versioned content-addressed object storage.
 #[derive(Parser)]
@@ -39,11 +39,7 @@ async fn main() {
     let cli = Cli::parse();
 
     // Initialize tracing / logging.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    telemetry::init_logging();
 
     let state = match cli.mode {
         Mode::Local => build_local_state(&cli),
