@@ -24,7 +24,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use foundationdb::{Database, FdbError};
+use foundationdb::Database;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -311,7 +311,7 @@ impl JwtService {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB refresh store: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB refresh store: {e}")))?;
 
         Ok(token)
     }
@@ -348,7 +348,7 @@ impl JwtService {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB refresh consume: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB refresh consume: {e}")))?;
 
         Ok(record.user_id)
     }
@@ -364,7 +364,7 @@ impl JwtService {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB revoke: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB revoke: {e}")))?;
         Ok(())
     }
 

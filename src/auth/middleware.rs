@@ -341,7 +341,7 @@ fn extract_bearer(headers: &axum::http::HeaderMap) -> Result<String, Response> {
 // gRPC (tonic) interceptor — cloud feature only
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "cloud")]
+#[cfg(all(feature = "cloud", feature = "fdb"))]
 pub mod grpc {
     //! Tonic interceptor that mirrors the axum JWT middleware for gRPC calls.
 

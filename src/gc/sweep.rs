@@ -40,7 +40,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use foundationdb::{Database, FdbError, KeySelector, RangeOption};
+use foundationdb::{Database, KeySelector, RangeOption};
 use foundationdb::options::StreamingMode;
 
 use crate::error::{CasError, CasResult};
@@ -289,7 +289,7 @@ impl GcSweeper {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB drain_pending_delete: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB drain_pending_delete: {e}")))?;
 
         Ok(())
     }
@@ -381,7 +381,7 @@ impl GcSweeper {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB promote_to_pending_delete: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB promote_to_pending_delete: {e}")))?;
 
         Ok(())
     }

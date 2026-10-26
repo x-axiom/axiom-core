@@ -92,10 +92,9 @@ pub trait RefRepo: Send + Sync {
     /// When the condition is **not** met, leaves the store unchanged and returns
     /// `Ok(false)`.
     ///
-    /// The default implementation is a **non-atomic** read-check-write, which
-    /// is safe for single-process use (SQLite/in-memory).  The FoundationDB
-    /// backend overrides this with a genuinely atomic FDB transaction, making
-    /// it safe under concurrent writers.
+    /// The default implementation is a **non-atomic** read-check-write and
+    /// must only be used when callers are externally serialized. Backends
+    /// that support concurrent writers must override it with an atomic op.
     fn compare_and_swap_ref(
         &self,
         name: &str,

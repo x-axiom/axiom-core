@@ -19,9 +19,21 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0:3000")]
     listen: String,
 
+    /// TOML configuration file (used by cloud mode).
+    #[arg(long)]
+    config: Option<String>,
+
     /// FoundationDB cluster file (required for cloud mode).
     #[arg(long)]
     fdb_cluster: Option<String>,
+
+    /// FoundationDB tenant (required for cloud mode without --config).
+    #[arg(long)]
+    fdb_tenant: Option<String>,
+
+    /// FoundationDB workspace (required for cloud mode without --config).
+    #[arg(long)]
+    fdb_workspace: Option<String>,
 
     /// S3 bucket name (required for cloud mode).
     #[arg(long)]
@@ -37,6 +49,14 @@ enum Mode {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    #[cfg(feature = "fdb")]
+    let _fdb_network_guard = if matches!(&cli.mode, Mode::Cloud) {
+        // Safety: keep the network guard alive for the full cloud-mode process.
+        Some(unsafe { foundationdb::boot() })
+    } else {
+        None
+    };
 
     // Initialize tracing / logging.
     telemetry::init_logging();
@@ -78,24 +98,32 @@ fn build_local_state(_cli: &Cli) -> AppState {
 }
 
 fn build_cloud_state(cli: &Cli) -> AppState {
-    // Prefer explicit CLI args over environment variables for ergonomic
-    // one-shot usage; missing required args fall through to env-var detection.
-    // SAFETY: single-threaded at this point — Tokio runtime not yet started.
-    unsafe {
-        if let Some(bucket) = &cli.s3_bucket {
-            std::env::set_var("AXIOM_S3_BUCKET", bucket);
+    let factory = if let Some(config) = &cli.config {
+        StoreFactory::from_file(config)
+    } else {
+        // Prefer explicit CLI args over environment variables for one-shot
+        // usage; missing values still fall through to env-var detection.
+        // SAFETY: single-threaded at this point — Tokio runtime not yet started.
+        unsafe {
+            if let Some(bucket) = &cli.s3_bucket {
+                std::env::set_var("AXIOM_S3_BUCKET", bucket);
+            }
+            if let Some(cluster) = &cli.fdb_cluster {
+                std::env::set_var("AXIOM_FDB_CLUSTER_FILE", cluster);
+            }
+            if let Some(tenant) = &cli.fdb_tenant {
+                std::env::set_var("AXIOM_FDB_TENANT", tenant);
+            }
+            if let Some(workspace) = &cli.fdb_workspace {
+                std::env::set_var("AXIOM_FDB_WORKSPACE", workspace);
+            }
+            std::env::set_var("AXIOM_BACKEND", "cloud");
         }
-        if let Some(cluster) = &cli.fdb_cluster {
-            std::env::set_var("AXIOM_FDB_CLUSTER_FILE", cluster);
-        }
-        // `AXIOM_BACKEND` must be set for from_env() to pick up "cloud".
-        std::env::set_var("AXIOM_BACKEND", "cloud");
-    }
+        StoreFactory::from_env()
+    };
 
-    StoreFactory::from_env()
-        .and_then(|f| f.create())
-        .unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        })
+    factory.and_then(|f| f.create()).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    })
 }

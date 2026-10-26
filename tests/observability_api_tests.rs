@@ -41,6 +41,13 @@ async fn observability_routes_expose_live_ready_and_request_id() {
     assert_eq!(live.status(), StatusCode::OK);
     assert!(live.headers().contains_key("x-request-id"));
 
+    let healthz = app
+        .clone()
+        .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(healthz.status(), StatusCode::OK);
+
     let ready = app
         .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
         .await

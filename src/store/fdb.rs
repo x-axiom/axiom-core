@@ -134,7 +134,7 @@ impl FdbMetadataStore {
     /// this function and kept the returned `NetworkAutoStop` guard alive.
     pub fn new(cfg: FdbConfig) -> CasResult<Self> {
         let db = match &cfg.cluster_file {
-            Some(path) => Database::new_compat(path)
+            Some(path) => Database::from_path(path)
                 .map_err(|e| CasError::Store(format!("FDB open cluster file '{}' failed: {e}", path)))?,
             None => Database::default()
                 .map_err(|e| CasError::Store(format!("FDB open default cluster failed: {e}")))?,
@@ -289,7 +289,7 @@ impl FdbMetadataStore {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB put {segment}/{id}: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB put {segment}/{id}: {e}")))?;
 
         Ok(())
     }
@@ -322,7 +322,7 @@ impl FdbMetadataStore {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB delete {segment}/{id}: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB delete {segment}/{id}: {e}")))?;
 
         Ok(())
     }
@@ -487,16 +487,22 @@ impl RefRepo for FdbMetadataStore {
         let new_bytes = serde_json::to_vec(new_ref).expect("serialize Ref");
         let rt = Self::rt()?;
 
-        let swapped = rt
+        let (swapped, immutable_tag) = rt
             .block_on(self.db.run(|trx, _maybe_committed| {
                 let key = key.clone();
                 let expected = expected_target.clone();
                 let new_bytes = new_bytes.clone();
                 async move {
                     let current_raw = trx.get(&key, false).await?;
-                    let current_target: Option<String> = current_raw.and_then(|b| {
-                        serde_json::from_slice::<Ref>(&b).ok().map(|r| r.target.0)
-                    });
+                    let current_ref: Option<Ref> =
+                        current_raw.and_then(|bytes| serde_json::from_slice(&bytes).ok());
+                    if current_ref
+                        .as_ref()
+                        .is_some_and(|current| current.kind == RefKind::Tag)
+                    {
+                        return Ok((false, true));
+                    }
+                    let current_target = current_ref.map(|current| current.target.0);
 
                     let condition_met = match (&current_target, &expected) {
                         (None, None) => true,
@@ -506,14 +512,17 @@ impl RefRepo for FdbMetadataStore {
 
                     if condition_met {
                         trx.set(&key, &new_bytes);
-                        Ok(true)
+                        Ok((true, false))
                     } else {
-                        Ok(false)
+                        Ok((false, false))
                     }
                 }
             }))
-            .map_err(|e: FdbError| CasError::Store(format!("FDB compare_and_swap_ref '{name}': {e}")))?;
+            .map_err(|e| CasError::Store(format!("FDB compare_and_swap_ref '{name}': {e}")))?;
 
+        if immutable_tag {
+            return Err(CasError::AlreadyExists);
+        }
         Ok(swapped)
     }
 }
@@ -548,7 +557,7 @@ impl PathIndexRepo for FdbMetadataStore {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB put_path_entry: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB put_path_entry: {e}")))?;
 
         Ok(())
     }

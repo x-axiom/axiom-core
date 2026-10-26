@@ -15,6 +15,7 @@ use crate::telemetry;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/health", get(health_check))
+        .route("/healthz", get(health_check))
         .route("/live", get(live_check))
         .route("/ready", get(ready_check))
         .route("/metrics", get(metrics_endpoint))

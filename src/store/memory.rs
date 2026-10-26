@@ -168,6 +168,31 @@ impl RefRepo for InMemoryRefRepo {
         Ok(())
     }
 
+    fn compare_and_swap_ref(
+        &self,
+        name: &str,
+        expected_old: Option<&VersionId>,
+        new_ref: &Ref,
+    ) -> CasResult<bool> {
+        let mut refs = self.refs.write();
+        if refs
+            .get(name)
+            .is_some_and(|existing| existing.kind == RefKind::Tag)
+        {
+            return Err(CasError::AlreadyExists);
+        }
+
+        let matches = match (refs.get(name), expected_old) {
+            (None, None) => true,
+            (Some(current), Some(expected)) => current.target == *expected,
+            _ => false,
+        };
+        if matches {
+            refs.insert(new_ref.name.clone(), new_ref.clone());
+        }
+        Ok(matches)
+    }
+
     fn get_ref(&self, name: &str) -> CasResult<Option<Ref>> {
         Ok(self.refs.read().get(name).cloned())
     }

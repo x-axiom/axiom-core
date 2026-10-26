@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use foundationdb::options::MutationType;
-use foundationdb::{Database, FdbError, KeySelector, RangeOption};
+use foundationdb::{Database, KeySelector, RangeOption};
 use foundationdb::options::StreamingMode;
 
 use crate::error::{CasError, CasResult};
@@ -257,7 +257,7 @@ impl RefCountRepo {
                     Ok(())
                 }
             }))
-            .map_err(|e: FdbError| CasError::Store(format!("FDB drain_garbage: {e}")))?;
+            .map_err(|e| CasError::Store(format!("FDB drain_garbage: {e}")))?;
         }
 
         Ok(hashes)
@@ -309,7 +309,7 @@ impl RefCountRepo {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB increment_batch: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB increment_batch: {e}")))?;
         Ok(())
     }
 
@@ -352,7 +352,7 @@ impl RefCountRepo {
                 Ok(zeroed)
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB decrement_batch: {e}")))
+        .map_err(|e| CasError::Store(format!("FDB decrement_batch: {e}")))
     }
 
     fn fdb_range_scan(

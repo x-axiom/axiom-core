@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "axiom-core"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1846,6 +1846,9 @@ dependencies = [
  "futures",
  "memchr",
  "rand 0.8.6",
+ "serde",
+ "serde_bytes",
+ "serde_json",
  "static_assertions",
  "uuid",
 ]
@@ -4000,6 +4003,16 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

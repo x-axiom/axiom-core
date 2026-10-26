@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use foundationdb::{Database, FdbError, KeySelector, RangeOption};
+use foundationdb::{Database, KeySelector, RangeOption};
 use foundationdb::options::StreamingMode;
 
 use crate::error::{CasError, CasResult};
@@ -231,7 +231,7 @@ impl TenantRepo {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB put_multi: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB put_multi: {e}")))?;
         Ok(())
     }
 
@@ -255,7 +255,7 @@ impl TenantRepo {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB delete_multi: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB delete_multi: {e}")))?;
         Ok(())
     }
 

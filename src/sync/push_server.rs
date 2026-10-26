@@ -17,14 +17,8 @@
 //! A production deployment would use a distributed lock (e.g. FoundationDB
 //! CAS) — see the design doc for details.
 //!
-//! ### Known limitation: ref-update race
-//! `FinalizeRefs` performs `get_ref → fast-forward check → put_ref` without
-//! a CAS primitive on `RefRepo`, so two concurrent finalizations on the same
-//! ref can both observe the old tip and both call `put_ref` (last writer
-//! silently wins). The fix requires `RefRepo::compare_and_swap_ref` backed
-//! by an atomic backend op (FDB transaction). Tracked under E06-S02 and the
-//! deferral note on E04-S07. Do not patch around it with an in-process
-//! Mutex — that hides the race rather than detecting it.
+//! Ref updates use `RefRepo::compare_and_swap_ref` after fast-forward
+//! validation, so concurrent finalizations cannot silently overwrite a tip.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -772,12 +766,26 @@ impl SyncService for PushServiceHandler {
                 kind: RefKind::Branch,
                 target: new_vid,
             };
-            match self.state.refs.put_ref(&new_ref) {
-                Ok(()) => {
+            match self.state.refs.compare_and_swap_ref(
+                &upd.ref_name,
+                current_remote.as_ref().map(|r| &r.target),
+                &new_ref,
+            ) {
+                Ok(true) => {
                     results.push(RefUpdateResult {
                         ref_name: upd.ref_name.clone(),
                         status: "ok".into(),
                         message: String::new(),
+                    });
+                }
+                Ok(false) => {
+                    results.push(RefUpdateResult {
+                        ref_name: upd.ref_name.clone(),
+                        status: "non-fast-forward".into(),
+                        message: format!(
+                            "remote tip moved while finalizing '{}'",
+                            upd.ref_name
+                        ),
                     });
                 }
                 Err(e) => {

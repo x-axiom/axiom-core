@@ -762,6 +762,36 @@ impl RefRepo for SqliteMetadataStore {
         Ok(())
     }
 
+    fn compare_and_swap_ref(
+        &self,
+        name: &str,
+        expected_old: Option<&VersionId>,
+        new_ref: &Ref,
+    ) -> CasResult<bool> {
+        let conn = self.conn.lock();
+        let kind = match new_ref.kind {
+            RefKind::Branch => "branch",
+            RefKind::Tag => "tag",
+        };
+
+        let changed = if let Some(expected) = expected_old {
+            conn.execute(
+                "UPDATE refs SET kind = ?1, target = ?2
+                 WHERE name = ?3 AND target = ?4 AND kind != 'tag'",
+                params![kind, new_ref.target.as_str(), name, expected.as_str()],
+            )
+        } else {
+            conn.execute(
+                "INSERT INTO refs (name, kind, target) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(name) DO NOTHING",
+                params![name, kind, new_ref.target.as_str()],
+            )
+        }
+        .map_err(|e| CasError::Store(e.to_string()))?;
+
+        Ok(changed == 1)
+    }
+
     fn get_ref(&self, name: &str) -> CasResult<Option<Ref>> {
         let conn = self.conn.lock();
         let mut stmt = conn
