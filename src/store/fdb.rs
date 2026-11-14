@@ -59,7 +59,9 @@ use foundationdb::options::StreamingMode;
 
 use crate::error::{CasError, CasResult};
 use crate::model::{ChunkHash, NodeEntry, Ref, RefKind, TreeNode, VersionId, VersionNode};
-use super::traits::{PathEntry, PathIndexRepo, NodeStore, RefRepo, TreeStore, VersionRepo};
+use super::traits::{
+    NodeStore, PathEntry, PathIndexRepo, RefRepo, TreeStore, VersionRepo, Workspace, WorkspaceRepo,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -113,6 +115,7 @@ pub struct FdbConfig {
 /// [`PathIndexRepo`].  All operations are synchronous from the caller's
 /// perspective; FDB I/O is driven by the FDB network thread, and blocking is
 /// performed via `tokio::runtime::Handle::block_on`.
+#[derive(Clone)]
 pub struct FdbMetadataStore {
     db: Arc<Database>,
     /// Tenant identifier (embedded in every key).
@@ -396,6 +399,23 @@ impl NodeStore for FdbMetadataStore {
 // ---------------------------------------------------------------------------
 
 impl VersionRepo for FdbMetadataStore {
+    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
+        let prefix = self.make_key("ver", "");
+        let end = Self::prefix_end(&prefix);
+        let pairs = self.range_scan(prefix.clone(), end)?;
+        let mut ids = Vec::with_capacity(pairs.len());
+        for (key, _value) in pairs {
+            if key.len() <= prefix.len() {
+                continue;
+            }
+            match String::from_utf8(key[prefix.len()..].to_vec()) {
+                Ok(id) if !id.is_empty() => ids.push(VersionId(id)),
+                _ => tracing::warn!("FDB: skipping malformed version key"),
+            }
+        }
+        Ok(ids)
+    }
+
     fn put_version(&self, version: &VersionNode) -> CasResult<()> {
         self.put_json("ver", version.id.as_str(), version)
     }
@@ -429,6 +449,78 @@ impl VersionRepo for FdbMetadataStore {
 // ---------------------------------------------------------------------------
 // RefRepo
 // ---------------------------------------------------------------------------
+
+impl WorkspaceRepo for FdbMetadataStore {
+    fn create_workspace(&self, ws: &Workspace) -> CasResult<()> {
+        if self.get_workspace(&ws.id)?.is_some() {
+            return Err(CasError::AlreadyExists);
+        }
+        self.put_json("ws", &ws.id, ws)
+    }
+
+    fn get_workspace(&self, id: &str) -> CasResult<Option<Workspace>> {
+        self.get_json("ws", id)
+    }
+
+    fn list_workspaces(&self) -> CasResult<Vec<Workspace>> {
+        let mut workspaces = self.scan_workspaces()?;
+        workspaces.retain(|w| w.deleted_at.is_none());
+        workspaces.sort_by_key(|w| w.created_at);
+        Ok(workspaces)
+    }
+
+    fn delete_workspace(&self, id: &str) -> CasResult<()> {
+        self.delete_key("ws", id)
+    }
+
+    fn update_workspace(&self, ws: &Workspace) -> CasResult<()> {
+        self.put_json("ws", &ws.id, ws)
+    }
+
+    fn soft_delete_workspace(&self, id: &str, deleted_at: u64) -> CasResult<()> {
+        let Some(mut ws) = self.get_workspace(id)? else {
+            return Ok(());
+        };
+        if ws.deleted_at.is_some() {
+            return Ok(());
+        }
+        ws.deleted_at = Some(deleted_at);
+        self.put_json("ws", &ws.id, &ws)
+    }
+
+    fn restore_workspace(&self, id: &str) -> CasResult<()> {
+        let Some(mut ws) = self.get_workspace(id)? else {
+            return Ok(());
+        };
+        ws.deleted_at = None;
+        self.put_json("ws", &ws.id, &ws)
+    }
+
+    fn list_deleted_workspaces(&self) -> CasResult<Vec<Workspace>> {
+        let mut workspaces = self.scan_workspaces()?;
+        workspaces.retain(|w| w.deleted_at.is_some());
+        workspaces.sort_by_key(|w| w.deleted_at);
+        Ok(workspaces)
+    }
+}
+
+impl FdbMetadataStore {
+    /// Scan every workspace record in this tenant/workspace subspace.
+    fn scan_workspaces(&self) -> CasResult<Vec<Workspace>> {
+        let start = self.make_key("ws", "");
+        let end = Self::prefix_end(&start);
+        let pairs = self.range_scan(start, end)?;
+
+        let mut out = Vec::with_capacity(pairs.len());
+        for (_k, v) in pairs {
+            match serde_json::from_slice::<Workspace>(&v) {
+                Ok(ws) => out.push(ws),
+                Err(e) => tracing::warn!(error = %e, "FDB: skipping malformed workspace entry"),
+            }
+        }
+        Ok(out)
+    }
+}
 
 impl RefRepo for FdbMetadataStore {
     fn put_ref(&self, r: &Ref) -> CasResult<()> {

@@ -1,0 +1,7 @@
+target
+.git
+.github
+.axiom
+docs
+*.log
+.DS_Store

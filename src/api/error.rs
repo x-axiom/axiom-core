@@ -10,9 +10,13 @@ use serde::Serialize;
 use crate::error::CasError;
 
 /// Structured error response body.
+///
+/// `code` is the stable, machine-readable identifier (also mirrored into
+/// `error` for backwards compatibility); `message` is human-readable.
 #[derive(Serialize)]
 pub struct ErrorResponse {
     pub error: String,
+    pub code: String,
     pub message: String,
 }
 
@@ -35,6 +39,7 @@ impl IntoResponse for ApiError {
             CasError::InvalidRef(_) => (StatusCode::BAD_REQUEST, "invalid_ref"),
             CasError::Store(_) => (StatusCode::INTERNAL_SERVER_ERROR, "store_error"),
             CasError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            CasError::TokenExpired(_) => (StatusCode::UNAUTHORIZED, "token_expired"),
             CasError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             CasError::TenantNotFound(_) => (StatusCode::NOT_FOUND, "tenant_not_found"),
             CasError::WorkspaceNotFound(_) => (StatusCode::NOT_FOUND, "workspace_not_found"),
@@ -48,6 +53,7 @@ impl IntoResponse for ApiError {
 
         let body = ErrorResponse {
             error: error_type.to_string(),
+            code: error_type.to_string(),
             message: self.0.to_string(),
         };
 

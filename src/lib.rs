@@ -11,6 +11,10 @@ pub mod working_tree;
 pub mod api;
 pub mod sync;
 
+/// gRPC sync server bootstrap (cloud mode).
+#[cfg(feature = "cloud")]
+pub mod grpc;
+
 // Keep legacy modules for backward compatibility during transition.
 pub mod cas;
 pub mod version;

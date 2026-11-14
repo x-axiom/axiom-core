@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::auth::service::AuthService;
 use crate::store::traits::{
     ChunkStore, NodeStore, PathIndexRepo, RefRepo, TreeStore, VersionRepo,
     WorkspaceRepo,
@@ -10,8 +11,14 @@ use crate::tenant::TenantDirectory;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpAuthMode {
+    /// No authentication (local single-user / desktop embedding).
     Disabled,
+    /// Trust identity headers injected by axiom-gateway after JWT verification.
     TrustedGatewayHeaders,
+    /// Verify `Authorization: Bearer <access token>` directly with the auth
+    /// service. Used when core is reachable without a gateway (dev) or as
+    /// defence-in-depth behind one.
+    Jwt,
 }
 
 /// Shared application state available to all route handlers.
@@ -38,6 +45,8 @@ pub struct AppState {
     pub tenant_directory: Option<Arc<dyn TenantDirectory>>,
     /// HTTP auth integration mode for protected REST routes.
     pub http_auth_mode: HttpAuthMode,
+    /// Login / token-issuing service. `None` disables `/auth/*`.
+    pub auth: Option<Arc<AuthService>>,
 }
 
 impl AppState {
@@ -69,6 +78,7 @@ impl AppState {
             workspaces: Some(meta),
             tenant_directory: None,
             http_auth_mode: HttpAuthMode::Disabled,
+            auth: None,
         }
     }
 
@@ -84,6 +94,7 @@ impl AppState {
             workspaces: None,
             tenant_directory: None,
             http_auth_mode: HttpAuthMode::Disabled,
+            auth: None,
         }
     }
 
@@ -101,10 +112,11 @@ impl AppState {
             nodes: fdb.clone(),
             versions: fdb.clone(),
             refs: fdb.clone(),
-            path_index: fdb,
-            workspaces: None,
+            path_index: fdb.clone(),
+            workspaces: Some(fdb),
             tenant_directory: None,
             http_auth_mode: HttpAuthMode::TrustedGatewayHeaders,
+            auth: None,
         }
     }
 
@@ -137,6 +149,7 @@ impl AppState {
             workspaces: None,
             tenant_directory: None,
             http_auth_mode: HttpAuthMode::TrustedGatewayHeaders,
+            auth: None,
         }
     }
 
@@ -147,6 +160,25 @@ impl AppState {
 
     pub fn with_tenant_directory(mut self, tenant_directory: Arc<dyn TenantDirectory>) -> Self {
         self.tenant_directory = Some(tenant_directory);
+        self
+    }
+
+    /// Attach the workspace repository (cloud mode wires the FDB store).
+    pub fn with_workspaces(mut self, workspaces: Arc<dyn WorkspaceRepo>) -> Self {
+        self.workspaces = Some(workspaces);
+        self
+    }
+
+    /// Attach the auth service and enable `/auth/*` routes.
+    ///
+    /// The auth service's tenant directory becomes the state's directory when
+    /// none is configured, so login and workspace APIs always agree on the
+    /// caller's organization.
+    pub fn with_auth(mut self, auth: Arc<AuthService>) -> Self {
+        if self.tenant_directory.is_none() {
+            self.tenant_directory = Some(auth.directory());
+        }
+        self.auth = Some(auth);
         self
     }
 }

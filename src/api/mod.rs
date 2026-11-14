@@ -13,7 +13,7 @@ use axum::response::Html;
 use axum::routing::get;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::auth::middleware::TrustedGatewayAuthLayer;
+use crate::auth::middleware::{JwtAuthLayer, TrustedGatewayAuthLayer};
 use crate::telemetry;
 
 use state::{AppState, HttpAuthMode};
@@ -38,12 +38,27 @@ pub fn build_router(state: AppState) -> Router {
     let protected_api = match state.http_auth_mode {
         HttpAuthMode::Disabled => protected_api,
         HttpAuthMode::TrustedGatewayHeaders => {
-            protected_api.layer(TrustedGatewayAuthLayer::new())
+            let secret = std::env::var("AXIOM_GATEWAY_SECRET").ok();
+            if secret.is_none() {
+                tracing::warn!(
+                    "AXIOM_GATEWAY_SECRET is not set; identity headers are trusted without proof of origin"
+                );
+            }
+            protected_api.layer(TrustedGatewayAuthLayer::with_secret(secret))
+        }
+        HttpAuthMode::Jwt => {
+            let auth = state
+                .auth
+                .clone()
+                .expect("HttpAuthMode::Jwt requires an attached AuthService");
+            protected_api.layer(JwtAuthLayer::new(auth))
         }
     };
 
     Router::new()
         .merge(routes::health::router())
+        // Auth endpoints must stay reachable without a token.
+        .merge(crate::auth::routes::router())
         .merge(protected_api)
         .layer(cors)
         .layer(axum::middleware::from_fn(telemetry::observe_http_request))

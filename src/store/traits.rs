@@ -69,6 +69,16 @@ pub trait VersionRepo: Send + Sync {
     /// List version history starting from a given version, walking parents.
     /// Returns up to `limit` versions in reverse chronological order.
     fn list_history(&self, from: &VersionId, limit: usize) -> CasResult<Vec<VersionNode>>;
+
+    /// Enumerate every version id in this repository.
+    ///
+    /// Backends that cannot scan versions leave the default, which fails loudly
+    /// instead of silently returning an empty set.
+    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
+        Err(crate::error::CasError::Store(
+            "list_all_version_ids is not supported by this backend".into(),
+        ))
+    }
 }
 
 /// Repository for branch and tag refs.
@@ -175,13 +185,21 @@ pub trait SyncStore: Send + Sync {
     }
 
     /// Return every version id known to this store.
-    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>>;
+    ///
+    /// Used by the sync graph walker and GC. Backends that cannot enumerate
+    /// versions cheaply may leave the default, which reports a clear error
+    /// rather than silently returning an empty set.
+    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
+        Err(crate::error::CasError::Store(
+            "list_all_version_ids is not supported by this backend".into(),
+        ))
+    }
 }
 
 /// A workspace record. Workspaces are logical containers used by the SaaS
 /// product for multi-tenant isolation; in Phase 0 (single-user local mode)
 /// only the seeded `default` workspace is meaningful.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Workspace {
     pub id: String,
     pub name: String,

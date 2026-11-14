@@ -47,10 +47,9 @@ use tower::{Layer, Service};
 use crate::auth::rbac::AuthContext;
 use crate::tenant::model::Role;
 
-#[cfg(feature = "fdb")]
-use crate::auth::jwt::JwtService;
-#[cfg(feature = "fdb")]
 use std::sync::Arc;
+
+use crate::auth::jwt::JwtService;
 
 // ---------------------------------------------------------------------------
 // Helper: parse a role string from a JWT claim
@@ -113,11 +112,20 @@ fn role_level(r: &Role) -> u8 {
 /// - `x-org-id`
 /// - `x-roles` (comma-separated) or `x-role`
 #[derive(Clone, Default)]
-pub struct TrustedGatewayAuthLayer;
+pub struct TrustedGatewayAuthLayer {
+    /// Shared secret the gateway must present. `None` disables the check
+    /// (local/dev only).
+    secret: Option<String>,
+}
 
 impl TrustedGatewayAuthLayer {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Require `x-axiom-gateway-secret` to match `secret`.
+    pub fn with_secret(secret: Option<String>) -> Self {
+        Self { secret }
     }
 }
 
@@ -125,13 +133,17 @@ impl<S> Layer<S> for TrustedGatewayAuthLayer {
     type Service = TrustedGatewayAuthMiddleware<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        TrustedGatewayAuthMiddleware { inner }
+        TrustedGatewayAuthMiddleware {
+            inner,
+            secret: self.secret.clone(),
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct TrustedGatewayAuthMiddleware<S> {
     inner: S,
+    secret: Option<String>,
 }
 
 impl<S> Service<Request<Body>> for TrustedGatewayAuthMiddleware<S>
@@ -148,6 +160,27 @@ where
     }
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+        // Prove the request traversed the gateway before trusting any header.
+        if let Some(expected) = &self.secret {
+            let presented = req
+                .headers()
+                .get("x-axiom-gateway-secret")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !constant_time_eq(expected.as_bytes(), presented.as_bytes()) {
+                let resp = (
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({
+                        "error": "untrusted_proxy",
+                        "code": "untrusted_proxy",
+                        "message": "request did not come through the API gateway"
+                    })),
+                )
+                    .into_response();
+                return Box::pin(async move { Ok(resp) });
+            }
+        }
+
         match extract_trusted_auth_context(req.headers()) {
             Err(resp) => Box::pin(async move { Ok(resp) }),
             Ok(ctx) => {
@@ -227,19 +260,16 @@ fn extract_trusted_auth_context(
 ///     .route_layer(AuthLayer::new(jwt))
 /// ```
 #[derive(Clone)]
-#[cfg(feature = "fdb")]
 pub struct AuthLayer {
     jwt: Arc<JwtService>,
 }
 
-#[cfg(feature = "fdb")]
 impl AuthLayer {
     pub fn new(jwt: Arc<JwtService>) -> Self {
         Self { jwt }
     }
 }
 
-#[cfg(feature = "fdb")]
 impl<S> Layer<S> for AuthLayer {
     type Service = AuthMiddleware<S>;
 
@@ -257,13 +287,11 @@ impl<S> Layer<S> for AuthLayer {
 
 /// Tower [`Service`] that verifies the JWT and injects [`AuthContext`].
 #[derive(Clone)]
-#[cfg(feature = "fdb")]
 pub struct AuthMiddleware<S> {
     inner: S,
     jwt: Arc<JwtService>,
 }
 
-#[cfg(feature = "fdb")]
 impl<S> Service<Request<Body>> for AuthMiddleware<S>
 where
     S: Service<Request<Body>, Response = Response> + Clone + Send + 'static,
@@ -314,7 +342,6 @@ where
 /// Extract the raw token string from `Authorization: Bearer <token>`.
 ///
 /// Returns `Err(Response)` with a 401 status on any parsing failure.
-#[cfg(feature = "fdb")]
 fn extract_bearer(headers: &axum::http::HeaderMap) -> Result<String, Response> {
     let header_value = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -337,11 +364,112 @@ fn extract_bearer(headers: &axum::http::HeaderMap) -> Result<String, Response> {
     Ok(token.to_owned())
 }
 
+/// Compare two byte strings without early exits.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ---------------------------------------------------------------------------
+// JWT AuthLayer (verifies Bearer tokens directly with the auth service)
+// ---------------------------------------------------------------------------
+
+/// Tower [`Layer`] that verifies `Authorization: Bearer <access token>` using
+/// the auth service and injects [`AuthContext`].
+///
+/// Used when core is reachable without axiom-gateway (local dev, direct
+/// deployment) or as defence-in-depth behind the gateway.
+#[derive(Clone)]
+pub struct JwtAuthLayer {
+    auth: std::sync::Arc<crate::auth::service::AuthService>,
+}
+
+impl JwtAuthLayer {
+    pub fn new(auth: std::sync::Arc<crate::auth::service::AuthService>) -> Self {
+        Self { auth }
+    }
+}
+
+impl<S> Layer<S> for JwtAuthLayer {
+    type Service = JwtAuthMiddleware<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        JwtAuthMiddleware {
+            inner,
+            auth: std::sync::Arc::clone(&self.auth),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct JwtAuthMiddleware<S> {
+    inner: S,
+    auth: std::sync::Arc<crate::auth::service::AuthService>,
+}
+
+impl<S> Service<Request<Body>> for JwtAuthMiddleware<S>
+where
+    S: Service<Request<Body>, Response = Response> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+        let auth = std::sync::Arc::clone(&self.auth);
+
+        let token = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned);
+
+        let Some(token) = token else {
+            let resp = crate::api::error::ApiError(crate::error::CasError::Unauthorized(
+                "missing Authorization header".into(),
+            ))
+            .into_response();
+            return Box::pin(async move { Ok(resp) });
+        };
+
+        match auth.verify_access(&token) {
+            Ok(claims) => {
+                let ctx = AuthContext {
+                    user_id: claims.sub,
+                    tenant_id: claims.tenant_id,
+                    org_id: claims.org_id,
+                    role: effective_role(&claims.roles),
+                };
+                req.extensions_mut().insert(ctx);
+                let fut = self.inner.call(req);
+                Box::pin(async move { fut.await })
+            }
+            Err(err) => {
+                let resp = crate::api::error::ApiError(err).into_response();
+                Box::pin(async move { Ok(resp) })
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // gRPC (tonic) interceptor — cloud feature only
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "cloud", feature = "fdb"))]
+#[cfg(feature = "cloud")]
 pub mod grpc {
     //! Tonic interceptor that mirrors the axum JWT middleware for gRPC calls.
 

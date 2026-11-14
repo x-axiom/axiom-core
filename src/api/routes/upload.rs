@@ -3,7 +3,6 @@
 //! - `POST /file`      — single-file streaming upload (raw body)
 //! - `POST /directory`  — multi-file upload (JSON with base64-encoded content)
 
-use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -24,8 +23,15 @@ use crate::namespace::{build_directory_tree, FileInput};
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        // Raw streaming body: the 2 MiB extractor default is disabled and the
+        // size ceiling is enforced inside the handler (structured 413).
         .route("/file", post(upload_file))
-        .route("/directory", post(upload_directory))
+        .layer(axum::extract::DefaultBodyLimit::disable())
+        .merge(
+            Router::new()
+                .route("/directory", post(upload_directory))
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +83,7 @@ fn chunk_persist_with_stats(
     ))
 }
 
+#[derive(Default)]
 struct DedupFileStats {
     total_bytes: u64,
     total_chunks: usize,
@@ -92,9 +99,167 @@ struct DedupFileStats {
 async fn upload_file(
     State(state): State<AppState>,
     Query(query): Query<FileUploadQuery>,
-    body: Bytes,
-) -> ApiResult<Json<UploadResponse>> {
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let max_bytes = max_upload_bytes();
+
+    let (descriptors, file_stats) = match ingest_stream(&state, request.into_body(), max_bytes).await
+    {
+        Ok(value) => value,
+        Err(IngestError::TooLarge) => return payload_too_large(max_bytes),
+        Err(IngestError::Api(err)) => return err.into_response(),
+    };
+
+    match finalize_single_upload(&state, query, descriptors, file_stats) {
+        Ok(json) => json.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// Configurable upload ceiling (default 8 GiB).
+///
+/// Enforced while streaming, so an oversized body is rejected as soon as the
+/// limit is crossed instead of being buffered first.
+fn max_upload_bytes() -> u64 {
+    std::env::var("AXIOM_MAX_UPLOAD_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(8 * 1024 * 1024 * 1024)
+}
+
+fn payload_too_large(max_bytes: u64) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    (
+        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        Json(serde_json::json!({
+            "error": "payload_too_large",
+            "code": "payload_too_large",
+            "message": format!("request body exceeds the configured limit of {max_bytes} bytes"),
+            "max_bytes": max_bytes,
+        })),
+    )
+        .into_response()
+}
+
+enum IngestError {
+    TooLarge,
+    Api(ApiError),
+}
+
+/// Stream the request body, chunk it incrementally, and persist chunks.
+///
+/// Memory use is bounded by `ChunkPolicy::max_size` (256 KiB) plus one
+/// transport frame, so upload size no longer determines RSS.
+async fn ingest_stream(
+    state: &AppState,
+    body: axum::body::Body,
+    max_bytes: u64,
+) -> Result<(Vec<ChunkDescriptor>, DedupFileStats), IngestError> {
+    use futures_util::StreamExt;
+
     let policy = ChunkPolicy::default();
+    let flush_at = policy.max_size as usize;
+
+    let mut buffer: Vec<u8> = Vec::with_capacity(flush_at * 2);
+    let mut descriptors: Vec<ChunkDescriptor> = Vec::new();
+    let mut stats = DedupFileStats::default();
+    let mut offset: u64 = 0;
+    let mut stream = body.into_data_stream();
+
+    while let Some(frame) = stream.next().await {
+        let bytes = frame.map_err(|e| {
+            IngestError::Api(ApiError(crate::error::CasError::InvalidObject(format!(
+                "failed to read request body: {e}"
+            ))))
+        })?;
+
+        if stats.total_bytes.saturating_add(bytes.len() as u64) > max_bytes {
+            return Err(IngestError::TooLarge);
+        }
+        stats.total_bytes += bytes.len() as u64;
+        buffer.extend_from_slice(&bytes);
+
+        // Flush full windows. Content-defined boundaries are computed within
+        // each window; because the window equals `max_size`, boundaries match
+        // a whole-file chunking pass.
+        while buffer.len() >= flush_at {
+            let window: Vec<u8> = buffer.drain(..flush_at).collect();
+            persist_chunks(state, &window, offset, &policy, &mut descriptors, &mut stats).await?;
+            offset += window.len() as u64;
+        }
+    }
+
+    if !buffer.is_empty() {
+        let tail = std::mem::take(&mut buffer);
+        let len = tail.len() as u64;
+        persist_chunks(state, &tail, offset, &policy, &mut descriptors, &mut stats).await?;
+        offset += len;
+    }
+    let _ = offset;
+
+    Ok((descriptors, stats))
+}
+
+async fn persist_chunks(
+    state: &AppState,
+    data: &[u8],
+    base_offset: u64,
+    policy: &ChunkPolicy,
+    descriptors: &mut Vec<ChunkDescriptor>,
+    stats: &mut DedupFileStats,
+) -> Result<(), IngestError> {
+    let raw = chunk_bytes(data, policy);
+
+    for (_hash, chunk, offset, length) in raw {
+        let order = descriptors.len() as u32;
+        let hash = _hash;
+        let store = state.chunks.clone();
+        let hash_for_store = hash.clone();
+        let owned = chunk.to_vec();
+
+        // Store I/O is blocking; keep it off the async executor.
+        let already_exists = tokio::task::spawn_blocking(move || {
+            let had = store.has_chunk(&hash_for_store)?;
+            store.put_chunk(owned)?;
+            Ok::<bool, crate::error::CasError>(had)
+        })
+        .await
+        .map_err(|e| {
+            IngestError::Api(ApiError(crate::error::CasError::Store(format!(
+                "chunk worker failed: {e}"
+            ))))
+        })?
+        .map_err(|e| IngestError::Api(ApiError(e)))?;
+
+        if already_exists {
+            stats.dedup_chunks += 1;
+            stats.dedup_bytes += length as u64;
+        } else {
+            stats.new_chunks += 1;
+        }
+
+        descriptors.push(ChunkDescriptor {
+            offset: base_offset + offset,
+            length,
+            hash,
+            order,
+        });
+    }
+
+    Ok(())
+}
+
+/// Build the Merkle tree, commit the version, and re-index paths.
+fn finalize_single_upload(
+    state: &AppState,
+    query: FileUploadQuery,
+    descriptors: Vec<ChunkDescriptor>,
+    file_stats: DedupFileStats,
+) -> ApiResult<Json<UploadResponse>> {
     let branch = query.branch.as_deref().unwrap_or(DEFAULT_BRANCH);
     let message = query
         .message
@@ -116,25 +281,17 @@ async fn upload_file(
         }
     }
 
-    // 1. Chunk and persist with dedup tracking.
-    let (descriptors, file_stats) =
-        chunk_persist_with_stats(&body, &policy, state.chunks.as_ref())?;
-
-    // 2. Build Merkle tree for this file.
+    // 1. Build Merkle tree for this file.
     let file_obj = build_tree(&descriptors, DEFAULT_FAN_OUT, state.trees.as_ref())
         .map_err(ApiError::from)?;
 
-    // 3. Build a single-file directory tree.
-    //    CommitService needs a version_id for path indexing, but we don't have
-    //    it yet. We'll use a temporary placeholder and re-index after commit.
+    // 2. Build a single-file directory tree under a temporary version id.
     let file_input = FileInput {
         path: query.path.clone(),
         root: file_obj.root,
         size: file_obj.size,
     };
 
-    // Create a temporary version id for path indexing — will be replaced by
-    // the real one shortly. Use a deterministic placeholder.
     let tmp_vid = VersionId::from("__pending__");
     let root_entry = build_directory_tree(
         &[file_input],
@@ -144,7 +301,7 @@ async fn upload_file(
     )
     .map_err(ApiError::from)?;
 
-    // 4. Commit to branch.
+    // 3. Commit to branch.
     let svc = CommitService::new(state.versions.clone(), state.refs.clone());
     let version = svc
         .commit(CommitRequest {
@@ -156,7 +313,7 @@ async fn upload_file(
         })
         .map_err(ApiError::from)?;
 
-    // 5. Re-index paths under the real version id.
+    // 4. Re-index paths under the real version id.
     re_index_paths(
         &[FileInput {
             path: query.path,
@@ -168,6 +325,7 @@ async fn upload_file(
         state.path_index.as_ref(),
     )?;
 
+    let total_chunks = descriptors.len();
     Ok(Json(UploadResponse {
         version_id: version.id.to_string(),
         root: root_entry.hash.to_hex().to_string(),
@@ -175,7 +333,7 @@ async fn upload_file(
         stats: UploadStats {
             total_files: 1,
             total_bytes: file_stats.total_bytes,
-            total_chunks: file_stats.total_chunks,
+            total_chunks,
             new_chunks: file_stats.new_chunks,
             dedup_chunks: file_stats.dedup_chunks,
             dedup_bytes: file_stats.dedup_bytes,

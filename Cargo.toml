@@ -9,7 +9,7 @@ local = ["dep:rocksdb", "dep:rusqlite"]
 cloud = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:zstd", "dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types", "dep:md-5", "dep:bytes", "dep:fred"]
 # FoundationDB backend — requires the FDB client library to be installed.
 # brew install foundationdb  (macOS) or the package for your distro.
-fdb = ["dep:foundationdb", "dep:uuid", "dep:jsonwebtoken", "dep:ed25519-dalek", "dep:rand"]
+fdb = ["dep:foundationdb"]
 full = ["local", "cloud"]
 
 [dependencies]
@@ -47,10 +47,12 @@ aws-credential-types = { version = "1", optional = true }
 md-5 = { version = "0.10", optional = true }
 bytes = { version = "1", optional = true }
 foundationdb = { version = "0.9", features = ["embedded-fdb-include", "fdb-7_3"], optional = true }
-uuid = { version = "1", features = ["v4", "serde"], optional = true }
-jsonwebtoken = { version = "9", optional = true }
-ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"], optional = true }
-rand = { version = "0.8", optional = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+jsonwebtoken = "9"
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
+rand = "0.8"
+# Outbound HTTPS for GitHub OAuth token verification (P0-1).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 fred = { version = "9", optional = true }
 prometheus = "0.13"
 keyring = "3"
@@ -61,7 +63,6 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
-reqwest = { version = "0.12", features = ["json"] }
 tokio-test = "0.4"
 tokio-stream = { version = "0.1", features = ["net"] }
 testcontainers-modules = { version = "0.15", features = ["minio", "redis"] }

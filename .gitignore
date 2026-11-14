@@ -1,6 +1,4 @@
 /target/
-/docs
-/.github
 
 # macOS
 .DS_Store

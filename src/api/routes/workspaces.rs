@@ -80,11 +80,46 @@ fn tenant_directory(state: &AppState) -> ApiResult<&dyn TenantDirectory> {
         .ok_or_else(|| ApiError(CasError::Store("tenant API unavailable for this backend".into())))
 }
 
-fn load_workspace(state: &AppState, workspace_id: &str) -> ApiResult<Workspace> {
-    workspace_repo(state)?
+/// Organization recorded in a workspace's metadata (set at creation).
+fn workspace_org(workspace: &Workspace) -> Option<String> {
+    serde_json::from_str::<Value>(&workspace.metadata)
+        .ok()
+        .and_then(|v| v.get("org_id")?.as_str().map(str::to_owned))
+}
+
+/// Load a workspace and enforce organization scoping.
+///
+/// This is the **only** path allowed to resolve a workspace for reads: it
+/// prevents cross-tenant access (IDOR) by rejecting any workspace whose
+/// recorded `org_id` differs from the caller's token.
+fn load_workspace(
+    state: &AppState,
+    auth: Option<&AuthContext>,
+    workspace_id: &str,
+) -> ApiResult<Workspace> {
+    let workspace = workspace_repo(state)?
         .get_workspace(workspace_id)
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError(CasError::WorkspaceNotFound(workspace_id.to_owned())))
+        .ok_or_else(|| ApiError(CasError::WorkspaceNotFound(workspace_id.to_owned())))?;
+
+    if state.http_auth_mode != crate::api::state::HttpAuthMode::Disabled {
+        let auth = require_auth(auth)?;
+        match workspace_org(&workspace) {
+            Some(org) if org == auth.org_id => {}
+            Some(_) => {
+                return Err(ApiError(CasError::Forbidden(format!(
+                    "workspace '{workspace_id}' is outside current org scope"
+                ))));
+            }
+            None => {
+                return Err(ApiError(CasError::Forbidden(format!(
+                    "workspace '{workspace_id}' has no organization scope"
+                ))));
+            }
+        }
+    }
+
+    Ok(workspace)
 }
 
 fn current_unix_secs() -> u64 {
@@ -129,6 +164,13 @@ fn workspace_head_selector(state: &AppState, workspace: &Workspace) -> ApiResult
     }
     if let Some(ref_name) = &workspace.current_ref {
         return Ok(Some(ref_name.clone()));
+    }
+
+    // Workspace-scoped ref used by cloud sync (`ws/<id>/main`). Present once a
+    // client has pushed into this workspace.
+    let scoped = format!("ws/{}/main", workspace.id);
+    if state.refs.get_ref(&scoped).map_err(ApiError::from)?.is_some() {
+        return Ok(Some(scoped));
     }
 
     // Phase 0 bridge: old single-user data lives on the global `main` ref.
@@ -411,10 +453,32 @@ async fn create_workspace(
                 return Err(ApiError(CasError::AlreadyExists));
             }
 
-            let workspace = directory
+            let tenant_workspace = directory
                 .create_workspace(&org_id, name, 0)
                 .map_err(ApiError::from)?;
-            return Ok(Json(tenant_workspace_to_summary(workspace)));
+
+            // Mirror into the data-plane repository so browse/versions/diff can
+            // resolve the workspace, carrying its org scope for authorization.
+            if let Some(repo) = state.workspaces.as_deref() {
+                let mirrored = Workspace {
+                    id: tenant_workspace.id.0.clone(),
+                    name: name.to_owned(),
+                    created_at: tenant_workspace.created_at,
+                    metadata: serde_json::json!({ "org_id": auth.org_id }).to_string(),
+                    local_path: None,
+                    current_ref: None,
+                    current_version: None,
+                    deleted_at: None,
+                };
+                if let Err(err) = repo.create_workspace(&mirrored) {
+                    // Roll back the tenant record so the two stores stay aligned.
+                    let _ = directory
+                        .delete_workspace(&tenant_workspace.id, &org_id);
+                    return Err(ApiError::from(err));
+                }
+            }
+
+            return Ok(Json(tenant_workspace_to_summary(tenant_workspace)));
         }
     }
 
@@ -425,10 +489,16 @@ async fn create_workspace(
     }
 
     let created_at = current_unix_secs();
-    let metadata = match req.description.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-        Some(description) => serde_json::json!({ "description": description }).to_string(),
-        None => "{}".to_owned(),
-    };
+    let mut metadata = serde_json::Map::new();
+    if let Some(description) = req.description.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        metadata.insert("description".into(), description.into());
+    }
+    if state.http_auth_mode != crate::api::state::HttpAuthMode::Disabled {
+        if let Some(auth) = auth.as_ref() {
+            metadata.insert("org_id".into(), auth.org_id.clone().into());
+        }
+    }
+    let metadata = Value::Object(metadata).to_string();
     let workspace = Workspace {
         id: generate_workspace_id(name, created_at),
         name: name.to_owned(),
@@ -463,6 +533,9 @@ async fn delete_workspace(
             tenant_directory(&state)?
                 .delete_workspace(&WorkspaceId::from(workspace_id.as_str()), &workspace.org_id)
                 .map_err(ApiError::from)?;
+            if let Some(repo) = state.workspaces.as_deref() {
+                repo.delete_workspace(&workspace_id).map_err(ApiError::from)?;
+            }
             return Ok(StatusCode::NO_CONTENT);
         }
     }
@@ -591,7 +664,7 @@ async fn list_tree_root(
 ) -> ApiResult<Json<Vec<WorkspaceTreeEntryResponse>>> {
     let auth = auth_context(auth);
     ensure_permission(&state, auth.as_ref(), Permission::Read)?;
-    list_tree_impl(&state, &workspace_id, "").map(Json)
+    list_tree_impl(&state, auth.as_ref(), &workspace_id, "").map(Json)
 }
 
 async fn list_tree_at_path(
@@ -601,15 +674,16 @@ async fn list_tree_at_path(
 ) -> ApiResult<Json<Vec<WorkspaceTreeEntryResponse>>> {
     let auth = auth_context(auth);
     ensure_permission(&state, auth.as_ref(), Permission::Read)?;
-    list_tree_impl(&state, &workspace_id, &path).map(Json)
+    list_tree_impl(&state, auth.as_ref(), &workspace_id, &path).map(Json)
 }
 
 fn list_tree_impl(
     state: &AppState,
+    auth: Option<&AuthContext>,
     workspace_id: &str,
     path: &str,
 ) -> ApiResult<Vec<WorkspaceTreeEntryResponse>> {
-    let workspace = load_workspace(state, workspace_id)?;
+    let workspace = load_workspace(state, auth, workspace_id)?;
     let Some(selector) = workspace_head_selector(state, &workspace)? else {
         return Ok(Vec::new());
     };
@@ -634,7 +708,7 @@ async fn download_workspace_file(
 ) -> Result<axum::response::Response, ApiError> {
     let auth = auth_context(auth);
     ensure_permission(&state, auth.as_ref(), Permission::Read)?;
-    let workspace = load_workspace(&state, &workspace_id)?;
+    let workspace = load_workspace(&state, auth.as_ref(), &workspace_id)?;
     let selector = workspace_head_selector(&state, &workspace)?.ok_or_else(|| {
         ApiError(CasError::NotFound(format!(
             "workspace '{}' has no committed files",
@@ -652,7 +726,7 @@ async fn list_versions(
 ) -> ApiResult<Json<WorkspaceVersionPageResponse>> {
     let auth = auth_context(auth);
     ensure_permission(&state, auth.as_ref(), Permission::Read)?;
-    let workspace = load_workspace(&state, &workspace_id)?;
+    let workspace = load_workspace(&state, auth.as_ref(), &workspace_id)?;
     let offset = parse_cursor(query.cursor.as_deref())?;
     let Some(selector) = workspace_head_selector(&state, &workspace)? else {
         return Ok(Json(WorkspaceVersionPageResponse {
@@ -687,7 +761,7 @@ async fn diff_versions(
 ) -> ApiResult<Json<Vec<WorkspaceDiffEntryResponse>>> {
     let auth = auth_context(auth);
     ensure_permission(&state, auth.as_ref(), Permission::Read)?;
-    let _workspace = load_workspace(&state, &workspace_id)?;
+    let _workspace = load_workspace(&state, auth.as_ref(), &workspace_id)?;
     let diff = super::diff::diff_versions_service(&state, &query.from, &query.to)?;
     Ok(Json(
         diff.entries

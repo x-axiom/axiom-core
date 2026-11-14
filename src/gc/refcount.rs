@@ -473,6 +473,7 @@ mod tests {
 
     use crate::model::{ChunkHash, NodeEntry, NodeKind, hash_bytes};
     use crate::store::memory::InMemoryNodeStore;
+    use crate::store::traits::NodeStore;
 
     use super::collect_node_hashes;
 

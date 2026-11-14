@@ -603,6 +603,10 @@ fn hex_to_hash(s: &str) -> CasResult<ChunkHash> {
 // ---------------------------------------------------------------------------
 
 impl VersionRepo for SqliteMetadataStore {
+    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
+        SqliteMetadataStore::list_all_version_ids(self)
+    }
+
     fn put_version(&self, version: &VersionNode) -> CasResult<()> {
         let conn = self.conn.lock();
         let tx = conn

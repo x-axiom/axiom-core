@@ -110,6 +110,10 @@ impl InMemoryVersionRepo {
 }
 
 impl VersionRepo for InMemoryVersionRepo {
+    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
+        Ok(self.versions.read().keys().cloned().collect())
+    }
+
     fn put_version(&self, version: &VersionNode) -> CasResult<()> {
         self.versions.write().insert(version.id.clone(), version.clone());
         Ok(())

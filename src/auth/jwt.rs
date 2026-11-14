@@ -24,11 +24,11 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use foundationdb::Database;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::auth::refresh::{RefreshRecord, RefreshTokenStore};
 use crate::error::{CasError, CasResult};
 
 // ---------------------------------------------------------------------------
@@ -40,7 +40,11 @@ pub const ACCESS_TTL_SECS: u64 = 15 * 60;
 /// Refresh token time-to-live (7 days).
 pub const REFRESH_TTL_SECS: u64 = 7 * 24 * 3600;
 
-/// FDB key prefix for refresh-token records.
+/// OAuth `state` token time-to-live (10 minutes).
+pub const STATE_TTL_SECS: u64 = 10 * 60;
+
+/// FDB key prefix for refresh-token records (kept for compatibility with
+/// records written before the store abstraction was introduced).
 const RT_PREFIX: &str = "rt\x00";
 
 // ---------------------------------------------------------------------------
@@ -75,15 +79,20 @@ struct RefreshClaims {
     exp: u64,
 }
 
-// ---------------------------------------------------------------------------
-// FDB refresh-token record
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize, Deserialize)]
-struct RefreshRecord {
-    user_id: String,
+/// Claims embedded in a short-lived OAuth `state` token.
+#[derive(Debug, Serialize, Deserialize)]
+struct StateClaims {
+    nonce: String,
+    iat: u64,
     exp: u64,
 }
+
+// ---------------------------------------------------------------------------
+// Refresh-token record
+// ---------------------------------------------------------------------------
+
+// `RefreshRecord` lives in `auth::refresh`; the type is imported at the top of
+// this module and used directly.
 
 // ---------------------------------------------------------------------------
 // JWKS
@@ -148,6 +157,25 @@ impl JwtKeyPair {
         Self::from_pem(kid, private_pem.as_bytes(), public_pem.as_bytes(), raw_public_key)
     }
 
+    /// Load a key pair from PEM **files** on disk.
+    ///
+    /// The raw public key required for JWKS export is recovered from the SPKI
+    /// DER structure (last 32 bytes of `PUBLIC KEY`).
+    pub fn from_pem_files(
+        kid: impl Into<String>,
+        private_path: &str,
+        public_path: &str,
+    ) -> CasResult<Self> {
+        let private_pem = std::fs::read(private_path).map_err(|e| {
+            CasError::Store(format!("read JWT private key '{private_path}': {e}"))
+        })?;
+        let public_pem = std::fs::read(public_path).map_err(|e| {
+            CasError::Store(format!("read JWT public key '{public_path}': {e}"))
+        })?;
+        let raw = raw_public_key_from_pem(&public_pem)?;
+        Self::from_pem(kid, &private_pem, &public_pem, raw)
+    }
+
     /// Load a key pair from PEM-encoded private (PKCS8) and public (SPKI) keys.
     ///
     /// `raw_public_key` is the raw 32-byte Ed25519 public key used only for
@@ -189,7 +217,7 @@ impl JwtKeyPair {
 // JwtService
 // ---------------------------------------------------------------------------
 
-/// Issues and verifies JWTs, and manages revocable refresh tokens in FDB.
+/// Issues and verifies JWTs, and manages revocable refresh tokens.
 ///
 /// Thread-safe; wrap in `Arc<JwtService>` to share across axum handlers.
 pub struct JwtService {
@@ -197,8 +225,8 @@ pub struct JwtService {
     keys: Vec<JwtKeyPair>,
     /// Index into `keys` for the current signing key.
     active_idx: usize,
-    /// FDB database for refresh-token storage.
-    db: Arc<Database>,
+    /// Storage for revocable refresh-token records.
+    store: Arc<dyn RefreshTokenStore>,
 }
 
 impl JwtService {
@@ -206,16 +234,38 @@ impl JwtService {
     ///
     /// `active_idx` selects the signing key.  All keys are used for
     /// verification, enabling zero-downtime rotation.
-    pub fn new(keys: Vec<JwtKeyPair>, active_idx: usize, db: Arc<Database>) -> Self {
+    pub fn new(
+        keys: Vec<JwtKeyPair>,
+        active_idx: usize,
+        store: Arc<dyn RefreshTokenStore>,
+    ) -> Self {
         assert!(!keys.is_empty(), "JwtService: keys must not be empty");
         assert!(active_idx < keys.len(), "JwtService: active_idx out of range");
-        Self { keys, active_idx, db }
+        Self { keys, active_idx, store }
     }
 
-    /// Convenience: generate one fresh key pair and build a `JwtService`.
-    pub fn with_generated_key(db: Arc<Database>) -> CasResult<Self> {
+    /// Convenience: generate one fresh key pair with an in-memory refresh store.
+    ///
+    /// Intended for local single-user mode and tests.
+    pub fn with_memory_store() -> CasResult<Self> {
         let kp = JwtKeyPair::generate()?;
-        Ok(Self::new(vec![kp], 0, db))
+        Ok(Self::new(
+            vec![kp],
+            0,
+            Arc::new(crate::auth::refresh::MemoryRefreshTokenStore::new()),
+        ))
+    }
+
+    /// Convenience: generate one fresh key pair backed by FoundationDB
+    /// refresh-token storage.
+    #[cfg(feature = "fdb")]
+    pub fn with_generated_key(db: Arc<foundationdb::Database>) -> CasResult<Self> {
+        let kp = JwtKeyPair::generate()?;
+        Ok(Self::new(
+            vec![kp],
+            0,
+            Arc::new(crate::auth::refresh::FdbRefreshTokenStore::new(db)),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -261,9 +311,10 @@ impl JwtService {
                 Err(e) => {
                     use jsonwebtoken::errors::ErrorKind;
                     match e.kind() {
-                        // Right key but token expired — fail fast.
+                        // Right key but token expired — fail fast and let the
+                        // caller map this to `token_expired` (401).
                         ErrorKind::ExpiredSignature => {
-                            return Err(CasError::Unauthorized("token expired".into()));
+                            return Err(CasError::TokenExpired("access token expired".into()));
                         }
                         // Wrong key — try the next one.
                         ErrorKind::InvalidSignature => continue,
@@ -298,74 +349,90 @@ impl JwtService {
         let token = encode(&header, &claims, &active.encoding_key)
             .map_err(|e| CasError::Store(format!("JWT refresh encode: {e}")))?;
 
-        // Persist in FDB.
+        // Persist the revocation record.
         let record = RefreshRecord { user_id: user_id.to_owned(), exp };
-        let record_bytes = serde_json::to_vec(&record).expect("serialize");
-        let key = rt_key(&jti);
-        let db = Arc::clone(&self.db);
-        Self::rt()?.block_on(db.run(|trx, _| {
-            let key = key.clone();
-            let bytes = record_bytes.clone();
-            async move {
-                trx.set(&key, &bytes);
-                Ok(())
-            }
-        }))
-        .map_err(|e| CasError::Store(format!("FDB refresh store: {e}")))?;
+        self.store.put(&jti, record)?;
 
         Ok(token)
     }
 
     /// Verify a refresh token and **atomically consume** it (single-use).
     ///
-    /// Deletes the FDB record on success; returns the `user_id`.
+    /// Deletes the stored record on success; returns the `user_id`.
     /// Returns [`CasError::Unauthorized`] if expired, revoked, or invalid.
     pub fn verify_and_consume_refresh_token(&self, token: &str) -> CasResult<String> {
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.validate_exp = true;
 
         let claims = self.decode_refresh_claims(token, &validation)?;
-        let key = rt_key(&claims.jti);
 
-        // Read the FDB record.
-        let record_bytes = Self::fdb_get(Arc::clone(&self.db), key.clone())?
+        let record = self
+            .store
+            .take(&claims.jti)?
             .ok_or_else(|| CasError::Unauthorized("refresh token revoked or not found".into()))?;
-        let record: RefreshRecord = serde_json::from_slice(&record_bytes)?;
 
         // Double-check server-side expiry.
         if unix_now() > record.exp {
-            // Lazily clean up the expired record.
-            let _ = self.revoke_refresh_token(&claims.jti);
-            return Err(CasError::Unauthorized("refresh token expired".into()));
+            return Err(CasError::TokenExpired("refresh token expired".into()));
         }
-
-        // Consume: delete from FDB.
-        let db = Arc::clone(&self.db);
-        Self::rt()?.block_on(db.run(|trx, _| {
-            let key = key.clone();
-            async move {
-                trx.clear(&key);
-                Ok(())
-            }
-        }))
-        .map_err(|e| CasError::Store(format!("FDB refresh consume: {e}")))?;
 
         Ok(record.user_id)
     }
 
     /// Revoke a refresh token by its JTI (e.g. on explicit logout).
     pub fn revoke_refresh_token(&self, jti: &str) -> CasResult<()> {
-        let key = rt_key(jti);
-        let db = Arc::clone(&self.db);
-        Self::rt()?.block_on(db.run(|trx, _| {
-            let key = key.clone();
-            async move {
-                trx.clear(&key);
-                Ok(())
+        self.store.revoke(jti)
+    }
+
+    /// Extract the JTI of a refresh token without consuming it.
+    ///
+    /// Used by logout so a caller can present an already-expired access token
+    /// alongside a refresh token and still get deterministic revocation.
+    pub fn refresh_token_jti(&self, token: &str) -> CasResult<String> {
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        // Logout must work even for recently-expired refresh tokens.
+        validation.validate_exp = false;
+        let claims = self.decode_refresh_claims(token, &validation)?;
+        Ok(claims.jti)
+    }
+
+    // -----------------------------------------------------------------------
+    // OAuth state tokens
+    // -----------------------------------------------------------------------
+
+    /// Sign a short-lived OAuth `state` value (CSRF protection without
+    /// server-side session storage).
+    pub fn issue_state_token(&self, nonce: &str) -> CasResult<String> {
+        let now = unix_now();
+        let claims = StateClaims {
+            nonce: nonce.to_owned(),
+            iat: now,
+            exp: now + STATE_TTL_SECS,
+        };
+        let active = &self.keys[self.active_idx];
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(active.kid.clone());
+        encode(&header, &claims, &active.encoding_key)
+            .map_err(|e| CasError::Store(format!("JWT state encode: {e}")))
+    }
+
+    /// Verify an OAuth `state` value produced by [`issue_state_token`].
+    pub fn verify_state_token(&self, token: &str) -> CasResult<()> {
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.validate_exp = true;
+        for kp in &self.keys {
+            match decode::<StateClaims>(token, &kp.decoding_key, &validation) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    use jsonwebtoken::errors::ErrorKind;
+                    if matches!(e.kind(), ErrorKind::ExpiredSignature) {
+                        return Err(CasError::TokenExpired("oauth state expired".into()));
+                    }
+                    continue;
+                }
             }
-        }))
-        .map_err(|e| CasError::Store(format!("FDB revoke: {e}")))?;
-        Ok(())
+        }
+        Err(CasError::Unauthorized("invalid oauth state".into()))
     }
 
     // -----------------------------------------------------------------------
@@ -409,7 +476,6 @@ impl JwtService {
     /// Issue an access token with an explicit expiry timestamp.
     ///
     /// Used in tests to create already-expired tokens without sleeping.
-    #[cfg(test)]
     pub fn issue_access_token_with_exp(
         &self,
         user_id: &str,
@@ -434,24 +500,6 @@ impl JwtService {
         encode(&header, &claims, &active.encoding_key)
             .map_err(|e| CasError::Store(format!("JWT test encode: {e}")))
     }
-
-    fn fdb_get(db: Arc<Database>, key: Vec<u8>) -> CasResult<Option<Vec<u8>>> {
-        Self::rt()?.block_on(async move {
-            let trx = db
-                .create_trx()
-                .map_err(|e| CasError::Store(format!("FDB create_trx: {e}")))?;
-            let v = trx
-                .get(&key, false)
-                .await
-                .map_err(|e| CasError::Store(format!("FDB get: {e}")))?;
-            Ok(v.map(|b| b.to_vec()))
-        })
-    }
-
-    fn rt() -> CasResult<tokio::runtime::Handle> {
-        tokio::runtime::Handle::try_current()
-            .map_err(|e| CasError::Store(format!("JwtService requires a Tokio runtime: {e}")))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,14 +514,41 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// FDB key for a refresh-token record.
+/// FDB key for a refresh-token record (legacy layout, retained for reference).
+#[allow(dead_code)]
 fn rt_key(jti: &str) -> Vec<u8> {
     format!("{RT_PREFIX}{jti}").into_bytes()
 }
 
-/// Wrap DER-encoded bytes in a PEM block using standard base64 (RFC 7468).
-fn der_to_pem(label: &str, der: &[u8]) -> String {
+/// Recover the raw 32-byte Ed25519 public key from a `PUBLIC KEY` PEM (SPKI).
+fn raw_public_key_from_pem(pem: &[u8]) -> CasResult<[u8; 32]> {
     use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let text = std::str::from_utf8(pem)
+        .map_err(|e| CasError::Store(format!("JWT public key is not UTF-8: {e}")))?;
+    let body: String = text
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+    let der = STANDARD
+        .decode(body.trim())
+        .map_err(|e| CasError::Store(format!("JWT public key base64: {e}")))?;
+
+    if der.len() < 32 {
+        return Err(CasError::Store(format!(
+            "JWT public key too short ({} bytes)",
+            der.len()
+        )));
+    }
+
+    let mut raw = [0u8; 32];
+    raw.copy_from_slice(&der[der.len() - 32..]);
+    Ok(raw)
+}
+
+/// Wrap DER-encoded bytes in a PEM block using standard base64 (RFC 7468).
+fn der_to_pem(label: &str, der: &[u8]) -> String {    use base64::{Engine, engine::general_purpose::STANDARD};
     let b64 = STANDARD.encode(der);
     let body = b64
         .as_bytes()

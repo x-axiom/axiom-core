@@ -96,3 +96,55 @@ async fn trusted_gateway_auth_enforces_workspace_rbac() {
         .unwrap();
     assert_eq!(admin_delete.status(), StatusCode::NO_CONTENT);
 }
+// ---------------------------------------------------------------------------
+// P0-8: shared-secret trust boundary
+// ---------------------------------------------------------------------------
+
+/// When `AXIOM_GATEWAY_SECRET` is configured, identity headers are only
+/// honoured for requests that also present the matching secret. This is what
+/// prevents a direct caller (or another pod) from impersonating a user.
+#[tokio::test]
+async fn gateway_secret_is_required_when_configured() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    use axiom_core::auth::middleware::TrustedGatewayAuthLayer;
+
+    fn app(secret: Option<&str>) -> Router {
+        Router::new()
+            .route("/protected", get(|| async { "ok" }))
+            .layer(TrustedGatewayAuthLayer::with_secret(
+                secret.map(str::to_owned),
+            ))
+    }
+
+    fn request(secret: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .uri("/protected")
+            .header("x-user-id", "user-1")
+            .header("x-tenant-id", "tenant-1")
+            .header("x-org-id", "org-1")
+            .header("x-roles", "Owner");
+        if let Some(secret) = secret {
+            builder = builder.header("x-axiom-gateway-secret", secret);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    // No secret configured: identity headers are trusted (local/dev mode).
+    let resp = app(None).oneshot(request(None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // With a configured secret: missing / wrong → 401, correct → 200.
+    let resp = app(Some("s3cret")).oneshot(request(None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app(Some("s3cret")).oneshot(request(Some("wrong"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app(Some("s3cret")).oneshot(request(Some("s3cret"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

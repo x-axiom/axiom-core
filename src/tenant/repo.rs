@@ -23,6 +23,7 @@ use foundationdb::{Database, KeySelector, RangeOption};
 use foundationdb::options::StreamingMode;
 
 use crate::error::{CasError, CasResult};
+use super::AccountContext;
 use super::model::{
     Membership, OrgId, Organization, Plan, Role, Tenant, TenantId, User, UserId,
     Workspace, WorkspaceId,
@@ -102,6 +103,83 @@ impl super::TenantDirectory for TenantRepo {
     fn delete_membership(&self, user_id: &UserId, org_id: &OrgId) -> CasResult<()> {
         TenantRepo::delete_membership(self, user_id, org_id)
     }
+
+    fn list_orgs_of_user(&self, user_id: &UserId) -> CasResult<Vec<OrgId>> {
+        TenantRepo::list_orgs_of_user(self, user_id)
+    }
+
+    fn get_org(&self, id: &OrgId) -> CasResult<Option<Organization>> {
+        TenantRepo::get_org(self, id)
+    }
+
+    fn ensure_account(&self, email: &str, display_name: &str) -> CasResult<AccountContext> {
+        let email = email.trim().to_ascii_lowercase();
+        if email.is_empty() || !email.contains('@') {
+            return Err(CasError::InvalidObject(
+                "account email must be a valid address".into(),
+            ));
+        }
+
+        let user = match TenantRepo::get_user_by_email(self, &email)? {
+            Some(user) => user,
+            None => TenantRepo::create_user(self, &email, display_name)?,
+        };
+
+        // Existing membership → reuse that org (first by creation order).
+        let org_ids = TenantRepo::list_orgs_of_user(self, &user.id)?;
+        if let Some(org_id) = org_ids.first() {
+            let org = TenantRepo::get_org(self, org_id)?.ok_or_else(|| {
+                CasError::Store(format!("org '{}' missing for existing membership", org_id))
+            })?;
+            let role = TenantRepo::get_membership(self, &user.id, org_id)?
+                .map(|m| m.role)
+                .unwrap_or(Role::Member);
+            let workspace = match TenantRepo::list_workspaces_by_org(self, org_id)?
+                .into_iter()
+                .next()
+            {
+                Some(ws) => ws,
+                None => TenantRepo::create_workspace(self, org_id, "Default", 0)?,
+            };
+            return Ok(AccountContext {
+                user,
+                tenant_id: org.tenant_id,
+                org_id: org_id.clone(),
+                role,
+                workspace,
+            });
+        }
+
+        // First login — provision tenant, org, default workspace, owner role.
+        let tenant = TenantRepo::create_tenant(self, &default_tenant_name(&email), Plan::Free)?;
+        let org = TenantRepo::create_org(self, &tenant.id, &default_org_name(&email))?;
+        let workspace = TenantRepo::create_workspace(self, &org.id, "Default", 0)?;
+        TenantRepo::put_membership(self, &user.id, &org.id, Role::Owner)?;
+
+        Ok(AccountContext {
+            user,
+            tenant_id: tenant.id,
+            org_id: org.id,
+            role: Role::Owner,
+            workspace,
+        })
+    }
+}
+
+/// Human-friendly tenant name derived from an email address.
+fn default_tenant_name(email: &str) -> String {
+    let local = email.split('@').next().unwrap_or("account");
+    format!("{local}'s tenant")
+}
+
+/// Human-friendly organization name derived from an email address.
+fn default_org_name(email: &str) -> String {
+    email
+        .split('@')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("workspace")
+        .to_owned()
 }
 
 impl TenantRepo {

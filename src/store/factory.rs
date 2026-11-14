@@ -410,17 +410,28 @@ impl StoreFactory {
                 Ok(client) => {
                     let client = Arc::new(client);
                     let cached_s3 = CachedChunkStore::new(s3, Arc::clone(&client));
+                    let workspace_repo: Arc<dyn crate::store::WorkspaceRepo> =
+                        Arc::new(fdb.clone());
                     let cached_fdb = CachedMetadataStore::new(fdb, Arc::clone(&client));
-                    AppState::cloud_cached(cached_s3, cached_fdb).with_tenant_directory(tenant_repo)
+                    AppState::cloud_cached(cached_s3, cached_fdb)
+                        .with_tenant_directory(tenant_repo)
+                        .with_workspaces(workspace_repo)
                 }
                 Err(e) => {
                     // Cache is best-effort: log and continue without it.
                     tracing::warn!(error = %e, "StoreFactory: cache init failed, running without cache");
-                    AppState::cloud_uncached(s3, fdb).with_tenant_directory(tenant_repo)
+                    let workspace_repo: Arc<dyn crate::store::WorkspaceRepo> =
+                        Arc::new(fdb.clone());
+                    AppState::cloud_uncached(s3, fdb)
+                        .with_tenant_directory(tenant_repo)
+                        .with_workspaces(workspace_repo)
                 }
             }
         } else {
-            AppState::cloud_uncached(s3, fdb).with_tenant_directory(tenant_repo)
+            let workspace_repo: Arc<dyn crate::store::WorkspaceRepo> = Arc::new(fdb.clone());
+            AppState::cloud_uncached(s3, fdb)
+                .with_tenant_directory(tenant_repo)
+                .with_workspaces(workspace_repo)
         })
     }
 
