@@ -43,6 +43,9 @@ pub const REFRESH_TTL_SECS: u64 = 7 * 24 * 3600;
 /// OAuth `state` token time-to-live (10 minutes).
 pub const STATE_TTL_SECS: u64 = 10 * 60;
 
+/// Invitation link time-to-live (7 days).
+pub const INVITATION_TTL_SECS: u64 = 7 * 24 * 3600;
+
 /// FDB key prefix for refresh-token records (kept for compatibility with
 /// records written before the store abstraction was introduced).
 const RT_PREFIX: &str = "rt\x00";
@@ -81,6 +84,17 @@ struct RefreshClaims {
     jti: String,
     iat: u64,
     exp: u64,
+}
+
+/// Claims embedded in an invitation token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvitationClaims {
+    pub org_id: String,
+    pub email: String,
+    pub role: String,
+    pub inviter: String,
+    pub exp: u64,
+    pub jti: String,
 }
 
 /// Claims embedded in a short-lived OAuth `state` token.
@@ -411,6 +425,58 @@ impl JwtService {
         validation.validate_exp = false;
         let claims = self.decode_refresh_claims(token, &validation)?;
         Ok(claims.jti)
+    }
+
+    // -----------------------------------------------------------------------
+    // Invitation tokens
+    // -----------------------------------------------------------------------
+
+    /// Sign an invitation for `email` to join `org_id` with `role`.
+    ///
+    /// Returns the token and its absolute expiry. Tokens are self-contained so
+    /// accepting an invite needs no server-side session table.
+    pub fn issue_invitation(
+        &self,
+        org_id: &str,
+        email: &str,
+        role: &str,
+        inviter: &str,
+    ) -> CasResult<(String, u64)> {
+        let now = unix_now();
+        let exp = now + INVITATION_TTL_SECS;
+        let claims = InvitationClaims {
+            org_id: org_id.to_owned(),
+            email: email.trim().to_ascii_lowercase(),
+            role: role.to_owned(),
+            inviter: inviter.to_owned(),
+            exp,
+            jti: Uuid::new_v4().to_string(),
+        };
+        let active = &self.keys[self.active_idx];
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(active.kid.clone());
+        let token = encode(&header, &claims, &active.encoding_key)
+            .map_err(|e| CasError::Store(format!("JWT invitation encode: {e}")))?;
+        Ok((token, exp))
+    }
+
+    /// Verify an invitation token.
+    pub fn verify_invitation(&self, token: &str) -> CasResult<InvitationClaims> {
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.validate_exp = true;
+        for kp in &self.keys {
+            match decode::<InvitationClaims>(token, &kp.decoding_key, &validation) {
+                Ok(data) => return Ok(data.claims),
+                Err(e) => {
+                    use jsonwebtoken::errors::ErrorKind;
+                    if matches!(e.kind(), ErrorKind::ExpiredSignature) {
+                        return Err(CasError::TokenExpired("invitation expired".into()));
+                    }
+                    continue;
+                }
+            }
+        }
+        Err(CasError::Unauthorized("invalid invitation".into()))
     }
 
     // -----------------------------------------------------------------------

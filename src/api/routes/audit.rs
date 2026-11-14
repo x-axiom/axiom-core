@@ -23,7 +23,7 @@ struct AuditQuery {
 }
 
 fn default_limit() -> usize {
-    100
+    crate::api::pagination::DEFAULT_LIMIT
 }
 
 async fn list_audit(
@@ -44,6 +44,6 @@ async fn list_audit(
         ApiError(CasError::Store("audit log is not available on this backend".into()))
     })?;
 
-    let limit = query.limit.clamp(1, 500);
+    let limit = crate::api::pagination::clamp_limit(query.limit);
     Ok(Json(repo.list(&auth.tenant_id, limit)?))
 }

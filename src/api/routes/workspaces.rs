@@ -275,6 +275,11 @@ fn ensure_member_management_permission(auth: Option<&AuthContext>) -> ApiResult<
 }
 
 #[cfg_attr(not(feature = "fdb"), allow(dead_code))]
+/// Lowercase role name used by the public API.
+fn api_role_name(role: &Role) -> String {
+    format!("{role:?}").to_ascii_lowercase()
+}
+
 fn member_role_from_api(role: &str) -> ApiResult<Role> {
     match role.trim().to_ascii_lowercase().as_str() {
         "owner" => Ok(Role::Owner),
@@ -604,12 +609,27 @@ async fn list_members(
     Ok(Json(members))
 }
 
+/// Result of an invite: either an existing user was added, or a signed
+/// invitation link was created for a new email (P2-6).
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum InviteOutcome {
+    Added(WorkspaceMemberResponse),
+    Invited {
+        status: &'static str,
+        email: String,
+        role: String,
+        invitation_token: String,
+        expires_at: u64,
+    },
+}
+
 async fn invite_member(
     State(state): State<AppState>,
     auth: Option<Extension<AuthContext>>,
     Path(workspace_id): Path<String>,
     Json(req): Json<InviteWorkspaceMemberRequest>,
-) -> ApiResult<Json<WorkspaceMemberResponse>> {
+) -> ApiResult<Json<InviteOutcome>> {
     let auth = auth_context(auth);
     let auth_ctx = ensure_member_management_permission(auth.as_ref())?;
     let workspace = load_tenant_workspace(&state, auth.as_ref(), &workspace_id)?;
@@ -622,31 +642,79 @@ async fn invite_member(
 
     let role = member_role_from_api(&req.role)?;
     let directory = tenant_directory(&state)?;
-    let user = match directory.get_user_by_email(&email).map_err(ApiError::from)? {
-        Some(user) => user,
-        None => directory
-            .create_user(&email, &derive_display_name(&email))
-            .map_err(ApiError::from)?,
-    };
 
-    if directory
-        .get_membership(&user.id, &workspace.org_id)
-        .map_err(ApiError::from)?
-        .is_some()
-    {
-        return Err(ApiError(CasError::AlreadyExists));
+    // Existing account: add the membership immediately (admin action).
+    if let Some(user) = directory.get_user_by_email(&email).map_err(ApiError::from)? {
+        if directory
+            .get_membership(&user.id, &workspace.org_id)
+            .map_err(ApiError::from)?
+            .is_some()
+        {
+            return Err(ApiError(CasError::AlreadyExists));
+        }
+        directory
+            .put_membership(&user.id, &workspace.org_id, role.clone())
+            .map_err(ApiError::from)?;
+        state.record_audit(
+            &auth_ctx.user_id,
+            &auth_ctx.tenant_id,
+            "member.invite",
+            &user.id.0,
+            "ok",
+        );
+        return Ok(Json(InviteOutcome::Added(user_to_member_response(user, role))));
     }
 
-    directory.put_membership(&user.id, &workspace.org_id, role.clone())
+    // New email: never create an account on the inviter's behalf. Issue a
+    // signed invitation the invitee must accept while signed in as that email.
+    let Some(auth_service) = state.auth.as_ref() else {
+        // No auth service (local/dev deployments without identity): fall back
+        // to the legacy behaviour so in-process team management still works.
+        tracing::warn!(
+            email = %email,
+            "auth disabled: creating the invited user directly instead of issuing an invitation"
+        );
+        let user = directory
+            .create_user(&email, &derive_display_name(&email))
+            .map_err(ApiError::from)?;
+        directory
+            .put_membership(&user.id, &workspace.org_id, role.clone())
+            .map_err(ApiError::from)?;
+        state.record_audit(
+            &auth_ctx.user_id,
+            &auth_ctx.tenant_id,
+            "member.invite",
+            &user.id.0,
+            "ok",
+        );
+        return Ok(Json(InviteOutcome::Added(user_to_member_response(user, role))));
+    };
+
+    let (token, expires_at) = auth_service
+        .jwt()
+        .issue_invitation(
+            workspace.org_id.as_str(),
+            &email,
+            &api_role_name(&role),
+            &auth_ctx.user_id,
+        )
         .map_err(ApiError::from)?;
+
     state.record_audit(
         &auth_ctx.user_id,
         &auth_ctx.tenant_id,
-        "member.invite",
-        &user.id.0,
+        "member.invite_pending",
+        &email,
         "ok",
     );
-    Ok(Json(user_to_member_response(user, role)))
+
+    Ok(Json(InviteOutcome::Invited {
+        status: "invited",
+        email,
+        role: api_role_name(&role),
+        invitation_token: token,
+        expires_at,
+    }))
 }
 
 async fn update_member_role(
@@ -802,8 +870,9 @@ async fn list_versions(
         }));
     };
 
-    let page = super::versions::version_history_service(&state, &selector, query.limit, offset)?;
-    let next_cursor = page.has_more.then(|| (offset + query.limit).to_string());
+    let limit = crate::api::pagination::clamp_limit(query.limit);
+    let page = super::versions::version_history_service(&state, &selector, limit, offset)?;
+    let next_cursor = page.has_more.then(|| (offset + limit).to_string());
     Ok(Json(WorkspaceVersionPageResponse {
         items: page
             .versions

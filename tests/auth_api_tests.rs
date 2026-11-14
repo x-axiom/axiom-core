@@ -351,3 +351,79 @@ async fn audit_log_records_login_and_workspace_lifecycle() {
     assert!(!first["tenant_id"].as_str().unwrap().is_empty());
     assert!(first["ts"].as_u64().unwrap() > 0);
 }
+
+// ---------------------------------------------------------------------------
+// P2-6: invitation consent flow
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn invitation_must_be_accepted_by_the_invited_email() {
+    let h = start().await;
+    let owner = dev_login_as(&h, "owner-invite@example.com", "Owner").await;
+    let owner_token = owner["access_token"].as_str().unwrap();
+
+    let ws: Value = reqwest::Client::new()
+        .post(format!("{}/api/v1/workspaces", h.base))
+        .bearer_auth(owner_token)
+        .json(&serde_json::json!({ "name": "invite-ws" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ws_id = ws["id"].as_str().unwrap();
+
+    let invite: Value = reqwest::Client::new()
+        .post(format!("{}/api/v1/workspaces/{ws_id}/members/invite", h.base))
+        .bearer_auth(owner_token)
+        .json(&serde_json::json!({ "email": "invitee@example.com", "role": "member" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(invite["status"], "invited");
+    let token = invite["invitation_token"].as_str().unwrap().to_owned();
+    assert!(invite["expires_at"].as_u64().unwrap() > 0);
+
+    // A different account cannot consume the invitation.
+    let stranger = dev_login_as(&h, "stranger@example.com", "Stranger").await;
+    let denied = reqwest::Client::new()
+        .post(format!("{}/auth/invitations/accept", h.base))
+        .bearer_auth(stranger["access_token"].as_str().unwrap())
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    // The invited email accepts and becomes a member.
+    let invitee = dev_login_as(&h, "invitee@example.com", "Invitee").await;
+    let accepted = reqwest::Client::new()
+        .post(format!("{}/auth/invitations/accept", h.base))
+        .bearer_auth(invitee["access_token"].as_str().unwrap())
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let body: Value = accepted.json().await.unwrap();
+    assert_eq!(body["role"], "member");
+
+    let members: Vec<Value> = reqwest::Client::new()
+        .get(format!("{}/api/v1/workspaces/{ws_id}/members", h.base))
+        .bearer_auth(owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        members.iter().any(|m| m["email"] == "invitee@example.com"),
+        "invitee must appear in the member list: {members:?}"
+    );
+}

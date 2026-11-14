@@ -30,6 +30,7 @@ pub fn router() -> Router<AppState> {
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
         .route("/auth/session", get(session))
+        .route("/auth/invitations/accept", post(accept_invitation))
         .route("/auth/jwks", get(jwks))
         .route("/.well-known/jwks.json", get(jwks))
         .route("/auth/config", get(auth_config))
@@ -87,6 +88,11 @@ pub struct LogoutRequest {
 struct OAuthCallbackQuery {
     code: String,
     state: String,
+}
+
+#[derive(Deserialize)]
+pub struct AcceptInvitationRequest {
+    pub token: String,
 }
 
 #[derive(Serialize)]
@@ -186,6 +192,58 @@ fn redirect_allowed(uri: &str) -> bool {
     std::env::var("AXIOM_GITHUB_REDIRECT_URIS")
         .map(|list| list.split(',').map(str::trim).any(|allowed| allowed == uri))
         .unwrap_or(false)
+}
+
+/// Accept an invitation for the signed-in user (P2-6).
+///
+/// The inviter never creates an account on the invitee's behalf: the invitee
+/// must be signed in with the exact invited email and explicitly accept.
+async fn accept_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AcceptInvitationRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = service(&state)?;
+    let bearer = bearer(&headers)
+        .ok_or_else(|| ApiError(CasError::Unauthorized("missing bearer token".into())))?;
+    let claims = auth.verify_access(&bearer)?;
+    let invite = auth.jwt().verify_invitation(&req.token)?;
+
+    let directory = auth.directory();
+    let user_id = crate::tenant::model::UserId::from(claims.sub.as_str());
+    let user = directory
+        .get_user(&user_id)?
+        .ok_or_else(|| ApiError(CasError::Unauthorized("user no longer exists".into())))?;
+
+    if user.email.to_ascii_lowercase() != invite.email {
+        return Err(ApiError(CasError::Forbidden(
+            "this invitation was issued for a different email address".into(),
+        )));
+    }
+
+    let role = match invite.role.as_str() {
+        "owner" => crate::tenant::model::Role::Owner,
+        "admin" => crate::tenant::model::Role::Admin,
+        "member" => crate::tenant::model::Role::Member,
+        _ => crate::tenant::model::Role::Viewer,
+    };
+
+    let org_id = crate::tenant::model::OrgId::from(invite.org_id.as_str());
+    directory.put_membership(&user.id, &org_id, role.clone())?;
+
+    state.record_audit(
+        &user.id.0,
+        &claims.tenant_id,
+        "member.accept_invite",
+        &invite.org_id,
+        "ok",
+    );
+
+    Ok(Json(serde_json::json!({
+        "status": "accepted",
+        "org_id": invite.org_id,
+        "role": invite.role,
+    })))
 }
 
 async fn jwks(State(state): State<AppState>) -> ApiResult<Json<JwkSet>> {

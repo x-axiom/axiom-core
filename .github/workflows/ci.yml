@@ -35,6 +35,10 @@ jobs:
       # Sync protocol round-trip.
       - run: cargo test --locked --features cloud --test sync_tests
 
+      # The OpenAPI document is part of the contract (P2-5); fail on invalid JSON.
+      - name: Validate OpenAPI document
+        run: python3 -c "import json;json.load(open('openapi/axiom-v1.json'))"
+
       # Cloud backend must type-check (the FDB client is not installed on the
       # runner, so this is a check, not a link).
       - run: cargo check --locked --no-default-features --features "cloud,fdb" --bin axiom-core

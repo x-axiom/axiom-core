@@ -55,6 +55,8 @@ pub struct AppState {
     pub quota: QuotaPolicy,
     /// Security-relevant audit trail. `None` disables persistence (log only).
     pub audit: Option<Arc<dyn AuditRepo>>,
+    /// Browser origins allowed to call the API. Empty means "no cross-origin".
+    pub cors_origins: Vec<String>,
 }
 
 impl AppState {
@@ -90,6 +92,7 @@ impl AppState {
             usage: Some(meta.clone()),
             quota: QuotaPolicy::from_env(),
             audit: Some(meta),
+            cors_origins: default_cors_origins(),
         }
     }
 
@@ -109,6 +112,7 @@ impl AppState {
             usage: Some(Arc::new(crate::quota::MemoryUsageRepo::new())),
             quota: QuotaPolicy::from_env(),
             audit: Some(Arc::new(crate::audit::MemoryAuditRepo::new())),
+            cors_origins: default_cors_origins(),
         }
     }
 
@@ -134,6 +138,7 @@ impl AppState {
             usage: Some(fdb.clone()),
             quota: QuotaPolicy::from_env(),
             audit: Some(fdb),
+            cors_origins: default_cors_origins(),
         }
     }
 
@@ -170,6 +175,7 @@ impl AppState {
             usage: None,
             quota: QuotaPolicy::from_env(),
             audit: None,
+            cors_origins: default_cors_origins(),
         }
     }
 
@@ -207,6 +213,12 @@ impl AppState {
         self
     }
 
+    /// Override the CORS allowlist (tests / per-environment policy).
+    pub fn with_cors_origins(mut self, origins: Vec<String>) -> Self {
+        self.cors_origins = origins;
+        self
+    }
+
     /// Append one audit record, tolerating a missing repository.
     pub fn record_audit(
         &self,
@@ -234,4 +246,36 @@ impl AppState {
         self.auth = Some(auth);
         self
     }
+}
+
+/// Browser origins allowed by default.
+///
+/// Production must configure `AXIOM_CORS_ORIGINS` explicitly; local dev gets
+/// the console and Tauri origins so `npm run dev` keeps working.
+pub fn default_cors_origins() -> Vec<String> {
+    if let Ok(raw) = std::env::var("AXIOM_CORS_ORIGINS") {
+        return raw
+            .split(',')
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+
+    if std::env::var("AXIOM_ENV").as_deref() == Ok("production") {
+        // Fail closed: no allowlist means no cross-origin browser access.
+        return Vec::new();
+    }
+
+    vec![
+        "http://localhost:3000".into(),
+        "http://localhost:3001".into(),
+        "http://localhost:5173".into(),
+        "http://127.0.0.1:3000".into(),
+        "http://127.0.0.1:3001".into(),
+        "http://127.0.0.1:5173".into(),
+        "tauri://localhost".into(),
+        "http://tauri.localhost".into(),
+        "https://tauri.localhost".into(),
+    ]
 }
