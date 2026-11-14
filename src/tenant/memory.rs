@@ -19,6 +19,7 @@ use crate::error::{CasError, CasResult};
 struct Inner {
     users: HashMap<String, User>,
     email_index: HashMap<String, UserId>,
+    tenants: HashMap<String, Tenant>,
     orgs: HashMap<String, Organization>,
     workspaces: HashMap<String, Workspace>,
     /// (user_id, org_id) → role
@@ -228,17 +229,26 @@ impl TenantDirectory for MemoryTenantDirectory {
                 Some(ws) => ws,
                 None => self.create_workspace(org_id, "Default", 0)?,
             };
+            let plan = self
+                .inner
+                .read()
+                .tenants
+                .get(org.tenant_id.as_str())
+                .map(|t| t.plan.clone())
+                .unwrap_or_default();
             return Ok(AccountContext {
                 user,
                 tenant_id: org.tenant_id,
                 org_id: org_id.clone(),
                 role,
                 workspace,
+                plan,
             });
         }
 
         let mut inner = self.inner.write();
         let tenant = Tenant::new(format!("{email} tenant"), Plan::Free);
+        inner.tenants.insert(tenant.id.0.clone(), tenant.clone());
         let org = Organization::new(tenant.id.clone(), email.clone());
         inner.orgs.insert(org.id.0.clone(), org.clone());
         inner.user_orgs.insert(user.id.0.clone(), vec![org.id.0.clone()]);
@@ -262,6 +272,7 @@ impl TenantDirectory for MemoryTenantDirectory {
             org_id: org.id,
             role: Role::Owner,
             workspace,
+            plan: Plan::Free,
         })
     }
 }

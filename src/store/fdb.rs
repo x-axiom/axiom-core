@@ -450,6 +450,99 @@ impl VersionRepo for FdbMetadataStore {
 // RefRepo
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct UsageRecord {
+    bytes: u64,
+}
+
+impl crate::quota::UsageRepo for FdbMetadataStore {
+    fn get(&self, tenant_id: &str) -> CasResult<u64> {
+        let record: Option<UsageRecord> = self.get_json("usage", tenant_id)?;
+        Ok(record.map(|r| r.bytes).unwrap_or(0))
+    }
+
+    fn add(&self, tenant_id: &str, delta: u64) -> CasResult<u64> {
+        // FDB transactions give us atomic read-modify-write; the helper below
+        // retries on conflict automatically.
+        let key = self.make_key("usage", tenant_id);
+        let rt = Self::rt()?;
+        let total = rt
+            .block_on(self.db.run(|trx, _| {
+                let key = key.clone();
+                async move {
+                    let current = trx.get(&key, false).await?;
+                    let mut bytes = current
+                        .and_then(|slice| serde_json::from_slice::<UsageRecord>(&slice).ok())
+                        .map(|r| r.bytes)
+                        .unwrap_or(0);
+                    bytes = bytes.saturating_add(delta);
+                    // `UsageRecord` holds a single u64, so serialization cannot fail.
+                    let encoded = serde_json::to_vec(&UsageRecord { bytes })
+                        .expect("usage record is always serializable");
+                    trx.set(&key, &encoded);
+                    Ok(bytes)
+                }
+            }))
+            .map_err(|e| CasError::Store(format!("FDB usage add: {e}")))?;
+        Ok(total)
+    }
+
+    fn set(&self, tenant_id: &str, bytes: u64) -> CasResult<()> {
+        self.put_json("usage", tenant_id, &UsageRecord { bytes })
+    }
+}
+
+impl crate::audit::AuditRepo for FdbMetadataStore {
+    fn append(&self, event: &crate::audit::AuditEvent) -> CasResult<()> {
+        let id = format!(
+            "{}\x00{:020}\x00{}",
+            event.tenant_id,
+            event.ts,
+            uuid::Uuid::new_v4()
+        );
+        self.put_json("audit", &id, event)
+    }
+
+    fn list(&self, tenant_id: &str, limit: usize) -> CasResult<Vec<crate::audit::AuditEvent>> {
+        let prefix = self.make_key("audit", &format!("{tenant_id}\x00"));
+        let end = Self::prefix_end(&prefix);
+        let pairs = self.range_scan(prefix, end)?;
+
+        let mut events: Vec<crate::audit::AuditEvent> = pairs
+            .into_iter()
+            .filter_map(|(_k, v)| serde_json::from_slice(&v).ok())
+            .collect();
+        events.sort_by(|a, b| b.ts.cmp(&a.ts));
+        events.truncate(limit);
+        Ok(events)
+    }
+
+    fn purge_before(&self, before_ts: u64) -> CasResult<usize> {
+        let prefix = self.make_key("audit", "");
+        let end = Self::prefix_end(&prefix);
+        let pairs = self.range_scan(prefix.clone(), end)?;
+
+        let mut removed = 0;
+        for (key, _value) in pairs {
+            if key.len() <= prefix.len() {
+                continue;
+            }
+            let id = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
+            // id = "{tenant}\x00{ts:020}\x00{uuid}"
+            let ts = id
+                .split('\x00')
+                .nth(1)
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .unwrap_or(u64::MAX);
+            if ts < before_ts {
+                self.delete_key("audit", &id)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
 impl WorkspaceRepo for FdbMetadataStore {
     fn create_workspace(&self, ws: &Workspace) -> CasResult<()> {
         if self.get_workspace(&ws.id)?.is_some() {

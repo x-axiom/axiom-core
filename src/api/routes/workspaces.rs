@@ -35,6 +35,9 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_workspaces).post(create_workspace))
         .route("/{workspace_id}", delete(delete_workspace))
+        .route("/deleted", get(list_deleted_workspaces))
+        .route("/{workspace_id}/restore", post(restore_workspace))
+        .route("/{workspace_id}/purge", post(purge_workspace))
         .route("/{workspace_id}/members", get(list_members))
         .route("/{workspace_id}/members/invite", post(invite_member))
         .route(
@@ -407,11 +410,20 @@ async fn list_workspaces(
                 let workspaces = directory
                     .list_workspaces_by_org(&OrgId::from(auth.org_id.as_str()))
                     .map_err(ApiError::from)?;
+                // Hide soft-deleted workspaces: they live in the recycle bin
+                // until restored or purged.
+                let repo = state.workspaces.as_deref();
+                let visible = workspaces.into_iter().filter(|ws| match repo {
+                    Some(repo) => repo
+                        .get_workspace(&ws.id.0)
+                        .ok()
+                        .flatten()
+                        .map(|row| row.deleted_at.is_none())
+                        .unwrap_or(true),
+                    None => true,
+                });
                 return Ok(Json(
-                    workspaces
-                        .into_iter()
-                        .map(tenant_workspace_to_summary)
-                        .collect(),
+                    visible.map(tenant_workspace_to_summary).collect(),
                 ));
             }
         }
@@ -478,6 +490,13 @@ async fn create_workspace(
                 }
             }
 
+            state.record_audit(
+                &auth.user_id,
+                &auth.tenant_id,
+                "workspace.create",
+                &tenant_workspace.id.0,
+                "ok",
+            );
             return Ok(Json(tenant_workspace_to_summary(tenant_workspace)));
         }
     }
@@ -527,21 +546,42 @@ async fn delete_workspace(
         )));
     }
 
+    // Soft delete: the workspace disappears from listings but its metadata is
+    // kept for the recycle-bin grace period (P1-3).
+    let now = current_unix_secs();
     if state.http_auth_mode != crate::api::state::HttpAuthMode::Disabled {
         if state.tenant_directory.is_some() {
-            let workspace = load_tenant_workspace(&state, auth.as_ref(), &workspace_id)?;
-            tenant_directory(&state)?
-                .delete_workspace(&WorkspaceId::from(workspace_id.as_str()), &workspace.org_id)
-                .map_err(ApiError::from)?;
-            if let Some(repo) = state.workspaces.as_deref() {
-                repo.delete_workspace(&workspace_id).map_err(ApiError::from)?;
+            let auth_ctx = require_auth(auth.as_ref())?;
+            let workspace = load_tenant_workspace(&state, Some(auth_ctx), &workspace_id)?;
+            match state.workspaces.as_deref() {
+                Some(repo) => {
+                    repo.soft_delete_workspace(&workspace_id, now)
+                        .map_err(ApiError::from)?;
+                }
+                // No data-plane repository on this backend: fall back to
+                // removing the tenant record (no recycle bin available).
+                None => {
+                    tenant_directory(&state)?
+                        .delete_workspace(
+                            &WorkspaceId::from(workspace_id.as_str()),
+                            &workspace.org_id,
+                        )
+                        .map_err(ApiError::from)?;
+                }
             }
+            state.record_audit(
+                &auth_ctx.user_id,
+                &auth_ctx.tenant_id,
+                "workspace.delete",
+                &workspace_id,
+                "ok",
+            );
             return Ok(StatusCode::NO_CONTENT);
         }
     }
 
     workspace_repo(&state)?
-        .delete_workspace(&workspace_id)
+        .soft_delete_workspace(&workspace_id, now)
         .map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -571,7 +611,7 @@ async fn invite_member(
     Json(req): Json<InviteWorkspaceMemberRequest>,
 ) -> ApiResult<Json<WorkspaceMemberResponse>> {
     let auth = auth_context(auth);
-    ensure_member_management_permission(auth.as_ref())?;
+    let auth_ctx = ensure_member_management_permission(auth.as_ref())?;
     let workspace = load_tenant_workspace(&state, auth.as_ref(), &workspace_id)?;
     let email = req.email.trim().to_ascii_lowercase();
     if email.is_empty() || !email.contains('@') {
@@ -599,6 +639,13 @@ async fn invite_member(
 
     directory.put_membership(&user.id, &workspace.org_id, role.clone())
         .map_err(ApiError::from)?;
+    state.record_audit(
+        &auth_ctx.user_id,
+        &auth_ctx.tenant_id,
+        "member.invite",
+        &user.id.0,
+        "ok",
+    );
     Ok(Json(user_to_member_response(user, role)))
 }
 
@@ -609,7 +656,7 @@ async fn update_member_role(
     Json(req): Json<UpdateWorkspaceMemberRoleRequest>,
 ) -> ApiResult<Json<WorkspaceMemberResponse>> {
     let auth = auth_context(auth);
-    ensure_member_management_permission(auth.as_ref())?;
+    let auth_ctx = ensure_member_management_permission(auth.as_ref())?;
     let workspace = load_tenant_workspace(&state, auth.as_ref(), &workspace_id)?;
     let role = member_role_from_api(&req.role)?;
     let directory = tenant_directory(&state)?;
@@ -631,6 +678,13 @@ async fn update_member_role(
         ))))?;
     directory.put_membership(&user_id, &workspace.org_id, role.clone())
         .map_err(ApiError::from)?;
+    state.record_audit(
+        &auth_ctx.user_id,
+        &auth_ctx.tenant_id,
+        "member.role_update",
+        &member_id,
+        "ok",
+    );
     Ok(Json(user_to_member_response(user, role)))
 }
 
@@ -640,7 +694,7 @@ async fn remove_member(
     Path((workspace_id, member_id)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
     let auth = auth_context(auth);
-    ensure_member_management_permission(auth.as_ref())?;
+    let auth_ctx = ensure_member_management_permission(auth.as_ref())?;
     let workspace = load_tenant_workspace(&state, auth.as_ref(), &workspace_id)?;
     let directory = tenant_directory(&state)?;
     let user_id = UserId::from(member_id.as_str());
@@ -654,6 +708,13 @@ async fn remove_member(
     ensure_not_last_owner(directory, &workspace.org_id, &membership, None)?;
     directory.delete_membership(&user_id, &workspace.org_id)
         .map_err(ApiError::from)?;
+    state.record_audit(
+        &auth_ctx.user_id,
+        &auth_ctx.tenant_id,
+        "member.remove",
+        &member_id,
+        "ok",
+    );
     Ok(Json(serde_json::json!({})))
 }
 
@@ -664,7 +725,10 @@ async fn list_tree_root(
 ) -> ApiResult<Json<Vec<WorkspaceTreeEntryResponse>>> {
     let auth = auth_context(auth);
     ensure_permission(&state, auth.as_ref(), Permission::Read)?;
-    list_tree_impl(&state, auth.as_ref(), &workspace_id, "").map(Json)
+    super::helpers::run_blocking(move || {
+        list_tree_impl(&state, auth.as_ref(), &workspace_id, "").map(Json)
+    })
+    .await
 }
 
 async fn list_tree_at_path(
@@ -674,7 +738,10 @@ async fn list_tree_at_path(
 ) -> ApiResult<Json<Vec<WorkspaceTreeEntryResponse>>> {
     let auth = auth_context(auth);
     ensure_permission(&state, auth.as_ref(), Permission::Read)?;
-    list_tree_impl(&state, auth.as_ref(), &workspace_id, &path).map(Json)
+    super::helpers::run_blocking(move || {
+        list_tree_impl(&state, auth.as_ref(), &workspace_id, &path).map(Json)
+    })
+    .await
 }
 
 fn list_tree_impl(
@@ -774,6 +841,188 @@ async fn diff_versions(
             })
             .collect(),
     ))
+}
+
+/// Grace period before a soft-deleted workspace becomes purgeable.
+fn workspace_grace_secs() -> u64 {
+    std::env::var("AXIOM_WORKSPACE_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(7 * 24 * 3600)
+}
+
+async fn list_deleted_workspaces(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
+) -> ApiResult<Json<Vec<WorkspaceSummaryResponse>>> {
+    let auth = auth_context(auth);
+    let auth = require_auth(auth.as_ref())?;
+    if !matches!(auth.role, Role::Owner | Role::Admin) {
+        return Err(ApiError(CasError::Forbidden(
+            "recycle bin requires owner or admin role".into(),
+        )));
+    }
+
+    let repo = workspace_repo(&state)?;
+    let deleted = repo.list_deleted_workspaces().map_err(ApiError::from)?;
+    let visible = deleted
+        .into_iter()
+        .filter(|ws| workspace_org(ws).as_deref() == Some(auth.org_id.as_str()))
+        .map(|ws| workspace_to_summary(&state, ws));
+
+    Ok(Json(visible.collect()))
+}
+
+async fn restore_workspace(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
+    Path(workspace_id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let auth = auth_context(auth);
+    let auth = require_auth(auth.as_ref())?;
+    if !matches!(auth.role, Role::Owner | Role::Admin) {
+        return Err(ApiError(CasError::Forbidden(
+            "restore requires owner or admin role".into(),
+        )));
+    }
+
+    let workspace = load_workspace(&state, Some(auth), &workspace_id)?;
+    if workspace.deleted_at.is_none() {
+        return Err(ApiError(CasError::InvalidObject(
+            "workspace is not deleted".into(),
+        )));
+    }
+
+    workspace_repo(&state)?
+        .restore_workspace(&workspace_id)
+        .map_err(ApiError::from)?;
+    state.record_audit(
+        &auth.user_id,
+        &auth.tenant_id,
+        "workspace.restore",
+        &workspace_id,
+        "ok",
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct PurgeQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(serde::Serialize)]
+struct PurgeResponse {
+    workspace_id: String,
+    dry_run: bool,
+    eligible: bool,
+    /// Seconds until the workspace becomes purgeable (0 = now).
+    remaining_grace_secs: u64,
+    purged: bool,
+}
+
+async fn purge_workspace(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
+    Path(workspace_id): Path<String>,
+    Query(query): Query<PurgeQuery>,
+) -> ApiResult<Json<PurgeResponse>> {
+    let auth = auth_context(auth);
+    let auth = require_auth(auth.as_ref())?;
+    if auth.role != Role::Owner {
+        return Err(ApiError(CasError::Forbidden(
+            "purge requires the owner role".into(),
+        )));
+    }
+
+    let workspace = load_workspace(&state, Some(auth), &workspace_id)?;
+    let Some(deleted_at) = workspace.deleted_at else {
+        return Err(ApiError(CasError::InvalidObject(
+            "workspace is not in the recycle bin".into(),
+        )));
+    };
+
+    let grace = workspace_grace_secs();
+    let now = current_unix_secs();
+    let age = now.saturating_sub(deleted_at);
+    let eligible = age >= grace;
+    let remaining_grace_secs = grace.saturating_sub(age);
+
+    if query.dry_run || !eligible {
+        return Ok(Json(PurgeResponse {
+            workspace_id,
+            dry_run: query.dry_run,
+            eligible,
+            remaining_grace_secs,
+            purged: false,
+        }));
+    }
+
+    // Purge permanently: metadata row + tenant record. Object chunks are
+    // reclaimed by GC separately and never deleted here.
+    workspace_repo(&state)?
+        .delete_workspace(&workspace_id)
+        .map_err(ApiError::from)?;
+
+    if let (Some(directory), Some(org)) = (state.tenant_directory.as_deref(), workspace_org(&workspace)) {
+        let _ = directory.delete_workspace(&WorkspaceId::from(workspace_id.as_str()), &OrgId::from(org));
+    }
+
+    state.record_audit(
+        &auth.user_id,
+        &auth.tenant_id,
+        "workspace.purge",
+        &workspace_id,
+        "ok",
+    );
+
+    Ok(Json(PurgeResponse {
+        workspace_id,
+        dry_run: false,
+        eligible: true,
+        remaining_grace_secs: 0,
+        purged: true,
+    }))
+}
+
+/// Purge every soft-deleted workspace whose grace period has elapsed.
+///
+/// Called by the background reaper and by admin tooling. Object chunks are
+/// **not** touched here: they are reclaimed by the GC sweep once unreachable.
+pub fn purge_expired_workspaces(state: &AppState) -> usize {
+    let Some(repo) = state.workspaces.as_deref() else {
+        return 0;
+    };
+    let grace = workspace_grace_secs();
+    let now = current_unix_secs();
+
+    let Ok(deleted) = repo.list_deleted_workspaces() else {
+        return 0;
+    };
+
+    let mut purged = 0;
+    for workspace in deleted {
+        let Some(deleted_at) = workspace.deleted_at else {
+            continue;
+        };
+        if now.saturating_sub(deleted_at) < grace {
+            continue;
+        }
+
+        if repo.delete_workspace(&workspace.id).is_err() {
+            continue;
+        }
+        if let (Some(directory), Some(org)) =
+            (state.tenant_directory.as_deref(), workspace_org(&workspace))
+        {
+            let _ = directory
+                .delete_workspace(&WorkspaceId::from(workspace.id.clone()), &OrgId::from(org));
+        }
+        purged += 1;
+        tracing::info!(workspace = %workspace.id, "recycle bin: purged expired workspace");
+    }
+    purged
 }
 
 #[cfg(test)]

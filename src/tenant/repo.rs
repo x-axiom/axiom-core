@@ -141,12 +141,16 @@ impl super::TenantDirectory for TenantRepo {
                 Some(ws) => ws,
                 None => TenantRepo::create_workspace(self, org_id, "Default", 0)?,
             };
+            let plan = TenantRepo::get_tenant(self, &org.tenant_id)?
+                .map(|t| t.plan)
+                .unwrap_or_default();
             return Ok(AccountContext {
                 user,
                 tenant_id: org.tenant_id,
                 org_id: org_id.clone(),
                 role,
                 workspace,
+                plan,
             });
         }
 
@@ -162,6 +166,7 @@ impl super::TenantDirectory for TenantRepo {
             org_id: org.id,
             role: Role::Owner,
             workspace,
+            plan: tenant.plan,
         })
     }
 }

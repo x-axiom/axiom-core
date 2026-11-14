@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::auth::jwt::{AccessClaims, JwkSet, JwtService, REFRESH_TTL_SECS};
 use crate::auth::oauth::{GitHubIdentity, GitHubOAuth};
 use crate::error::{CasError, CasResult};
-use crate::tenant::model::Role;
+use crate::tenant::model::{Plan, Role};
 use crate::tenant::TenantDirectory;
 
 /// Token bundle returned by login / refresh.
@@ -108,12 +108,37 @@ impl AuthService {
 
     /// Exchange a GitHub OAuth `code` for Axiom tokens.
     pub async fn login_github_code(&self, code: &str) -> CasResult<TokenPair> {
+        self.login_github_code_with_redirect(code, None).await
+    }
+
+    /// Same as [`login_github_code`], but with an explicit redirect URI
+    /// (native loopback flow).
+    pub async fn login_github_code_with_redirect(
+        &self,
+        code: &str,
+        redirect_uri: Option<&str>,
+    ) -> CasResult<TokenPair> {
         let github = self.github.as_ref().ok_or_else(|| {
             CasError::Store("github oauth is not configured (AXIOM_GITHUB_*)".into())
         })?;
-        let token = github.exchange_code(code).await?;
+        let token = github.exchange_code(code, redirect_uri).await?;
         let identity = github.fetch_identity(&token).await?;
         self.login_github_identity(&identity)
+    }
+
+    /// Public OAuth parameters a native client needs to start the flow.
+    pub fn oauth_public_config(&self) -> CasResult<serde_json::Value> {
+        let github = self.github.as_ref().ok_or_else(|| {
+            CasError::Store("github oauth is not configured (AXIOM_GITHUB_*)".into())
+        })?;
+        let cfg = github.config();
+        Ok(serde_json::json!({
+            "provider": "github",
+            "client_id": cfg.client_id,
+            "authorize_url": format!("{}/login/oauth/authorize", cfg.web_base),
+            "default_redirect_uri": cfg.redirect_uri,
+            "scopes": "read:user user:email",
+        }))
     }
 
     pub fn authorize_url(&self, state: &str) -> CasResult<String> {
@@ -157,6 +182,7 @@ impl AuthService {
             &account.org_id.0,
             &account.workspace.id.0,
             account.role,
+            plan_name(&account.plan),
         )
     }
 
@@ -173,6 +199,7 @@ impl AuthService {
             &account.org_id.0,
             &account.workspace.id.0,
             account.role,
+            plan_name(&account.plan),
         )
     }
 
@@ -186,11 +213,16 @@ impl AuthService {
         org_id: &str,
         workspace_id: &str,
         role: Role,
+        plan: &'static str,
     ) -> CasResult<TokenPair> {
         let roles = vec![role_name(&role).to_owned()];
-        let access_token = self
-            .jwt
-            .issue_access_token(user_id, tenant_id, org_id, roles.clone())?;
+        let access_token = self.jwt.issue_access_token_with_plan(
+            user_id,
+            tenant_id,
+            org_id,
+            roles.clone(),
+            Some(plan),
+        )?;
         let refresh_token = self.jwt.issue_refresh_token(user_id)?;
         Ok(TokenPair {
             access_token,
@@ -210,6 +242,15 @@ impl AuthService {
     /// Refresh-token TTL, exposed for docs/tests.
     pub fn refresh_ttl_secs(&self) -> u64 {
         REFRESH_TTL_SECS
+    }
+}
+
+/// Lowercase plan name used in JWT / rate-limit claims.
+pub fn plan_name(plan: &Plan) -> &'static str {
+    match plan {
+        Plan::Free => "free",
+        Plan::Pro => "pro",
+        Plan::Enterprise => "enterprise",
     }
 }
 

@@ -115,7 +115,15 @@ impl GitHubOAuth {
     }
 
     /// Exchange an authorization `code` for a GitHub access token.
-    pub async fn exchange_code(&self, code: &str) -> CasResult<String> {
+    ///
+    /// `redirect_override` lets a native client use a loopback callback; the
+    /// caller must validate it against an allowlist first.
+    pub async fn exchange_code(
+        &self,
+        code: &str,
+        redirect_override: Option<&str>,
+    ) -> CasResult<String> {
+        let redirect_uri = redirect_override.unwrap_or(&self.config.redirect_uri);
         let resp = self
             .http
             .post(format!("{}/login/oauth/access_token", self.config.web_base))
@@ -124,7 +132,7 @@ impl GitHubOAuth {
                 ("client_id", self.config.client_id.as_str()),
                 ("client_secret", self.config.client_secret.as_str()),
                 ("code", code),
-                ("redirect_uri", self.config.redirect_uri.as_str()),
+                ("redirect_uri", redirect_uri),
             ])
             .send()
             .await

@@ -19,7 +19,7 @@ use super::traits::{
 // ---------------------------------------------------------------------------
 
 /// Current schema version. Bump this when adding new migrations.
-const CURRENT_SCHEMA_VERSION: u32 = 8;
+const CURRENT_SCHEMA_VERSION: u32 = 10;
 const REMOTE_CREDENTIAL_PREFIX: &str = "keyring:v1:";
 const REMOTE_CREDENTIAL_SERVICE_PREFIX: &str = "axiom.remote-credentials.";
 
@@ -71,6 +71,12 @@ fn run_migrations(conn: &Connection) -> CasResult<()> {
             if current < 8 {
                 migrate_v8(conn)?;
             }
+            if current < 9 {
+                migrate_v9(conn)?;
+            }
+            if current < 10 {
+                migrate_v10(conn)?;
+            }
             Ok(())
         })();
 
@@ -103,6 +109,41 @@ fn get_schema_version(conn: &Connection) -> CasResult<u32> {
         |row| row.get(0),
     )
     .map_err(|e| CasError::Store(e.to_string()))
+}
+
+/// Migration v9: tenant-level usage ledger (P1-1).
+fn migrate_v9(conn: &Connection) -> CasResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tenant_usage (
+            tenant_id   TEXT PRIMARY KEY,
+            bytes       INTEGER NOT NULL DEFAULT 0,
+            updated_at  INTEGER NOT NULL DEFAULT 0
+        );
+        UPDATE schema_version SET version = 9;",
+    )
+    .map_err(|e| CasError::Store(e.to_string()))?;
+    Ok(())
+}
+
+/// Migration v10: audit log (P1-8).
+fn migrate_v10(conn: &Connection) -> CasResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS audit_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          INTEGER NOT NULL,
+            actor       TEXT NOT NULL,
+            tenant_id   TEXT NOT NULL,
+            action      TEXT NOT NULL,
+            target      TEXT NOT NULL,
+            outcome     TEXT NOT NULL,
+            request_id  TEXT,
+            detail      TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_tenant_ts ON audit_log (tenant_id, ts DESC);
+        UPDATE schema_version SET version = 10;",
+    )
+    .map_err(|e| CasError::Store(e.to_string()))?;
+    Ok(())
 }
 
 /// Migration v1: initial schema.
@@ -1397,6 +1438,17 @@ mod remote_credential_tests {
     }
 
     #[test]
+    fn usage_repo_roundtrip() {
+        use crate::quota::UsageRepo;
+
+        let store = SqliteMetadataStore::open_in_memory().unwrap();
+        assert_eq!(store.get("t1").unwrap(), 0);
+        assert_eq!(store.add("t1", 128).unwrap(), 128);
+        assert_eq!(store.add("t1", 64).unwrap(), 192);
+        store.set("t1", 10).unwrap();
+        assert_eq!(store.get("t1").unwrap(), 10);
+    }
+
     fn update_remote_overwrites_and_clears_keyring_backed_token() {
         let store = SqliteMetadataStore::open_in_memory().unwrap();
         store
@@ -1878,5 +1930,121 @@ mod hex {
                     .map_err(|e| format!("invalid hex at offset {i}: {e}"))
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UsageRepo (P1-1)
+// ---------------------------------------------------------------------------
+
+impl crate::quota::UsageRepo for SqliteMetadataStore {
+    fn get(&self, tenant_id: &str) -> CasResult<u64> {
+        let conn = self.conn.lock();
+        let value: Option<i64> = conn
+            .query_row(
+                "SELECT bytes FROM tenant_usage WHERE tenant_id = ?1",
+                params![tenant_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(value.unwrap_or(0).max(0) as u64)
+    }
+
+    fn add(&self, tenant_id: &str, delta: u64) -> CasResult<u64> {
+        let conn = self.conn.lock();
+        let now = crate::model::hash::current_timestamp() as i64;
+        conn.execute(
+            "INSERT INTO tenant_usage (tenant_id, bytes, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(tenant_id) DO UPDATE SET bytes = bytes + excluded.bytes, updated_at = excluded.updated_at",
+            params![tenant_id, delta as i64, now],
+        )
+        .map_err(|e| CasError::Store(e.to_string()))?;
+        let total: i64 = conn
+            .query_row(
+                "SELECT bytes FROM tenant_usage WHERE tenant_id = ?1",
+                params![tenant_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(total.max(0) as u64)
+    }
+
+    fn set(&self, tenant_id: &str, bytes: u64) -> CasResult<()> {
+        let conn = self.conn.lock();
+        let now = crate::model::hash::current_timestamp() as i64;
+        conn.execute(
+            "INSERT INTO tenant_usage (tenant_id, bytes, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(tenant_id) DO UPDATE SET bytes = excluded.bytes, updated_at = excluded.updated_at",
+            params![tenant_id, bytes as i64, now],
+        )
+        .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AuditRepo (P1-8)
+// ---------------------------------------------------------------------------
+
+impl crate::audit::AuditRepo for SqliteMetadataStore {
+    fn append(&self, event: &crate::audit::AuditEvent) -> CasResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO audit_log (ts, actor, tenant_id, action, target, outcome, request_id, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                event.ts as i64,
+                event.actor,
+                event.tenant_id,
+                event.action,
+                event.target,
+                event.outcome,
+                event.request_id.as_deref(),
+                event.detail.as_deref(),
+            ],
+        )
+        .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list(&self, tenant_id: &str, limit: usize) -> CasResult<Vec<crate::audit::AuditEvent>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT ts, actor, tenant_id, action, target, outcome, request_id, detail
+                 FROM audit_log WHERE tenant_id = ?1 ORDER BY ts DESC, id DESC LIMIT ?2",
+            )
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![tenant_id, limit as i64], |row| {
+                Ok(crate::audit::AuditEvent {
+                    ts: row.get::<_, i64>(0)? as u64,
+                    actor: row.get(1)?,
+                    tenant_id: row.get(2)?,
+                    action: row.get(3)?,
+                    target: row.get(4)?,
+                    outcome: row.get(5)?,
+                    request_id: row.get(6)?,
+                    detail: row.get(7)?,
+                })
+            })
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| CasError::Store(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    fn purge_before(&self, before_ts: u64) -> CasResult<usize> {
+        let conn = self.conn.lock();
+        let deleted = conn
+            .execute(
+                "DELETE FROM audit_log WHERE ts < ?1",
+                params![before_ts as i64],
+            )
+            .map_err(|e| CasError::Store(e.to_string()))?;
+        Ok(deleted)
     }
 }

@@ -168,6 +168,7 @@ where
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             if !constant_time_eq(expected.as_bytes(), presented.as_bytes()) {
+                crate::telemetry::record_auth_failure("untrusted_proxy");
                 let resp = (
                     StatusCode::UNAUTHORIZED,
                     axum::Json(serde_json::json!({
@@ -184,6 +185,13 @@ where
         match extract_trusted_auth_context(req.headers()) {
             Err(resp) => Box::pin(async move { Ok(resp) }),
             Ok(ctx) => {
+                let plan = req
+                    .headers()
+                    .get("x-plan")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .filter(|v| !v.is_empty());
+                req.extensions_mut().insert(crate::auth::rbac::PlanContext(plan));
                 req.extensions_mut().insert(ctx);
                 let fut = self.inner.call(req);
                 Box::pin(async move { fut.await })
@@ -197,6 +205,7 @@ fn extract_required_header(
     name: &'static str,
 ) -> Result<String, Response> {
     let value = headers.get(name).ok_or_else(|| {
+        crate::telemetry::record_auth_failure("missing_identity_header");
         (StatusCode::UNAUTHORIZED, format!("missing {name} header")).into_response()
     })?;
 
@@ -438,6 +447,7 @@ where
             .map(str::to_owned);
 
         let Some(token) = token else {
+            crate::telemetry::record_auth_failure("missing_bearer");
             let resp = crate::api::error::ApiError(crate::error::CasError::Unauthorized(
                 "missing Authorization header".into(),
             ))
@@ -453,11 +463,17 @@ where
                     org_id: claims.org_id,
                     role: effective_role(&claims.roles),
                 };
+                req.extensions_mut()
+                    .insert(crate::auth::rbac::PlanContext(claims.plan));
                 req.extensions_mut().insert(ctx);
                 let fut = self.inner.call(req);
                 Box::pin(async move { fut.await })
             }
             Err(err) => {
+                crate::telemetry::record_auth_failure(match &err {
+                    crate::error::CasError::TokenExpired(_) => "token_expired",
+                    _ => "invalid_token",
+                });
                 let resp = crate::api::error::ApiError(err).into_response();
                 Box::pin(async move { Ok(resp) })
             }

@@ -37,6 +37,22 @@ const CLEANUP_INTERVAL_SECS: u64 = 300;
 /// Default cap on decompressed upload bytes per `UploadPack` (4 GiB).
 const MAX_DECOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+fn record<T>(operation: &str, result: &Result<T, Status>) {
+    crate::telemetry::record_sync_operation(
+        operation,
+        match result {
+            Ok(_) => "ok",
+            Err(status) => match status.code() {
+                tonic::Code::Unauthenticated => "unauthenticated",
+                tonic::Code::PermissionDenied => "forbidden",
+                tonic::Code::ResourceExhausted => "resource_exhausted",
+                tonic::Code::NotFound => "not_found",
+                _ => "error",
+            },
+        },
+    );
+}
+
 /// Routes Push RPCs to [`PushServiceHandler`] and Pull/Clone RPCs to
 /// [`PullServiceHandler`], backed by the same stores.
 struct CombinedSyncHandler {
@@ -50,35 +66,45 @@ impl SyncService for CombinedSyncHandler {
         &self,
         req: Request<ListRefsRequest>,
     ) -> Result<Response<ListRefsResponse>, Status> {
-        self.push.list_refs(req).await
+        let result = self.push.list_refs(req).await;
+        record("list_refs", &result);
+        result
     }
 
     async fn negotiate_push(
         &self,
         req: Request<NegotiatePushRequest>,
     ) -> Result<Response<NegotiatePushResponse>, Status> {
-        self.push.negotiate_push(req).await
+        let result = self.push.negotiate_push(req).await;
+        record("negotiate_push", &result);
+        result
     }
 
     async fn upload_pack(
         &self,
         req: Request<tonic::Streaming<UploadPackRequest>>,
     ) -> Result<Response<UploadPackResponse>, Status> {
-        self.push.upload_pack(req).await
+        let result = self.push.upload_pack(req).await;
+        record("upload_pack", &result);
+        result
     }
 
     async fn finalize_refs(
         &self,
         req: Request<FinalizeRefsRequest>,
     ) -> Result<Response<FinalizeRefsResponse>, Status> {
-        self.push.finalize_refs(req).await
+        let result = self.push.finalize_refs(req).await;
+        record("finalize_refs", &result);
+        result
     }
 
     async fn negotiate_pull(
         &self,
         req: Request<NegotiatePullRequest>,
     ) -> Result<Response<NegotiatePullResponse>, Status> {
-        self.pull.negotiate_pull(req).await
+        let result = self.pull.negotiate_pull(req).await;
+        record("negotiate_pull", &result);
+        result
     }
 
     type DownloadPackStream =
@@ -88,6 +114,7 @@ impl SyncService for CombinedSyncHandler {
         &self,
         req: Request<DownloadPackRequest>,
     ) -> Result<Response<Self::DownloadPackStream>, Status> {
+        crate::telemetry::record_sync_operation("download_pack", "ok");
         let resp = self.pull.download_pack(req).await?;
         let inner = resp.into_inner();
         Ok(Response::new(Box::pin(inner)))
@@ -97,7 +124,9 @@ impl SyncService for CombinedSyncHandler {
         &self,
         req: Request<CloneInitRequest>,
     ) -> Result<Response<CloneInitResponse>, Status> {
-        self.pull.clone_init(req).await
+        let result = self.pull.clone_init(req).await;
+        record("clone_init", &result);
+        result
     }
 
     type CloneDownloadStream =
@@ -107,6 +136,7 @@ impl SyncService for CombinedSyncHandler {
         &self,
         req: Request<CloneDownloadRequest>,
     ) -> Result<Response<Self::CloneDownloadStream>, Status> {
+        crate::telemetry::record_sync_operation("clone_download", "ok");
         let resp = self.pull.clone_download(req).await?;
         let inner = resp.into_inner();
         Ok(Response::new(Box::pin(inner)))
@@ -131,6 +161,8 @@ fn build_handler(state: &AppState) -> CombinedSyncHandler {
         session_ttl_secs: SESSION_TTL_SECS,
         cleanup_interval_secs: CLEANUP_INTERVAL_SECS,
         max_decompressed_bytes: MAX_DECOMPRESSED_BYTES,
+        usage: state.usage.clone(),
+        quota: state.quota.clone(),
     });
 
     let pull = PullServiceHandler::new(PullServiceState {

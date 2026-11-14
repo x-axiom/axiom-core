@@ -64,6 +64,7 @@ async fn metrics_endpoint() -> Response {
 fn readiness_response(state: &AppState) -> Response {
     let checks = readiness_checks(state);
     let ready = checks.iter().all(|check| check.status == "ok");
+    telemetry::set_ready(ready);
     let status = if ready {
         StatusCode::OK
     } else {

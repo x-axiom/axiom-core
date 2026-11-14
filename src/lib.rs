@@ -19,6 +19,8 @@ pub mod grpc;
 pub mod cas;
 pub mod version;
 pub mod tenant;
+pub mod audit;
 pub mod auth;
+pub mod quota;
 pub mod gc;
 pub mod telemetry;

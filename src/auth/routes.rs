@@ -32,6 +32,7 @@ pub fn router() -> Router<AppState> {
         .route("/auth/session", get(session))
         .route("/auth/jwks", get(jwks))
         .route("/.well-known/jwks.json", get(jwks))
+        .route("/auth/config", get(auth_config))
         .route("/auth/oauth/github", get(oauth_start))
         .route("/auth/oauth/github/callback", get(oauth_callback))
 }
@@ -64,6 +65,8 @@ pub struct LoginRequest {
     /// Dev-provider identity.
     email: Option<String>,
     name: Option<String>,
+    /// Native (loopback) redirect URI. Must match the allowlist.
+    redirect_uri: Option<String>,
 }
 
 fn default_provider() -> String {
@@ -105,7 +108,15 @@ async fn login(
     let pair = match req.provider.as_str() {
         "github" => {
             if let Some(code) = req.code.as_deref() {
-                auth.login_github_code(code).await?
+                if let Some(uri) = req.redirect_uri.as_deref() {
+                    if !redirect_allowed(uri) {
+                        return Err(ApiError(CasError::InvalidObject(format!(
+                            "redirect_uri '{uri}' is not allowed"
+                        ))));
+                    }
+                }
+                auth.login_github_code_with_redirect(code, req.redirect_uri.as_deref())
+                    .await?
             } else if let Some(token) = req.access_token.as_deref() {
                 auth.login_github_token(token).await?
             } else {
@@ -131,6 +142,14 @@ async fn login(
         }
     };
 
+    state.record_audit(
+        &pair.user_id,
+        &pair.tenant_id,
+        "auth.login",
+        &pair.email,
+        "ok",
+    );
+
     Ok(Json(pair))
 }
 
@@ -149,6 +168,24 @@ async fn logout(
     let auth = service(&state)?;
     auth.logout(&req.refresh_token)?;
     Ok(Json(LogoutResponse { revoked: true }))
+}
+
+async fn auth_config(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let auth = service(&state)?;
+    Ok(Json(auth.oauth_public_config()?))
+}
+
+/// Loopback redirects (`http://127.0.0.1:<port>/callback`) are allowed for
+/// native clients; anything else must be listed in
+/// `AXIOM_GITHUB_REDIRECT_URIS`.
+fn redirect_allowed(uri: &str) -> bool {
+    let loopback = uri.starts_with("http://127.0.0.1:") && uri.ends_with("/callback");
+    if loopback {
+        return true;
+    }
+    std::env::var("AXIOM_GITHUB_REDIRECT_URIS")
+        .map(|list| list.split(',').map(str::trim).any(|allowed| allowed == uri))
+        .unwrap_or(false)
 }
 
 async fn jwks(State(state): State<AppState>) -> ApiResult<Json<JwkSet>> {

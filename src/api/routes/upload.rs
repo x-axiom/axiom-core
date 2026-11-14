@@ -3,7 +3,7 @@
 //! - `POST /file`      — single-file streaming upload (raw body)
 //! - `POST /directory`  — multi-file upload (JSON with base64-encoded content)
 
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use base64::Engine;
@@ -14,6 +14,7 @@ use crate::api::dto::{
 };
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::state::AppState;
+use crate::auth::rbac::{AuthContext, PlanContext};
 use crate::chunker::{chunk_bytes, ChunkPolicy};
 use crate::commit::{CommitRequest, CommitService, DEFAULT_BRANCH};
 use crate::merkle::{build_tree, DEFAULT_FAN_OUT};
@@ -76,6 +77,7 @@ fn chunk_persist_with_stats(
         DedupFileStats {
             total_bytes: data.len() as u64,
             total_chunks,
+            new_bytes: (data.len() as u64).saturating_sub(dedup_bytes),
             new_chunks,
             dedup_chunks,
             dedup_bytes,
@@ -87,6 +89,7 @@ fn chunk_persist_with_stats(
 struct DedupFileStats {
     total_bytes: u64,
     total_chunks: usize,
+    new_bytes: u64,
     new_chunks: usize,
     dedup_chunks: usize,
     dedup_bytes: u64,
@@ -99,23 +102,101 @@ struct DedupFileStats {
 async fn upload_file(
     State(state): State<AppState>,
     Query(query): Query<FileUploadQuery>,
+    auth: Option<Extension<AuthContext>>,
+    plan: Option<Extension<PlanContext>>,
     request: axum::extract::Request,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     let max_bytes = max_upload_bytes();
 
-    let (descriptors, file_stats) = match ingest_stream(&state, request.into_body(), max_bytes).await
+    let tenant_id = auth.as_ref().map(|Extension(ctx)| ctx.tenant_id.clone());
+    let plan_name = plan.as_ref().and_then(|Extension(p)| p.0.clone());
+    let plan_ref = plan_name.as_deref();
+
+    // Quota is resolved once per request: remaining budget is enforced while
+    // streaming, so an over-quota upload stops early instead of filling S3.
+    let (quota_bytes, used_bytes, budget) = match tenant_id.as_deref() {
+        Some(tenant) => {
+            let quota = state.quota.limit_for(plan_ref);
+            let used = match state.usage.as_ref() {
+                Some(repo) => repo.get(tenant).unwrap_or(0),
+                None => 0,
+            };
+            (Some(quota), used, Some(quota.saturating_sub(used)))
+        }
+        None => (None, 0, None),
+    };
+
+    let (descriptors, file_stats) = match ingest_stream(
+        &state,
+        request.into_body(),
+        max_bytes,
+        budget,
+        used_bytes,
+        quota_bytes,
+    )
+    .await
     {
         Ok(value) => value,
         Err(IngestError::TooLarge) => return payload_too_large(max_bytes),
+        Err(IngestError::QuotaExceeded { used, quota }) => {
+            return quota_exceeded(used, quota, plan_ref);
+        }
         Err(IngestError::Api(err)) => return err.into_response(),
     };
 
-    match finalize_single_upload(&state, query, descriptors, file_stats) {
-        Ok(json) => json.into_response(),
-        Err(err) => err.into_response(),
+    let new_bytes = file_stats.new_bytes;
+    let query_path_for_audit = query.path.clone();
+    let committed = match finalize_single_upload(&state, query, descriptors, file_stats) {
+        Ok(json) => json,
+        Err(err) => return err.into_response(),
+    };
+
+    // Charge only after the commit succeeded: aborted uploads leave orphan
+    // chunks for GC to reclaim, but must never consume quota.
+    if let (Some(tenant), Some(repo)) = (tenant_id.as_deref(), state.usage.as_ref()) {
+        if new_bytes > 0 {
+            if let Err(err) = repo.add(tenant, new_bytes) {
+                tracing::error!(error = %err, tenant, "failed to record usage");
+            }
+        }
     }
+
+    if let Some(Extension(ctx)) = auth.as_ref() {
+        state.record_audit(
+            &ctx.user_id,
+            &ctx.tenant_id,
+            "object.upload",
+            &format!("{} ({} bytes)", query_path_for_audit, new_bytes),
+            "ok",
+        );
+    }
+
+    committed.into_response()
+}
+
+fn quota_exceeded(used: u64, quota: u64, plan: Option<&str>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    crate::telemetry::record_quota_rejection(plan);
+    (
+        axum::http::StatusCode::PAYMENT_REQUIRED,
+        Json(serde_json::json!({
+            "error": "quota_exceeded",
+            "code": "quota_exceeded",
+            "message": format!(
+                "storage quota exceeded: {used} of {quota} bytes used on the {} plan",
+                crate::quota::QuotaPolicy::plan_name(plan)
+            ),
+            "used_bytes": used,
+            "quota_bytes": quota,
+            "plan": crate::quota::QuotaPolicy::plan_name(plan),
+            "request_id": crate::telemetry::current_request_id(),
+            "retryable": false,
+        })),
+    )
+        .into_response()
 }
 
 /// Configurable upload ceiling (default 8 GiB).
@@ -140,6 +221,8 @@ fn payload_too_large(max_bytes: u64) -> axum::response::Response {
             "code": "payload_too_large",
             "message": format!("request body exceeds the configured limit of {max_bytes} bytes"),
             "max_bytes": max_bytes,
+            "request_id": crate::telemetry::current_request_id(),
+            "retryable": false,
         })),
     )
         .into_response()
@@ -147,6 +230,7 @@ fn payload_too_large(max_bytes: u64) -> axum::response::Response {
 
 enum IngestError {
     TooLarge,
+    QuotaExceeded { used: u64, quota: u64 },
     Api(ApiError),
 }
 
@@ -158,6 +242,9 @@ async fn ingest_stream(
     state: &AppState,
     body: axum::body::Body,
     max_bytes: u64,
+    quota_budget: Option<u64>,
+    used_bytes: u64,
+    quota_bytes: Option<u64>,
 ) -> Result<(Vec<ChunkDescriptor>, DedupFileStats), IngestError> {
     use futures_util::StreamExt;
 
@@ -180,6 +267,11 @@ async fn ingest_stream(
         if stats.total_bytes.saturating_add(bytes.len() as u64) > max_bytes {
             return Err(IngestError::TooLarge);
         }
+        if let (Some(budget), Some(quota)) = (quota_budget, quota_bytes) {
+            if stats.new_bytes > budget {
+                return Err(IngestError::QuotaExceeded { used: used_bytes, quota });
+            }
+        }
         stats.total_bytes += bytes.len() as u64;
         buffer.extend_from_slice(&bytes);
 
@@ -188,7 +280,18 @@ async fn ingest_stream(
         // a whole-file chunking pass.
         while buffer.len() >= flush_at {
             let window: Vec<u8> = buffer.drain(..flush_at).collect();
-            persist_chunks(state, &window, offset, &policy, &mut descriptors, &mut stats).await?;
+            persist_chunks(
+                state,
+                &window,
+                offset,
+                &policy,
+                &mut descriptors,
+                &mut stats,
+                quota_budget,
+                used_bytes,
+                quota_bytes,
+            )
+            .await?;
             offset += window.len() as u64;
         }
     }
@@ -196,7 +299,18 @@ async fn ingest_stream(
     if !buffer.is_empty() {
         let tail = std::mem::take(&mut buffer);
         let len = tail.len() as u64;
-        persist_chunks(state, &tail, offset, &policy, &mut descriptors, &mut stats).await?;
+        persist_chunks(
+            state,
+            &tail,
+            offset,
+            &policy,
+            &mut descriptors,
+            &mut stats,
+            quota_budget,
+            used_bytes,
+            quota_bytes,
+        )
+        .await?;
         offset += len;
     }
     let _ = offset;
@@ -204,6 +318,7 @@ async fn ingest_stream(
     Ok((descriptors, stats))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_chunks(
     state: &AppState,
     data: &[u8],
@@ -211,35 +326,55 @@ async fn persist_chunks(
     policy: &ChunkPolicy,
     descriptors: &mut Vec<ChunkDescriptor>,
     stats: &mut DedupFileStats,
+    quota_budget: Option<u64>,
+    used_bytes: u64,
+    quota_bytes: Option<u64>,
 ) -> Result<(), IngestError> {
     let raw = chunk_bytes(data, policy);
 
     for (_hash, chunk, offset, length) in raw {
         let order = descriptors.len() as u32;
         let hash = _hash;
-        let store = state.chunks.clone();
-        let hash_for_store = hash.clone();
         let owned = chunk.to_vec();
 
-        // Store I/O is blocking; keep it off the async executor.
-        let already_exists = tokio::task::spawn_blocking(move || {
-            let had = store.has_chunk(&hash_for_store)?;
-            store.put_chunk(owned)?;
-            Ok::<bool, crate::error::CasError>(had)
-        })
-        .await
-        .map_err(|e| {
-            IngestError::Api(ApiError(crate::error::CasError::Store(format!(
-                "chunk worker failed: {e}"
-            ))))
-        })?
-        .map_err(|e| IngestError::Api(ApiError(e)))?;
+        // Step 1: dedup probe (blocking).
+        let probe = state.chunks.clone();
+        let hash_for_probe = hash.clone();
+        let already_exists = tokio::task::spawn_blocking(move || probe.has_chunk(&hash_for_probe))
+            .await
+            .map_err(|e| {
+                IngestError::Api(ApiError(crate::error::CasError::Store(format!(
+                    "chunk worker failed: {e}"
+                ))))
+            })?
+            .map_err(|e| IngestError::Api(ApiError(e)))?;
 
         if already_exists {
             stats.dedup_chunks += 1;
             stats.dedup_bytes += length as u64;
         } else {
+            // Step 2: quota gate before the bytes touch storage.
+            if let (Some(budget), Some(quota)) = (quota_budget, quota_bytes) {
+                if stats.new_bytes.saturating_add(length as u64) > budget {
+                    return Err(IngestError::QuotaExceeded { used: used_bytes, quota });
+                }
+            }
+
+            // Step 3: persist (blocking).
+            let store = state.chunks.clone();
+            let hash_for_store = hash.clone();
+            tokio::task::spawn_blocking(move || store.put_chunk(owned))
+                .await
+                .map_err(|e| {
+                    IngestError::Api(ApiError(crate::error::CasError::Store(format!(
+                        "chunk worker failed: {e}"
+                    ))))
+                })?
+                .map_err(|e| IngestError::Api(ApiError(e)))?;
+
+            crate::telemetry::record_storage_operation("chunk_store", "put", "ok");
             stats.new_chunks += 1;
+            stats.new_bytes += length as u64;
         }
 
         descriptors.push(ChunkDescriptor {

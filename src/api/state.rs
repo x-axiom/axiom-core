@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use crate::auth::service::AuthService;
+use crate::audit::AuditRepo;
+use crate::quota::{QuotaPolicy, UsageRepo};
 use crate::store::traits::{
     ChunkStore, NodeStore, PathIndexRepo, RefRepo, TreeStore, VersionRepo,
     WorkspaceRepo,
@@ -47,6 +49,12 @@ pub struct AppState {
     pub http_auth_mode: HttpAuthMode,
     /// Login / token-issuing service. `None` disables `/auth/*`.
     pub auth: Option<Arc<AuthService>>,
+    /// Tenant-level usage ledger. `None` disables quota enforcement.
+    pub usage: Option<Arc<dyn UsageRepo>>,
+    /// Plan → byte ceiling mapping.
+    pub quota: QuotaPolicy,
+    /// Security-relevant audit trail. `None` disables persistence (log only).
+    pub audit: Option<Arc<dyn AuditRepo>>,
 }
 
 impl AppState {
@@ -75,10 +83,13 @@ impl AppState {
             versions: meta.clone(),
             refs: meta.clone(),
             path_index: meta.clone(),
-            workspaces: Some(meta),
+            workspaces: Some(meta.clone()),
             tenant_directory: None,
             http_auth_mode: HttpAuthMode::Disabled,
             auth: None,
+            usage: Some(meta.clone()),
+            quota: QuotaPolicy::from_env(),
+            audit: Some(meta),
         }
     }
 
@@ -95,6 +106,9 @@ impl AppState {
             tenant_directory: None,
             http_auth_mode: HttpAuthMode::Disabled,
             auth: None,
+            usage: Some(Arc::new(crate::quota::MemoryUsageRepo::new())),
+            quota: QuotaPolicy::from_env(),
+            audit: Some(Arc::new(crate::audit::MemoryAuditRepo::new())),
         }
     }
 
@@ -113,10 +127,13 @@ impl AppState {
             versions: fdb.clone(),
             refs: fdb.clone(),
             path_index: fdb.clone(),
-            workspaces: Some(fdb),
+            workspaces: Some(fdb.clone()),
             tenant_directory: None,
             http_auth_mode: HttpAuthMode::TrustedGatewayHeaders,
             auth: None,
+            usage: Some(fdb.clone()),
+            quota: QuotaPolicy::from_env(),
+            audit: Some(fdb),
         }
     }
 
@@ -150,6 +167,9 @@ impl AppState {
             tenant_directory: None,
             http_auth_mode: HttpAuthMode::TrustedGatewayHeaders,
             auth: None,
+            usage: None,
+            quota: QuotaPolicy::from_env(),
+            audit: None,
         }
     }
 
@@ -167,6 +187,39 @@ impl AppState {
     pub fn with_workspaces(mut self, workspaces: Arc<dyn WorkspaceRepo>) -> Self {
         self.workspaces = Some(workspaces);
         self
+    }
+
+    /// Attach the usage ledger (cloud mode wires the FDB store).
+    pub fn with_usage(mut self, usage: Arc<dyn UsageRepo>) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Override the quota policy (tests / per-environment tiers).
+    pub fn with_quota_policy(mut self, quota: QuotaPolicy) -> Self {
+        self.quota = quota;
+        self
+    }
+
+    /// Attach the audit trail (cloud mode wires the FDB store).
+    pub fn with_audit(mut self, audit: Arc<dyn AuditRepo>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// Append one audit record, tolerating a missing repository.
+    pub fn record_audit(
+        &self,
+        actor: &str,
+        tenant_id: &str,
+        action: &str,
+        target: &str,
+        outcome: &str,
+    ) {
+        crate::audit::record(
+            self.audit.as_ref(),
+            crate::audit::AuditEvent::new(actor, tenant_id, action, target, outcome),
+        );
     }
 
     /// Attach the auth service and enable `/auth/*` routes.

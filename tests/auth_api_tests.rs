@@ -300,3 +300,54 @@ async fn workspace_list_is_scoped_to_the_callers_org() {
         "bob must not see alice's workspace, got {bob_list:?}"
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// P1-8: audit trail
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn audit_log_records_login_and_workspace_lifecycle() {
+    let h = start().await;
+    let tokens = dev_login_as(&h, "audit@example.com", "Audit").await;
+    let token = tokens["access_token"].as_str().unwrap();
+
+    let created: Value = reqwest::Client::new()
+        .post(format!("{}/api/v1/workspaces", h.base))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "name": "audited" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ws_id = created["id"].as_str().unwrap().to_owned();
+
+    reqwest::Client::new()
+        .delete(format!("{}/api/v1/workspaces/{ws_id}", h.base))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+
+    let events: Vec<Value> = reqwest::Client::new()
+        .get(format!("{}/api/v1/audit?limit=50", h.base))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let actions: Vec<&str> = events.iter().filter_map(|e| e["action"].as_str()).collect();
+    for expected in ["auth.login", "workspace.create", "workspace.delete"] {
+        assert!(actions.contains(&expected), "missing audit action {expected}: {actions:?}");
+    }
+
+    let first = events.first().unwrap();
+    assert!(!first["actor"].as_str().unwrap().is_empty());
+    assert!(!first["tenant_id"].as_str().unwrap().is_empty());
+    assert!(first["ts"].as_u64().unwrap() > 0);
+}

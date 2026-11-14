@@ -20,6 +20,8 @@ use state::{AppState, HttpAuthMode};
 
 /// Build the full axum `Router` with all route groups and middleware.
 pub fn build_router(state: AppState) -> Router {
+    telemetry::init_domain_metrics();
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -33,6 +35,8 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/v1/diff", routes::diff::router())
         .nest("/api/v1/upload", routes::upload::router())
         .nest("/api/v1", routes::download::router())
+        .merge(routes::usage::router())
+        .merge(routes::audit::router())
         .route("/api", get(api_index));
 
     let protected_api = match state.http_auth_mode {

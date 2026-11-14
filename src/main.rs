@@ -108,6 +108,46 @@ async fn main() {
         });
     }
 
+    // ── Recycle-bin reaper (P1-3) ────────────────────────────────────────
+    // Runs only when a workspace repository exists; interval is configurable
+    // and can be disabled with 0.
+    let purge_interval = std::env::var("AXIOM_RECYCLE_PURGE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(6 * 3600);
+    if purge_interval > 0 {
+        let reaper_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(purge_interval));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let purged = axiom_core::api::routes::workspaces::purge_expired_workspaces(&reaper_state);
+                if purged > 0 {
+                    tracing::info!(purged, "recycle bin: expired workspaces purged");
+                }
+            }
+        });
+    }
+
+    // ── Audit retention (P1-8): drop records older than 90 days ──────────
+    if let Some(audit) = state.audit.clone() {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let cutoff = axiom_core::audit::current_ts()
+                    .saturating_sub(axiom_core::audit::RETENTION_SECS);
+                match audit.purge_before(cutoff) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(removed = n, "audit retention: purged old records"),
+                    Err(err) => tracing::error!(error = %err, "audit retention failed"),
+                }
+            }
+        });
+    }
+
     let app = build_router(state);
 
     tracing::info!("axiom-core listening on {}", cli.listen);

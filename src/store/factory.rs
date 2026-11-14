@@ -397,6 +397,7 @@ impl StoreFactory {
             workspace: cfg.fdb.workspace,
         };
         let fdb = FdbMetadataStore::new(fdb_cfg)?;
+        let audit_repo: Arc<dyn crate::audit::AuditRepo> = Arc::new(fdb.clone());
         let tenant_repo = Arc::new(TenantRepo::new(cluster_file.as_deref())?);
 
         // ---- Optional cache layer ----
@@ -416,6 +417,7 @@ impl StoreFactory {
                     AppState::cloud_cached(cached_s3, cached_fdb)
                         .with_tenant_directory(tenant_repo)
                         .with_workspaces(workspace_repo)
+                        .with_audit(Arc::clone(&audit_repo))
                 }
                 Err(e) => {
                     // Cache is best-effort: log and continue without it.
@@ -425,6 +427,8 @@ impl StoreFactory {
                     AppState::cloud_uncached(s3, fdb)
                         .with_tenant_directory(tenant_repo)
                         .with_workspaces(workspace_repo)
+                        .with_audit(Arc::clone(&audit_repo))
+                        .with_audit(Arc::clone(&audit_repo))
                 }
             }
         } else {
@@ -432,6 +436,7 @@ impl StoreFactory {
             AppState::cloud_uncached(s3, fdb)
                 .with_tenant_directory(tenant_repo)
                 .with_workspaces(workspace_repo)
+                .with_audit(audit_repo)
         })
     }
 

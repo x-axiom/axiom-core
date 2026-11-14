@@ -5,7 +5,7 @@ pub mod repo;
 
 use crate::error::{CasError, CasResult};
 use self::model::{
-    Membership, OrgId, Organization, Role, TenantId, User, UserId, Workspace, WorkspaceId,
+    Membership, OrgId, Organization, Plan, Role, TenantId, User, UserId, Workspace, WorkspaceId,
 };
 
 /// Resolved identity scope for a signed-in user.
@@ -20,6 +20,8 @@ pub struct AccountContext {
     pub role: Role,
     /// Default workspace for the account (created on first login).
     pub workspace: Workspace,
+    /// Billing plan of the tenant (drives quota).
+    pub plan: Plan,
 }
 
 pub trait TenantDirectory: Send + Sync {

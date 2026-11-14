@@ -18,6 +18,11 @@ pub struct ErrorResponse {
     pub error: String,
     pub code: String,
     pub message: String,
+    /// Correlation id (also returned in the `x-request-id` header).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Whether the client may retry the same request.
+    pub retryable: bool,
 }
 
 /// Wrapper that implements `IntoResponse` for `CasError`.
@@ -51,10 +56,16 @@ impl IntoResponse for ApiError {
             CasError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "io_error"),
         };
 
+        let retryable = status.is_server_error()
+            || status == StatusCode::TOO_MANY_REQUESTS
+            || error_type == "token_expired";
+
         let body = ErrorResponse {
             error: error_type.to_string(),
             code: error_type.to_string(),
             message: self.0.to_string(),
+            request_id: crate::telemetry::current_request_id(),
+            retryable,
         };
 
         (status, Json(body)).into_response()

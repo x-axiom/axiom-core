@@ -60,6 +60,10 @@ pub struct AccessClaims {
     pub org_id: String,
     /// Role names: `"Owner"` | `"Admin"` | `"Member"` | `"Viewer"`.
     pub roles: Vec<String>,
+    /// Billing plan (`"free"` / `"pro"` / `"enterprise"`). Drives quota and
+    /// rate-limit tiers; absent in legacy tokens → treated as Free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
     /// Issued-at (Unix seconds).
     pub iat: u64,
     /// Expiry (Unix seconds).
@@ -280,12 +284,25 @@ impl JwtService {
         org_id: &str,
         roles: Vec<String>,
     ) -> CasResult<String> {
+        self.issue_access_token_with_plan(user_id, tenant_id, org_id, roles, None)
+    }
+
+    /// Sign an access token that also carries the tenant's billing plan.
+    pub fn issue_access_token_with_plan(
+        &self,
+        user_id: &str,
+        tenant_id: &str,
+        org_id: &str,
+        roles: Vec<String>,
+        plan: Option<&str>,
+    ) -> CasResult<String> {
         let now = unix_now();
         let claims = AccessClaims {
             sub: user_id.to_owned(),
             tenant_id: tenant_id.to_owned(),
             org_id: org_id.to_owned(),
             roles,
+            plan: plan.map(str::to_owned),
             iat: now,
             exp: now + ACCESS_TTL_SECS,
             jti: Uuid::new_v4().to_string(),
@@ -490,6 +507,7 @@ impl JwtService {
             tenant_id: tenant_id.to_owned(),
             org_id: org_id.to_owned(),
             roles,
+            plan: None,
             iat: now,
             exp,
             jti: Uuid::new_v4().to_string(),

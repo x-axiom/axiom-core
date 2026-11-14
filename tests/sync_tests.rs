@@ -235,6 +235,8 @@ async fn spawn_server(server: Backends) -> std::net::SocketAddr {
         session_ttl_secs: 3600,
         cleanup_interval_secs: 300,
         max_decompressed_bytes: 4 * 1024 * 1024 * 1024,
+        usage: None,
+        quota: axiom_core::quota::QuotaPolicy::default(),
     };
     let pull_state = PullServiceState {
         chunks: server.chunks.clone(),
@@ -2284,6 +2286,8 @@ async fn spawn_server_short_ttl(server: Backends) -> std::net::SocketAddr {
         session_ttl_secs: 1,
         cleanup_interval_secs: 1,
         max_decompressed_bytes: 4 * 1024 * 1024 * 1024,
+        usage: None,
+        quota: axiom_core::quota::QuotaPolicy::default(),
     };
     let pull_state = PullServiceState {
         chunks: server.chunks.clone(),
@@ -2449,6 +2453,8 @@ async fn spawn_server_with_quota(server: Backends, quota: u64) -> std::net::Sock
         session_ttl_secs: 3600,
         cleanup_interval_secs: 300,
         max_decompressed_bytes: quota,
+        usage: None,
+        quota: axiom_core::quota::QuotaPolicy::default(),
     };
     let pull_state = PullServiceState {
         chunks: server.chunks.clone(),
