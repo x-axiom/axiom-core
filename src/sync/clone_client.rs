@@ -25,6 +25,7 @@ use crate::store::traits::{
     ChunkStore, NodeStore, PathIndexRepo, RefRepo, SyncDirection, SyncSessionRepo, TreeStore,
     VersionRepo,
 };
+use crate::sync::client_auth::ClientAuth;
 use crate::sync::proto::{
     CloneDownloadRequest, CloneInitRequest, DownloadPackRequest, ListRefsRequest,
     NegotiatePullRequest, WantEntry,
@@ -94,12 +95,22 @@ pub struct CloneResult {
 /// Executes the clone protocol against a remote sync server.
 pub struct CloneClient {
     inner: SyncServiceClient<Channel>,
+    auth: ClientAuth,
 }
 
 impl CloneClient {
     /// Connect to a gRPC sync server at `endpoint`.
     pub async fn connect(
         endpoint: impl Into<tonic::transport::Endpoint>,
+    ) -> CasResult<Self> {
+        Self::connect_authenticated(endpoint, None).await
+    }
+
+    /// Connect to a gRPC sync server, optionally attaching a bearer token to
+    /// every request made by this client.
+    pub async fn connect_authenticated(
+        endpoint: impl Into<tonic::transport::Endpoint>,
+        auth_token: Option<&str>,
     ) -> CasResult<Self> {
         let channel = endpoint
             .into()
@@ -108,6 +119,7 @@ impl CloneClient {
             .map_err(|e| CasError::SyncError(format!("connect: {e}")))?;
         Ok(Self {
             inner: SyncServiceClient::new(channel),
+            auth: ClientAuth::from_token(auth_token)?,
         })
     }
 
@@ -186,10 +198,10 @@ impl CloneClient {
 
         let list_resp = self
             .inner
-            .list_refs(Request::new(ListRefsRequest {
+            .list_refs(self.auth.apply(Request::new(ListRefsRequest {
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("list_refs: {e}")))?
             .into_inner();
@@ -229,12 +241,12 @@ impl CloneClient {
 
         let neg_resp = self
             .inner
-            .negotiate_pull(Request::new(NegotiatePullRequest {
+            .negotiate_pull(self.auth.apply(Request::new(NegotiatePullRequest {
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
                 wants,
                 have_filter: Vec::new(),
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("negotiate_pull: {e}")))?
             .into_inner();
@@ -245,11 +257,11 @@ impl CloneClient {
         // ── Step 3: DownloadPack ──────────────────────────────────────────
         let mut dl_stream = self
             .inner
-            .download_pack(Request::new(DownloadPackRequest {
+            .download_pack(self.auth.apply(Request::new(DownloadPackRequest {
                 session_id: dl_session_id,
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("download_pack: {e}")))?
             .into_inner();
@@ -427,12 +439,12 @@ impl CloneClient {
 
         let init_resp = self
             .inner
-            .clone_init(Request::new(CloneInitRequest {
+            .clone_init(self.auth.apply(Request::new(CloneInitRequest {
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
                 depth: Some(depth),
                 refs: ref_names.to_vec(),
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("clone_init: {e}")))?
             .into_inner();
@@ -459,11 +471,11 @@ impl CloneClient {
         // ── Step 2: CloneDownload ─────────────────────────────────────────
         let mut dl_stream = self
             .inner
-            .clone_download(Request::new(CloneDownloadRequest {
+            .clone_download(self.auth.apply(Request::new(CloneDownloadRequest {
                 session_id: dl_session_id,
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("clone_download: {e}")))?
             .into_inner();
@@ -656,12 +668,12 @@ impl CloneClient {
 
         let neg_resp = self
             .inner
-            .negotiate_pull(Request::new(NegotiatePullRequest {
+            .negotiate_pull(self.auth.apply(Request::new(NegotiatePullRequest {
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
                 wants,
                 have_filter: Vec::new(),
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("negotiate_pull: {e}")))?
             .into_inner();
@@ -669,11 +681,11 @@ impl CloneClient {
         let total_objects = neg_resp.total_objects;
         let mut dl_stream = self
             .inner
-            .download_pack(Request::new(DownloadPackRequest {
+            .download_pack(self.auth.apply(Request::new(DownloadPackRequest {
                 session_id: neg_resp.session_id,
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("download_pack: {e}")))?
             .into_inner();

@@ -195,8 +195,9 @@ impl S3LifecycleManager {
             Ok(resp) => Ok(Some(resp.rules().to_vec())),
             Err(e) => {
                 let svc_err = e.into_service_error();
+                let msg = svc_err.to_string();
                 // AWS returns NoSuchLifecycleConfiguration when no rules exist.
-                if svc_err.is_no_such_lifecycle_configuration() {
+                if msg.contains("NoSuchLifecycleConfiguration") {
                     Ok(None)
                 } else {
                     Err(CasError::Store(format!(

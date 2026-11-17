@@ -13,6 +13,10 @@ pub mod remote;
 /// Remote-tracking refs management.
 pub mod remote_refs;
 
+/// Shared auth-header helper for cloud sync clients.
+#[cfg(feature = "cloud")]
+pub(crate) mod client_auth;
+
 /// Push client — four-step gRPC push protocol.
 #[cfg(feature = "cloud")]
 pub mod push_client;

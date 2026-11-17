@@ -58,7 +58,6 @@ id_type!(UserId);
 // ---------------------------------------------------------------------------
 
 /// Generate a new random UUID v4 string for entity IDs.
-#[cfg(feature = "fdb")]
 pub(crate) fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -106,7 +105,6 @@ pub struct Tenant {
     pub created_at: u64,
 }
 
-#[cfg(feature = "fdb")]
 impl Tenant {
     pub fn new(name: impl Into<String>, plan: Plan) -> Self {
         Self {
@@ -128,7 +126,6 @@ pub struct Organization {
     pub created_at: u64,
 }
 
-#[cfg(feature = "fdb")]
 impl Organization {
     pub fn new(tenant_id: TenantId, name: impl Into<String>) -> Self {
         Self {
@@ -154,7 +151,6 @@ pub struct Workspace {
     pub created_at: u64,
 }
 
-#[cfg(feature = "fdb")]
 impl Workspace {
     pub fn new(org_id: OrgId, name: impl Into<String>, storage_quota: u64) -> Self {
         Self {
@@ -177,7 +173,6 @@ pub struct User {
     pub created_at: u64,
 }
 
-#[cfg(feature = "fdb")]
 impl User {
     pub fn new(email: impl Into<String>, display_name: impl Into<String>) -> Self {
         Self {

@@ -59,7 +59,9 @@ use foundationdb::options::StreamingMode;
 
 use crate::error::{CasError, CasResult};
 use crate::model::{ChunkHash, NodeEntry, Ref, RefKind, TreeNode, VersionId, VersionNode};
-use super::traits::{PathEntry, PathIndexRepo, NodeStore, RefRepo, TreeStore, VersionRepo};
+use super::traits::{
+    NodeStore, PathEntry, PathIndexRepo, RefRepo, TreeStore, VersionRepo, Workspace, WorkspaceRepo,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -113,6 +115,7 @@ pub struct FdbConfig {
 /// [`PathIndexRepo`].  All operations are synchronous from the caller's
 /// perspective; FDB I/O is driven by the FDB network thread, and blocking is
 /// performed via `tokio::runtime::Handle::block_on`.
+#[derive(Clone)]
 pub struct FdbMetadataStore {
     db: Arc<Database>,
     /// Tenant identifier (embedded in every key).
@@ -134,7 +137,7 @@ impl FdbMetadataStore {
     /// this function and kept the returned `NetworkAutoStop` guard alive.
     pub fn new(cfg: FdbConfig) -> CasResult<Self> {
         let db = match &cfg.cluster_file {
-            Some(path) => Database::new_compat(path)
+            Some(path) => Database::from_path(path)
                 .map_err(|e| CasError::Store(format!("FDB open cluster file '{}' failed: {e}", path)))?,
             None => Database::default()
                 .map_err(|e| CasError::Store(format!("FDB open default cluster failed: {e}")))?,
@@ -289,7 +292,7 @@ impl FdbMetadataStore {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB put {segment}/{id}: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB put {segment}/{id}: {e}")))?;
 
         Ok(())
     }
@@ -322,7 +325,7 @@ impl FdbMetadataStore {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB delete {segment}/{id}: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB delete {segment}/{id}: {e}")))?;
 
         Ok(())
     }
@@ -396,6 +399,23 @@ impl NodeStore for FdbMetadataStore {
 // ---------------------------------------------------------------------------
 
 impl VersionRepo for FdbMetadataStore {
+    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
+        let prefix = self.make_key("ver", "");
+        let end = Self::prefix_end(&prefix);
+        let pairs = self.range_scan(prefix.clone(), end)?;
+        let mut ids = Vec::with_capacity(pairs.len());
+        for (key, _value) in pairs {
+            if key.len() <= prefix.len() {
+                continue;
+            }
+            match String::from_utf8(key[prefix.len()..].to_vec()) {
+                Ok(id) if !id.is_empty() => ids.push(VersionId(id)),
+                _ => tracing::warn!("FDB: skipping malformed version key"),
+            }
+        }
+        Ok(ids)
+    }
+
     fn put_version(&self, version: &VersionNode) -> CasResult<()> {
         self.put_json("ver", version.id.as_str(), version)
     }
@@ -429,6 +449,171 @@ impl VersionRepo for FdbMetadataStore {
 // ---------------------------------------------------------------------------
 // RefRepo
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct UsageRecord {
+    bytes: u64,
+}
+
+impl crate::quota::UsageRepo for FdbMetadataStore {
+    fn get(&self, tenant_id: &str) -> CasResult<u64> {
+        let record: Option<UsageRecord> = self.get_json("usage", tenant_id)?;
+        Ok(record.map(|r| r.bytes).unwrap_or(0))
+    }
+
+    fn add(&self, tenant_id: &str, delta: u64) -> CasResult<u64> {
+        // FDB transactions give us atomic read-modify-write; the helper below
+        // retries on conflict automatically.
+        let key = self.make_key("usage", tenant_id);
+        let rt = Self::rt()?;
+        let total = rt
+            .block_on(self.db.run(|trx, _| {
+                let key = key.clone();
+                async move {
+                    let current = trx.get(&key, false).await?;
+                    let mut bytes = current
+                        .and_then(|slice| serde_json::from_slice::<UsageRecord>(&slice).ok())
+                        .map(|r| r.bytes)
+                        .unwrap_or(0);
+                    bytes = bytes.saturating_add(delta);
+                    // `UsageRecord` holds a single u64, so serialization cannot fail.
+                    let encoded = serde_json::to_vec(&UsageRecord { bytes })
+                        .expect("usage record is always serializable");
+                    trx.set(&key, &encoded);
+                    Ok(bytes)
+                }
+            }))
+            .map_err(|e| CasError::Store(format!("FDB usage add: {e}")))?;
+        Ok(total)
+    }
+
+    fn set(&self, tenant_id: &str, bytes: u64) -> CasResult<()> {
+        self.put_json("usage", tenant_id, &UsageRecord { bytes })
+    }
+}
+
+impl crate::audit::AuditRepo for FdbMetadataStore {
+    fn append(&self, event: &crate::audit::AuditEvent) -> CasResult<()> {
+        let id = format!(
+            "{}\x00{:020}\x00{}",
+            event.tenant_id,
+            event.ts,
+            uuid::Uuid::new_v4()
+        );
+        self.put_json("audit", &id, event)
+    }
+
+    fn list(&self, tenant_id: &str, limit: usize) -> CasResult<Vec<crate::audit::AuditEvent>> {
+        let prefix = self.make_key("audit", &format!("{tenant_id}\x00"));
+        let end = Self::prefix_end(&prefix);
+        let pairs = self.range_scan(prefix, end)?;
+
+        let mut events: Vec<crate::audit::AuditEvent> = pairs
+            .into_iter()
+            .filter_map(|(_k, v)| serde_json::from_slice(&v).ok())
+            .collect();
+        events.sort_by(|a, b| b.ts.cmp(&a.ts));
+        events.truncate(limit);
+        Ok(events)
+    }
+
+    fn purge_before(&self, before_ts: u64) -> CasResult<usize> {
+        let prefix = self.make_key("audit", "");
+        let end = Self::prefix_end(&prefix);
+        let pairs = self.range_scan(prefix.clone(), end)?;
+
+        let mut removed = 0;
+        for (key, _value) in pairs {
+            if key.len() <= prefix.len() {
+                continue;
+            }
+            let id = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
+            // id = "{tenant}\x00{ts:020}\x00{uuid}"
+            let ts = id
+                .split('\x00')
+                .nth(1)
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .unwrap_or(u64::MAX);
+            if ts < before_ts {
+                self.delete_key("audit", &id)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
+impl WorkspaceRepo for FdbMetadataStore {
+    fn create_workspace(&self, ws: &Workspace) -> CasResult<()> {
+        if self.get_workspace(&ws.id)?.is_some() {
+            return Err(CasError::AlreadyExists);
+        }
+        self.put_json("ws", &ws.id, ws)
+    }
+
+    fn get_workspace(&self, id: &str) -> CasResult<Option<Workspace>> {
+        self.get_json("ws", id)
+    }
+
+    fn list_workspaces(&self) -> CasResult<Vec<Workspace>> {
+        let mut workspaces = self.scan_workspaces()?;
+        workspaces.retain(|w| w.deleted_at.is_none());
+        workspaces.sort_by_key(|w| w.created_at);
+        Ok(workspaces)
+    }
+
+    fn delete_workspace(&self, id: &str) -> CasResult<()> {
+        self.delete_key("ws", id)
+    }
+
+    fn update_workspace(&self, ws: &Workspace) -> CasResult<()> {
+        self.put_json("ws", &ws.id, ws)
+    }
+
+    fn soft_delete_workspace(&self, id: &str, deleted_at: u64) -> CasResult<()> {
+        let Some(mut ws) = self.get_workspace(id)? else {
+            return Ok(());
+        };
+        if ws.deleted_at.is_some() {
+            return Ok(());
+        }
+        ws.deleted_at = Some(deleted_at);
+        self.put_json("ws", &ws.id, &ws)
+    }
+
+    fn restore_workspace(&self, id: &str) -> CasResult<()> {
+        let Some(mut ws) = self.get_workspace(id)? else {
+            return Ok(());
+        };
+        ws.deleted_at = None;
+        self.put_json("ws", &ws.id, &ws)
+    }
+
+    fn list_deleted_workspaces(&self) -> CasResult<Vec<Workspace>> {
+        let mut workspaces = self.scan_workspaces()?;
+        workspaces.retain(|w| w.deleted_at.is_some());
+        workspaces.sort_by_key(|w| w.deleted_at);
+        Ok(workspaces)
+    }
+}
+
+impl FdbMetadataStore {
+    /// Scan every workspace record in this tenant/workspace subspace.
+    fn scan_workspaces(&self) -> CasResult<Vec<Workspace>> {
+        let start = self.make_key("ws", "");
+        let end = Self::prefix_end(&start);
+        let pairs = self.range_scan(start, end)?;
+
+        let mut out = Vec::with_capacity(pairs.len());
+        for (_k, v) in pairs {
+            match serde_json::from_slice::<Workspace>(&v) {
+                Ok(ws) => out.push(ws),
+                Err(e) => tracing::warn!(error = %e, "FDB: skipping malformed workspace entry"),
+            }
+        }
+        Ok(out)
+    }
+}
 
 impl RefRepo for FdbMetadataStore {
     fn put_ref(&self, r: &Ref) -> CasResult<()> {
@@ -487,16 +672,22 @@ impl RefRepo for FdbMetadataStore {
         let new_bytes = serde_json::to_vec(new_ref).expect("serialize Ref");
         let rt = Self::rt()?;
 
-        let swapped = rt
+        let (swapped, immutable_tag) = rt
             .block_on(self.db.run(|trx, _maybe_committed| {
                 let key = key.clone();
                 let expected = expected_target.clone();
                 let new_bytes = new_bytes.clone();
                 async move {
                     let current_raw = trx.get(&key, false).await?;
-                    let current_target: Option<String> = current_raw.and_then(|b| {
-                        serde_json::from_slice::<Ref>(&b).ok().map(|r| r.target.0)
-                    });
+                    let current_ref: Option<Ref> =
+                        current_raw.and_then(|bytes| serde_json::from_slice(&bytes).ok());
+                    if current_ref
+                        .as_ref()
+                        .is_some_and(|current| current.kind == RefKind::Tag)
+                    {
+                        return Ok((false, true));
+                    }
+                    let current_target = current_ref.map(|current| current.target.0);
 
                     let condition_met = match (&current_target, &expected) {
                         (None, None) => true,
@@ -506,14 +697,17 @@ impl RefRepo for FdbMetadataStore {
 
                     if condition_met {
                         trx.set(&key, &new_bytes);
-                        Ok(true)
+                        Ok((true, false))
                     } else {
-                        Ok(false)
+                        Ok((false, false))
                     }
                 }
             }))
-            .map_err(|e: FdbError| CasError::Store(format!("FDB compare_and_swap_ref '{name}': {e}")))?;
+            .map_err(|e| CasError::Store(format!("FDB compare_and_swap_ref '{name}': {e}")))?;
 
+        if immutable_tag {
+            return Err(CasError::AlreadyExists);
+        }
         Ok(swapped)
     }
 }
@@ -548,7 +742,7 @@ impl PathIndexRepo for FdbMetadataStore {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB put_path_entry: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB put_path_entry: {e}")))?;
 
         Ok(())
     }

@@ -1,8 +1,7 @@
-# syntax=docker/dockerfile:1.7
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 1: builder
 # ─────────────────────────────────────────────────────────────────────────────
-FROM rust:1.82-slim AS builder
+FROM rust:1.85-slim AS builder
 
 # RocksDB requires cmake + clang + libz + libsnappy.
 # rusqlite uses the bundled feature (no system sqlite needed).
@@ -23,6 +22,7 @@ WORKDIR /build
 
 # ── Dependency layer cache ────────────────────────────────────────────────────
 COPY Cargo.toml Cargo.toml
+COPY Cargo.lock Cargo.lock
 RUN mkdir src && echo 'fn main(){}' > src/main.rs \
     && cargo build --release --features local 2>/dev/null; rm -rf src
 
@@ -42,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         liblz4-1 \
         libzstd1 \
         libz1 \
+        wget \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

@@ -2,7 +2,26 @@
 
 use std::sync::Arc;
 
-use crate::store::traits::{ChunkStore, TreeStore, NodeStore, VersionRepo, RefRepo, PathIndexRepo};
+use crate::auth::service::AuthService;
+use crate::audit::AuditRepo;
+use crate::quota::{QuotaPolicy, UsageRepo};
+use crate::store::traits::{
+    ChunkStore, NodeStore, PathIndexRepo, RefRepo, TreeStore, VersionRepo,
+    WorkspaceRepo,
+};
+use crate::tenant::TenantDirectory;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpAuthMode {
+    /// No authentication (local single-user / desktop embedding).
+    Disabled,
+    /// Trust identity headers injected by axiom-gateway after JWT verification.
+    TrustedGatewayHeaders,
+    /// Verify `Authorization: Bearer <access token>` directly with the auth
+    /// service. Used when core is reachable without a gateway (dev) or as
+    /// defence-in-depth behind one.
+    Jwt,
+}
 
 /// Shared application state available to all route handlers.
 ///
@@ -22,6 +41,22 @@ pub struct AppState {
     pub refs: Arc<dyn RefRepo>,
     /// Path-based metadata index.
     pub path_index: Arc<dyn PathIndexRepo>,
+    /// Workspace metadata repository when backend supports workspace CRUD.
+    pub workspaces: Option<Arc<dyn WorkspaceRepo>>,
+    /// Tenant/member directory for SaaS workspace and team management.
+    pub tenant_directory: Option<Arc<dyn TenantDirectory>>,
+    /// HTTP auth integration mode for protected REST routes.
+    pub http_auth_mode: HttpAuthMode,
+    /// Login / token-issuing service. `None` disables `/auth/*`.
+    pub auth: Option<Arc<AuthService>>,
+    /// Tenant-level usage ledger. `None` disables quota enforcement.
+    pub usage: Option<Arc<dyn UsageRepo>>,
+    /// Plan → byte ceiling mapping.
+    pub quota: QuotaPolicy,
+    /// Security-relevant audit trail. `None` disables persistence (log only).
+    pub audit: Option<Arc<dyn AuditRepo>>,
+    /// Browser origins allowed to call the API. Empty means "no cross-origin".
+    pub cors_origins: Vec<String>,
 }
 
 impl AppState {
@@ -49,7 +84,15 @@ impl AppState {
             nodes: cas,
             versions: meta.clone(),
             refs: meta.clone(),
-            path_index: meta,
+            path_index: meta.clone(),
+            workspaces: Some(meta.clone()),
+            tenant_directory: None,
+            http_auth_mode: HttpAuthMode::Disabled,
+            auth: None,
+            usage: Some(meta.clone()),
+            quota: QuotaPolicy::from_env(),
+            audit: Some(meta),
+            cors_origins: default_cors_origins(),
         }
     }
 
@@ -62,6 +105,14 @@ impl AppState {
             versions: Arc::new(crate::store::InMemoryVersionRepo::new()),
             refs: Arc::new(crate::store::InMemoryRefRepo::new()),
             path_index: Arc::new(crate::store::InMemoryPathIndex::new()),
+            workspaces: None,
+            tenant_directory: None,
+            http_auth_mode: HttpAuthMode::Disabled,
+            auth: None,
+            usage: Some(Arc::new(crate::quota::MemoryUsageRepo::new())),
+            quota: QuotaPolicy::from_env(),
+            audit: Some(Arc::new(crate::audit::MemoryAuditRepo::new())),
+            cors_origins: default_cors_origins(),
         }
     }
 
@@ -79,7 +130,15 @@ impl AppState {
             nodes: fdb.clone(),
             versions: fdb.clone(),
             refs: fdb.clone(),
-            path_index: fdb,
+            path_index: fdb.clone(),
+            workspaces: Some(fdb.clone()),
+            tenant_directory: None,
+            http_auth_mode: HttpAuthMode::TrustedGatewayHeaders,
+            auth: None,
+            usage: Some(fdb.clone()),
+            quota: QuotaPolicy::from_env(),
+            audit: Some(fdb),
+            cors_origins: default_cors_origins(),
         }
     }
 
@@ -109,6 +168,114 @@ impl AppState {
             versions: meta.clone(),
             refs: meta.clone(),
             path_index: meta,
+            workspaces: None,
+            tenant_directory: None,
+            http_auth_mode: HttpAuthMode::TrustedGatewayHeaders,
+            auth: None,
+            usage: None,
+            quota: QuotaPolicy::from_env(),
+            audit: None,
+            cors_origins: default_cors_origins(),
         }
     }
+
+    pub fn with_http_auth(mut self, http_auth_mode: HttpAuthMode) -> Self {
+        self.http_auth_mode = http_auth_mode;
+        self
+    }
+
+    pub fn with_tenant_directory(mut self, tenant_directory: Arc<dyn TenantDirectory>) -> Self {
+        self.tenant_directory = Some(tenant_directory);
+        self
+    }
+
+    /// Attach the workspace repository (cloud mode wires the FDB store).
+    pub fn with_workspaces(mut self, workspaces: Arc<dyn WorkspaceRepo>) -> Self {
+        self.workspaces = Some(workspaces);
+        self
+    }
+
+    /// Attach the usage ledger (cloud mode wires the FDB store).
+    pub fn with_usage(mut self, usage: Arc<dyn UsageRepo>) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Override the quota policy (tests / per-environment tiers).
+    pub fn with_quota_policy(mut self, quota: QuotaPolicy) -> Self {
+        self.quota = quota;
+        self
+    }
+
+    /// Attach the audit trail (cloud mode wires the FDB store).
+    pub fn with_audit(mut self, audit: Arc<dyn AuditRepo>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// Override the CORS allowlist (tests / per-environment policy).
+    pub fn with_cors_origins(mut self, origins: Vec<String>) -> Self {
+        self.cors_origins = origins;
+        self
+    }
+
+    /// Append one audit record, tolerating a missing repository.
+    pub fn record_audit(
+        &self,
+        actor: &str,
+        tenant_id: &str,
+        action: &str,
+        target: &str,
+        outcome: &str,
+    ) {
+        crate::audit::record(
+            self.audit.as_ref(),
+            crate::audit::AuditEvent::new(actor, tenant_id, action, target, outcome),
+        );
+    }
+
+    /// Attach the auth service and enable `/auth/*` routes.
+    ///
+    /// The auth service's tenant directory becomes the state's directory when
+    /// none is configured, so login and workspace APIs always agree on the
+    /// caller's organization.
+    pub fn with_auth(mut self, auth: Arc<AuthService>) -> Self {
+        if self.tenant_directory.is_none() {
+            self.tenant_directory = Some(auth.directory());
+        }
+        self.auth = Some(auth);
+        self
+    }
+}
+
+/// Browser origins allowed by default.
+///
+/// Production must configure `AXIOM_CORS_ORIGINS` explicitly; local dev gets
+/// the console and Tauri origins so `npm run dev` keeps working.
+pub fn default_cors_origins() -> Vec<String> {
+    if let Ok(raw) = std::env::var("AXIOM_CORS_ORIGINS") {
+        return raw
+            .split(',')
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+
+    if std::env::var("AXIOM_ENV").as_deref() == Ok("production") {
+        // Fail closed: no allowlist means no cross-origin browser access.
+        return Vec::new();
+    }
+
+    vec![
+        "http://localhost:3000".into(),
+        "http://localhost:3001".into(),
+        "http://localhost:5173".into(),
+        "http://127.0.0.1:3000".into(),
+        "http://127.0.0.1:3001".into(),
+        "http://127.0.0.1:5173".into(),
+        "tauri://localhost".into(),
+        "http://tauri.localhost".into(),
+        "https://tauri.localhost".into(),
+    ]
 }

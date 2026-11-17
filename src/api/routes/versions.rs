@@ -69,7 +69,13 @@ async fn get_history(
     Path(id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> ApiResult<Json<PaginatedVersionListResponse>> {
-    version_history_service(&state, &id, query.limit, query.offset).map(Json)
+    version_history_service(
+        &state,
+        &id,
+        crate::api::pagination::clamp_limit(query.limit),
+        query.offset,
+    )
+    .map(Json)
 }
 
 /// Synchronous service for paginated version history starting at a ref/id.
@@ -79,6 +85,7 @@ pub fn version_history_service(
     limit: usize,
     offset: usize,
 ) -> ApiResult<PaginatedVersionListResponse> {
+    let limit = crate::api::pagination::clamp_limit(limit);
     let start = super::helpers::resolve_version_node(ref_str, state.versions.as_ref(), state.refs.as_ref())?;
 
     // Fetch one more than limit+offset to determine has_more.

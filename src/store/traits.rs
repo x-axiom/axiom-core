@@ -69,6 +69,16 @@ pub trait VersionRepo: Send + Sync {
     /// List version history starting from a given version, walking parents.
     /// Returns up to `limit` versions in reverse chronological order.
     fn list_history(&self, from: &VersionId, limit: usize) -> CasResult<Vec<VersionNode>>;
+
+    /// Enumerate every version id in this repository.
+    ///
+    /// Backends that cannot scan versions leave the default, which fails loudly
+    /// instead of silently returning an empty set.
+    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
+        Err(crate::error::CasError::Store(
+            "list_all_version_ids is not supported by this backend".into(),
+        ))
+    }
 }
 
 /// Repository for branch and tag refs.
@@ -92,10 +102,9 @@ pub trait RefRepo: Send + Sync {
     /// When the condition is **not** met, leaves the store unchanged and returns
     /// `Ok(false)`.
     ///
-    /// The default implementation is a **non-atomic** read-check-write, which
-    /// is safe for single-process use (SQLite/in-memory).  The FoundationDB
-    /// backend overrides this with a genuinely atomic FDB transaction, making
-    /// it safe under concurrent writers.
+    /// The default implementation is a **non-atomic** read-check-write and
+    /// must only be used when callers are externally serialized. Backends
+    /// that support concurrent writers must override it with an atomic op.
     fn compare_and_swap_ref(
         &self,
         name: &str,
@@ -176,13 +185,21 @@ pub trait SyncStore: Send + Sync {
     }
 
     /// Return every version id known to this store.
-    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>>;
+    ///
+    /// Used by the sync graph walker and GC. Backends that cannot enumerate
+    /// versions cheaply may leave the default, which reports a clear error
+    /// rather than silently returning an empty set.
+    fn list_all_version_ids(&self) -> CasResult<Vec<VersionId>> {
+        Err(crate::error::CasError::Store(
+            "list_all_version_ids is not supported by this backend".into(),
+        ))
+    }
 }
 
 /// A workspace record. Workspaces are logical containers used by the SaaS
 /// product for multi-tenant isolation; in Phase 0 (single-user local mode)
 /// only the seeded `default` workspace is meaningful.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Workspace {
     pub id: String,
     pub name: String,
@@ -328,6 +345,8 @@ pub struct Remote {
 pub trait RemoteRepo: Send + Sync {
     /// Add a remote. Returns `CasError::AlreadyExists` if name is taken.
     fn add_remote(&self, remote: &Remote) -> CasResult<()>;
+    /// Update an existing remote in place.
+    fn update_remote(&self, remote: &Remote) -> CasResult<()>;
     /// Remove a remote and cascade-delete its remote_refs and sync_sessions.
     fn remove_remote(&self, name: &str) -> CasResult<()>;
     /// Get a remote by name.
@@ -339,6 +358,9 @@ pub trait RemoteRepo: Send + Sync {
 impl<T: RemoteRepo + ?Sized> RemoteRepo for Arc<T> {
     fn add_remote(&self, remote: &Remote) -> CasResult<()> {
         (**self).add_remote(remote)
+    }
+    fn update_remote(&self, remote: &Remote) -> CasResult<()> {
+        (**self).update_remote(remote)
     }
     fn remove_remote(&self, name: &str) -> CasResult<()> {
         (**self).remove_remote(name)

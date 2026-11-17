@@ -77,8 +77,6 @@
 
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 
 use crate::api::state::AppState;
@@ -364,6 +362,7 @@ impl StoreFactory {
         use crate::store::cache::{CacheClient, CacheConfig, CachedChunkStore, CachedMetadataStore};
         use crate::store::fdb::{FdbConfig, FdbMetadataStore};
         use crate::store::s3::{S3ChunkStore, S3Config, StaticCredentials};
+        use crate::tenant::repo::TenantRepo;
 
         // ---- S3 chunk store ----
         let credentials = match (&cfg.s3.access_key_id, &cfg.s3.secret_access_key) {
@@ -391,12 +390,15 @@ impl StoreFactory {
         let s3 = S3ChunkStore::new(s3_cfg);
 
         // ---- FDB metadata store ----
+        let cluster_file = cfg.fdb.cluster_file.clone();
         let fdb_cfg = FdbConfig {
             cluster_file: cfg.fdb.cluster_file,
             tenant: cfg.fdb.tenant,
             workspace: cfg.fdb.workspace,
         };
         let fdb = FdbMetadataStore::new(fdb_cfg)?;
+        let audit_repo: Arc<dyn crate::audit::AuditRepo> = Arc::new(fdb.clone());
+        let tenant_repo = Arc::new(TenantRepo::new(cluster_file.as_deref())?);
 
         // ---- Optional cache layer ----
         Ok(if let Some(cache_cfg) = cfg.cache {
@@ -409,17 +411,32 @@ impl StoreFactory {
                 Ok(client) => {
                     let client = Arc::new(client);
                     let cached_s3 = CachedChunkStore::new(s3, Arc::clone(&client));
+                    let workspace_repo: Arc<dyn crate::store::WorkspaceRepo> =
+                        Arc::new(fdb.clone());
                     let cached_fdb = CachedMetadataStore::new(fdb, Arc::clone(&client));
                     AppState::cloud_cached(cached_s3, cached_fdb)
+                        .with_tenant_directory(tenant_repo)
+                        .with_workspaces(workspace_repo)
+                        .with_audit(Arc::clone(&audit_repo))
                 }
                 Err(e) => {
                     // Cache is best-effort: log and continue without it.
                     tracing::warn!(error = %e, "StoreFactory: cache init failed, running without cache");
+                    let workspace_repo: Arc<dyn crate::store::WorkspaceRepo> =
+                        Arc::new(fdb.clone());
                     AppState::cloud_uncached(s3, fdb)
+                        .with_tenant_directory(tenant_repo)
+                        .with_workspaces(workspace_repo)
+                        .with_audit(Arc::clone(&audit_repo))
+                        .with_audit(Arc::clone(&audit_repo))
                 }
             }
         } else {
+            let workspace_repo: Arc<dyn crate::store::WorkspaceRepo> = Arc::new(fdb.clone());
             AppState::cloud_uncached(s3, fdb)
+                .with_tenant_directory(tenant_repo)
+                .with_workspaces(workspace_repo)
+                .with_audit(audit_repo)
         })
     }
 

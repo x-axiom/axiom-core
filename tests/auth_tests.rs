@@ -18,9 +18,6 @@
 //! cargo test --test auth_tests --features fdb -- --include-ignored
 //! ```
 
-// All auth types are gated behind the `fdb` feature.
-#![cfg(feature = "fdb")]
-
 // ---------------------------------------------------------------------------
 // RBAC matrix tests — no feature gate, no FDB, always compiled
 // ---------------------------------------------------------------------------
@@ -258,32 +255,25 @@ mod jwt_tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use axum::routing::get;
-    use foundationdb::Database;
     use tower::ServiceExt;
 
     // ------------------------------------------------------------------
-    // FDB boot (once per test process)
+    // Service factories (in-memory refresh store — no FDB needed)
     // ------------------------------------------------------------------
 
-    static FDB_GUARD: OnceLock<foundationdb::api::NetworkAutoStop> = OnceLock::new();
-
-    fn boot_fdb() {
-        FDB_GUARD.get_or_init(|| unsafe { foundationdb::boot() });
-    }
-
     async fn make_svc() -> JwtService {
-        boot_fdb();
-        let db = Arc::new(Database::default().expect("FDB default database"));
-        JwtService::with_generated_key(db).expect("JwtService init")
+        JwtService::with_memory_store().expect("JwtService init")
     }
 
     async fn make_svc_two_keys() -> JwtService {
-        boot_fdb();
-        let db = Arc::new(Database::default().expect("FDB default database"));
         let k0 = JwtKeyPair::generate().unwrap();
         let k1 = JwtKeyPair::generate().unwrap();
         // active key is k1
-        JwtService::new(vec![k0, k1], 1, db)
+        JwtService::new(
+            vec![k0, k1],
+            1,
+            Arc::new(axiom_core::auth::refresh::MemoryRefreshTokenStore::new()),
+        )
     }
 
     fn unix_now() -> u64 {
@@ -298,7 +288,6 @@ mod jwt_tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_issue_and_verify_access_token() {
         let svc = make_svc().await;
         let token = svc
@@ -314,21 +303,20 @@ mod jwt_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_expired_token_returns_unauthorized() {
         let svc = make_svc().await;
         // Issue a token that expired 60 seconds ago.
-        let past_exp = unix_now().saturating_sub(60);
+        // Default verification leeway is 60s; expire well beyond it.
+        let past_exp = unix_now().saturating_sub(300);
         let token = svc
             .issue_access_token_with_exp("user-1", "t1", "o1", vec!["Owner".into()], past_exp)
             .unwrap();
 
         let err = svc.verify_access_token(&token).unwrap_err();
-        assert!(matches!(err, CasError::Unauthorized(_)), "expected Unauthorized, got {err:?}");
+        assert!(matches!(err, CasError::TokenExpired(_)), "expected TokenExpired, got {err:?}");
     }
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_tampered_token_rejected() {
         let svc = make_svc().await;
         let token = svc
@@ -346,7 +334,6 @@ mod jwt_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_malformed_token_rejected() {
         let svc = make_svc().await;
         let err = svc.verify_access_token("not.a.jwt").unwrap_err();
@@ -358,7 +345,6 @@ mod jwt_tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_key_rotation_both_keys_can_verify() {
         let svc = make_svc_two_keys().await;
 
@@ -373,7 +359,6 @@ mod jwt_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_wrong_service_rejects_token() {
         let svc_a = make_svc().await;
         let svc_b = make_svc().await; // different key
@@ -391,7 +376,6 @@ mod jwt_tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_jwks_contains_all_public_keys() {
         let svc = make_svc_two_keys().await;
         let jwks = svc.jwks();
@@ -409,7 +393,6 @@ mod jwt_tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_access_token_contains_no_sensitive_fields() {
         let svc = make_svc().await;
         let token = svc
@@ -438,7 +421,6 @@ mod jwt_tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_cross_tenant_claims_are_isolated() {
         let svc = make_svc().await;
 
@@ -463,7 +445,6 @@ mod jwt_tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_concurrent_access_token_issuance() {
         let svc = Arc::new(make_svc().await);
         let handles: Vec<_> = (0..20)
@@ -502,44 +483,30 @@ mod jwt_tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_refresh_token_single_use() {
         let svc = make_svc().await;
-        let token = svc.issue_refresh_token("user-1").await.unwrap();
+        let token = svc.issue_refresh_token("user-1").unwrap();
 
         // First use: succeeds.
-        let user_id = svc.verify_and_consume_refresh_token(&token).await.unwrap();
+        let user_id = svc.verify_and_consume_refresh_token(&token).unwrap();
         assert_eq!(user_id, "user-1");
 
         // Second use: must fail (single-use).
-        let err = svc.verify_and_consume_refresh_token(&token).await.unwrap_err();
+        let err = svc.verify_and_consume_refresh_token(&token).unwrap_err();
         assert!(matches!(err, CasError::Unauthorized(_)));
     }
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_refresh_token_revocation() {
         let svc = make_svc().await;
-        let token = svc.issue_refresh_token("user-1").await.unwrap();
+        let token = svc.issue_refresh_token("user-1").unwrap();
 
-        // Revoke before use.
-        let claims: axiom_core::auth::jwt::AccessClaims = {
-            // We don't have direct access to RefreshClaims, but we can parse
-            // the jti from the base64 payload to get the jti for revocation.
-            // Instead, verify+consume once to get the side-effect, but we want
-            // to test revoke_refresh_token. Let's revoke via token directly.
-            //
-            // JwtService::revoke_refresh_token needs a jti string.
-            // We'll decode the token payload manually.
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            let parts: Vec<&str> = token.split('.').collect();
-            let payload = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
-            serde_json::from_slice(&payload).unwrap()
-        };
-        svc.revoke_refresh_token(&claims.jti).await.unwrap();
+        // Revoke before use (jti extracted without consuming the token).
+        let jti = svc.refresh_token_jti(&token).unwrap();
+        svc.revoke_refresh_token(&jti).unwrap();
 
         // After revocation, token should be rejected.
-        let err = svc.verify_and_consume_refresh_token(&token).await.unwrap_err();
+        let err = svc.verify_and_consume_refresh_token(&token).unwrap_err();
         assert!(matches!(err, CasError::Unauthorized(_)));
     }
 
@@ -554,7 +521,6 @@ mod jwt_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_auth_middleware_no_token_returns_401() {
         let svc = Arc::new(make_svc().await);
         let app = make_auth_router(svc);
@@ -568,7 +534,6 @@ mod jwt_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_auth_middleware_valid_token_passes() {
         let svc = Arc::new(make_svc().await);
         let token = svc
@@ -586,10 +551,10 @@ mod jwt_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_auth_middleware_expired_token_returns_401() {
         let svc = Arc::new(make_svc().await);
-        let past_exp = unix_now().saturating_sub(60);
+        // Default verification leeway is 60s; expire well beyond it.
+        let past_exp = unix_now().saturating_sub(300);
         let token = svc
             .issue_access_token_with_exp("u1", "t1", "o1", vec!["Owner".into()], past_exp)
             .unwrap();
@@ -605,7 +570,6 @@ mod jwt_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_auth_middleware_invalid_bearer_scheme_returns_401() {
         let svc = Arc::new(make_svc().await);
         let app = make_auth_router(svc);
@@ -620,7 +584,6 @@ mod jwt_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires foundationdb cluster"]
     async fn test_auth_middleware_injects_auth_context() {
         use axum::Extension;
 

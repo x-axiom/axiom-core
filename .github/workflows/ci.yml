@@ -1,0 +1,54 @@
+name: Core CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install RocksDB build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake libz-dev libsnappy-dev liblz4-dev libzstd-dev pkg-config libssl-dev
+
+      # Engine + HTTP API + auth loop (local feature).
+      - run: cargo test --locked --features local
+
+      # The sync gRPC service must actually serve over TCP (cloud feature,
+      # no FoundationDB required).
+      - run: cargo test --locked --features cloud --test grpc_smoke_tests
+
+      # Sync protocol round-trip.
+      - run: cargo test --locked --features cloud --test sync_tests
+
+      # The OpenAPI document is part of the contract (P2-5); fail on invalid JSON.
+      - name: Validate OpenAPI document
+        run: python3 -c "import json;json.load(open('openapi/axiom-v1.json'))"
+
+      # Cloud backend must type-check (the FDB client is not installed on the
+      # runner, so this is a check, not a link).
+      - run: cargo check --locked --no-default-features --features "cloud,fdb" --bin axiom-core
+
+      # Advisory: the existing code base still carries lint debt, so this
+      # reports rather than blocks. Tighten to `-- -D warnings` once clean.
+      - run: cargo clippy --locked --all-targets --features local
+
+      - name: Docker build (local image)
+        run: docker build --tag axiom-core:local .
+
+      - name: Docker build (cloud image)
+        run: docker build -f Dockerfile.cloud --tag axiom-core:cloud .

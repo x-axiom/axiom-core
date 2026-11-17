@@ -38,3 +38,20 @@ pub fn resolve_version_node(
         "version or ref '{ref_str}' not found"
     ))))
 }
+
+/// Run a blocking store call on the blocking pool so it never occupies a
+/// Tokio worker (P1-7). Store backends (RocksDB, SQLite, S3 SDK calls behind a
+/// blocking facade) are synchronous by design.
+pub async fn run_blocking<T, F>(f: F) -> crate::api::error::ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> crate::api::error::ApiResult<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| {
+            crate::api::error::ApiError(crate::error::CasError::Store(format!(
+                "blocking task failed: {e}"
+            )))
+        })?
+}

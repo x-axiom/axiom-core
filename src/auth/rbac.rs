@@ -105,6 +105,20 @@ pub struct AuthContext {
     pub role: Role,
 }
 
+/// Billing plan resolved from the JWT (`plan` claim) or the
+/// `x-plan` header injected by the gateway.
+///
+/// Kept out of [`AuthContext`] so identity and commercial tier can evolve
+/// independently.
+#[derive(Clone, Debug, Default)]
+pub struct PlanContext(pub Option<String>);
+
+impl PlanContext {
+    pub fn as_deref(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
 impl AuthContext {
     /// Return `true` if this context grants `permission`.
     pub fn can(&self, permission: Permission) -> bool {

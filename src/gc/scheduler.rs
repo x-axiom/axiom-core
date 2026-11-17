@@ -34,7 +34,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use foundationdb::{Database, FdbError};
+use foundationdb::Database;
 use prometheus::{Counter, CounterVec, Histogram, HistogramOpts, Opts, Registry};
 use tokio::task::JoinHandle;
 
@@ -137,7 +137,7 @@ impl FdbGcLock {
                     Ok(should_acquire)
                 }
             }))
-            .map_err(|e: FdbError| CasError::Store(format!("FDB gc_lock try_acquire: {e}")))?;
+            .map_err(|e| CasError::Store(format!("FDB gc_lock try_acquire: {e}")))?;
 
         Ok(acquired)
     }
@@ -169,7 +169,7 @@ impl FdbGcLock {
                 Ok(())
             }
         }))
-        .map_err(|e: FdbError| CasError::Store(format!("FDB gc_lock release: {e}")))?;
+        .map_err(|e| CasError::Store(format!("FDB gc_lock release: {e}")))?;
 
         Ok(())
     }

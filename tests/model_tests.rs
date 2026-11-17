@@ -3,6 +3,7 @@ mod tests {
     use axiom_core::model::*;
     use axiom_core::store::*;
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Barrier};
 
     // ── ChunkStore ──────────────────────────────────────────
 
@@ -304,6 +305,71 @@ mod tests {
             target: VersionId::from("v2"),
         };
         assert!(repo.put_ref(&duplicate).is_err());
+    }
+
+    #[test]
+    fn ref_repo_compare_and_swap_allows_only_one_concurrent_writer() {
+        fn assert_single_cas_winner(repo: Arc<dyn RefRepo>) {
+            let initial = Ref {
+                name: "main".into(),
+                kind: RefKind::Branch,
+                target: VersionId::from("v1"),
+            };
+            repo.put_ref(&initial).unwrap();
+
+            let writers = 8;
+            let barrier = Arc::new(Barrier::new(writers));
+            let handles: Vec<_> = (0..writers)
+                .map(|index| {
+                    let repo = Arc::clone(&repo);
+                    let barrier = Arc::clone(&barrier);
+                    let expected = initial.target.clone();
+                    std::thread::spawn(move || {
+                        let new_ref = Ref {
+                            name: "main".into(),
+                            kind: RefKind::Branch,
+                            target: VersionId::from(format!("candidate-{index}")),
+                        };
+                        barrier.wait();
+                        repo.compare_and_swap_ref("main", Some(&expected), &new_ref)
+                            .unwrap()
+                    })
+                })
+                .collect();
+
+            let successes = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|success| *success)
+                .count();
+            assert_eq!(successes, 1);
+        }
+
+        assert_single_cas_winner(Arc::new(InMemoryRefRepo::new()));
+        let sqlite = SqliteMetadataStore::open_in_memory().unwrap();
+        sqlite
+            .put_version(&VersionNode {
+                id: VersionId::from("v1"),
+                parents: vec![],
+                root: hash_bytes(b"root"),
+                message: "initial".into(),
+                timestamp: 1,
+                metadata: Default::default(),
+            })
+            .unwrap();
+        for index in 0..8 {
+            sqlite
+                .put_version(&VersionNode {
+                    id: VersionId::from(format!("candidate-{index}")),
+                    parents: vec![VersionId::from("v1")],
+                    root: hash_bytes(format!("root-{index}").as_bytes()),
+                    message: "candidate".into(),
+                    timestamp: 2,
+                    metadata: Default::default(),
+                })
+                .unwrap();
+        }
+        assert_single_cas_winner(Arc::new(sqlite));
     }
 
     #[test]

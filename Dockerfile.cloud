@@ -1,0 +1,86 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# axiom-core — cloud (S3 + FoundationDB) image
+#
+# Separate from the local-mode Dockerfile on purpose:
+#   * `--no-default-features --features "cloud,fdb"` drops RocksDB/SQLite, so
+#     the binary is stateless and safe to run behind a Service with N replicas.
+#   * links against libfdb_c, which must be present at build AND runtime.
+#
+# Build:
+#   docker build -f Dockerfile.cloud -t axiom-core:0.5.0 .
+#
+# Run (needs a mounted FDB cluster file):
+#   docker run --rm -p 3000:3000 -p 50051:50051 \
+#     -e AXIOM_BACKEND=cloud -e AXIOM_S3_BUCKET=... \
+#     -e AXIOM_FDB_TENANT=axiom -e AXIOM_FDB_WORKSPACE=production \
+#     -e AXIOM_FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster \
+#     -v /etc/foundationdb/fdb.cluster:/etc/foundationdb/fdb.cluster:ro \
+#     axiom-core:0.5.0
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Stage 0: source of libfdb_c.so (avoids compiling the FDB client).
+FROM foundationdb/foundationdb:7.3.27 AS fdb
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1: builder
+# ─────────────────────────────────────────────────────────────────────────────
+FROM rust:1.85-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev \
+        cmake \
+        clang \
+        libclang-dev \
+        protobuf-compiler \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=fdb /usr/lib/libfdb_c.so /usr/lib/libfdb_c.so
+ENV FOUNDATIONDB_LIB_DIR=/usr/lib
+ENV LIBRARY_PATH=/usr/lib
+
+WORKDIR /build
+
+# Dependency layer cache.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto/ proto/
+RUN mkdir -p src && echo 'fn main(){}' > src/main.rs && echo '' > src/lib.rs \
+    && cargo build --release --no-default-features --features "cloud,fdb" 2>/dev/null \
+    ; rm -rf src
+
+COPY src/ src/
+RUN touch src/main.rs src/lib.rs \
+    && cargo build --release --no-default-features --features "cloud,fdb"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2: runtime
+# ─────────────────────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libgcc-s1 \
+        libstdc++6 \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=fdb /usr/lib/libfdb_c.so /usr/lib/libfdb_c.so
+RUN ldconfig
+
+RUN groupadd -r axiom && useradd -r -g axiom -s /sbin/nologin axiom
+
+COPY --from=builder /build/target/release/axiom-core /usr/local/bin/axiom-core
+
+WORKDIR /app
+RUN chown axiom:axiom /app && mkdir -p /etc/foundationdb && chown axiom:axiom /etc/foundationdb
+USER axiom
+
+EXPOSE 3000
+EXPOSE 50051
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=3 \
+    CMD wget -qO- http://localhost:3000/ready || exit 1
+
+ENTRYPOINT ["/usr/local/bin/axiom-core"]
+CMD ["--mode", "cloud", "--listen", "0.0.0.0:3000", "--grpc-listen", "0.0.0.0:50051"]

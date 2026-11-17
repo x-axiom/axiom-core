@@ -1,6 +1,6 @@
 [package]
 name = "axiom-core"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
 
 [features]
@@ -9,7 +9,7 @@ local = ["dep:rocksdb", "dep:rusqlite"]
 cloud = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:zstd", "dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types", "dep:md-5", "dep:bytes", "dep:fred"]
 # FoundationDB backend — requires the FDB client library to be installed.
 # brew install foundationdb  (macOS) or the package for your distro.
-fdb = ["dep:foundationdb", "dep:uuid", "dep:jsonwebtoken", "dep:ed25519-dalek", "dep:rand", "dep:prometheus"]
+fdb = ["dep:foundationdb"]
 full = ["local", "cloud"]
 
 [dependencies]
@@ -20,6 +20,7 @@ serde_json = "1"
 toml = "0.8"
 anyhow = "1"
 parking_lot = "0.12"
+dashmap = "6"
 criterion = "0.8.2"
 rocksdb = { version = "0.22", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
@@ -27,8 +28,9 @@ fastcdc = "3"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower = "0.5"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 hex = "0.4"
 base64 = "0.22"
 walkdir = "2"
@@ -44,20 +46,23 @@ aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
 md-5 = { version = "0.10", optional = true }
 bytes = { version = "1", optional = true }
-foundationdb = { version = "0.9", features = ["embedded-fdb-include"], optional = true }
-uuid = { version = "1", features = ["v4", "serde"], optional = true }
-jsonwebtoken = { version = "9", optional = true }
-ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"], optional = true }
-rand = { version = "0.8", optional = true }
+foundationdb = { version = "0.9", features = ["embedded-fdb-include", "fdb-7_3"], optional = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+jsonwebtoken = "9"
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
+rand = "0.8"
+# Outbound HTTPS for GitHub OAuth token verification (P0-1).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 fred = { version = "9", optional = true }
-prometheus = { version = "0.13", optional = true }
+prometheus = "0.13"
+keyring = "3"
+time = { version = "0.3", features = ["formatting"] }
 
 [build-dependencies]
 tonic-build = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
-reqwest = { version = "0.12", features = ["json"] }
 tokio-test = "0.4"
 tokio-stream = { version = "0.1", features = ["net"] }
 testcontainers-modules = { version = "0.15", features = ["minio", "redis"] }

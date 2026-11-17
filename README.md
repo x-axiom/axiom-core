@@ -6,6 +6,14 @@ Axiom Core is a high-performance, versioned, content-addressed storage engine wr
 
 It brings Git-like ideas to large binary assets: immutable versions, content-based deduplication, branch and tag references, and Merkle-tree diffing. It can run as an HTTP service or be embedded directly in other applications.
 
+Axiom is a **versioned, content-addressed object storage SaaS** designed for large files such as videos, 3D models, datasets, container images, and design assets. It combines:
+
+- **Git** version DAGs and immutable snapshot semantics
+- **S3** object storage scale and API simplicity
+- **IPFS/CAS** content addressing and global deduplication
+
+**Long-term goal:** provide complete change history and traceability at a cost close to raw object storage, with **zero redundant copies**.
+
 ## Table of Contents
 
 - [Why Axiom Core](#why-axiom-core)

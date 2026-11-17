@@ -17,14 +17,8 @@
 //! A production deployment would use a distributed lock (e.g. FoundationDB
 //! CAS) — see the design doc for details.
 //!
-//! ### Known limitation: ref-update race
-//! `FinalizeRefs` performs `get_ref → fast-forward check → put_ref` without
-//! a CAS primitive on `RefRepo`, so two concurrent finalizations on the same
-//! ref can both observe the old tip and both call `put_ref` (last writer
-//! silently wins). The fix requires `RefRepo::compare_and_swap_ref` backed
-//! by an atomic backend op (FDB transaction). Tracked under E06-S02 and the
-//! deferral note on E04-S07. Do not patch around it with an in-process
-//! Mutex — that hides the race rather than detecting it.
+//! Ref updates use `RefRepo::compare_and_swap_ref` after fast-forward
+//! validation, so concurrent finalizations cannot silently overwrite a tip.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -32,8 +26,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dashmap::DashMap;
 use futures_util::StreamExt;
-use parking_lot::Mutex;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::error::{CasError, CasResult};
@@ -109,6 +103,10 @@ pub struct PushServiceState {
     /// Prevents zip-bomb / OOM DoS from clients that send many highly-compressed
     /// entries.  Defaults to 4 GiB.  Inject a smaller value in tests.
     pub max_decompressed_bytes: u64,
+    /// Tenant usage ledger. `None` disables quota enforcement (local mode).
+    pub usage: Option<Arc<dyn crate::quota::UsageRepo>>,
+    /// Plan → byte ceiling mapping.
+    pub quota: crate::quota::QuotaPolicy,
 }
 
 // ─── PushServiceHandler ──────────────────────────────────────────────────────
@@ -120,15 +118,14 @@ pub struct PushServiceState {
 pub struct PushServiceHandler {
     state: PushServiceState,
     /// In-flight push sessions keyed by session_id.
-    sessions: Arc<Mutex<HashMap<String, PushSession>>>,
+    sessions: Arc<DashMap<String, PushSession>>,
     /// Background reaper task — aborted on drop.
     _reaper: tokio::task::AbortHandle,
 }
 
 impl PushServiceHandler {
     pub fn new(state: PushServiceState) -> Self {
-        let sessions: Arc<Mutex<HashMap<String, PushSession>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let sessions: Arc<DashMap<String, PushSession>> = Arc::new(DashMap::new());
 
         let ttl = state.session_ttl_secs;
         let interval = state.cleanup_interval_secs;
@@ -140,10 +137,15 @@ impl PushServiceHandler {
             loop {
                 tokio::time::sleep(interval_dur).await;
                 let now = now_secs();
-                let mut map = sessions_ref.lock();
-                let before = map.len();
-                map.retain(|_, s| now.saturating_sub(s.created_at) < ttl);
-                let expired = before - map.len();
+                let expired_keys: Vec<String> = sessions_ref
+                    .iter()
+                    .filter(|entry| now.saturating_sub(entry.value().created_at) >= ttl)
+                    .map(|entry| entry.key().clone())
+                    .collect();
+                let expired = expired_keys.len();
+                for key in expired_keys {
+                    sessions_ref.remove(&key);
+                }
                 if expired > 0 {
                     tracing::info!(n_expired = expired, "reaped stale push sessions");
                 }
@@ -499,17 +501,14 @@ impl SyncService for PushServiceHandler {
 
         // ③ Create session.
         let session_id = new_session_id();
-        {
-            let mut sessions = self.sessions.lock();
-            sessions.insert(
-                session_id.clone(),
-                PushSession {
-                    ref_updates: session_updates,
-                    expected_objects: total_objects,
-                    created_at: now_secs(),
-                },
-            );
-        }
+        self.sessions.insert(
+            session_id.clone(),
+            PushSession {
+                ref_updates: session_updates,
+                expected_objects: total_objects,
+                created_at: now_secs(),
+            },
+        );
 
         Ok(Response::new(NegotiatePushResponse {
             accepted: true,
@@ -524,8 +523,27 @@ impl SyncService for PushServiceHandler {
         &self,
         request: Request<Streaming<UploadPackRequest>>,
     ) -> Result<Response<UploadPackResponse>, Status> {
+        // Resolve the tenant budget before consuming the stream.
+        let quota_tenant = request
+            .extensions()
+            .get::<crate::auth::rbac::AuthContext>()
+            .map(|ctx| ctx.tenant_id.clone());
+        let quota_plan = request
+            .extensions()
+            .get::<crate::auth::rbac::PlanContext>()
+            .and_then(|p| p.0.clone());
+        let quota_budget = match (quota_tenant.as_deref(), self.state.usage.as_ref()) {
+            (Some(tenant), Some(repo)) => {
+                let used = repo.get(tenant).unwrap_or(0);
+                let quota = self.state.quota.limit_for(quota_plan.as_deref());
+                Some((quota.saturating_sub(used), quota, used))
+            }
+            _ => None,
+        };
+
         let mut stream = request.into_inner();
 
+        let mut new_bytes: u64 = 0;
         let mut received: u64 = 0;
         let mut stored: u64 = 0;
         let mut duplicates: u64 = 0;
@@ -540,14 +558,11 @@ impl SyncService for PushServiceHandler {
                     // Validate the session_id refers to a live NegotiatePush.
                     // Without this check, any client could push raw objects
                     // bypassing negotiation and the per-session quota.
-                    {
-                        let sessions = self.sessions.lock();
-                        if !sessions.contains_key(&hdr.session_id) {
-                            return Err(Status::not_found(format!(
-                                "unknown push session '{}'",
-                                hdr.session_id
-                            )));
-                        }
+                    if !self.sessions.contains_key(&hdr.session_id) {
+                        return Err(Status::not_found(format!(
+                            "unknown push session '{}'",
+                            hdr.session_id
+                        )));
                     }
                     session_id = hdr.session_id.clone();
                 }
@@ -575,7 +590,7 @@ impl SyncService for PushServiceHandler {
                         // Evict the session so the client cannot retry with the
                         // same session_id and continue accumulating bytes.
                         if !session_id.is_empty() {
-                            self.sessions.lock().remove(&session_id);
+                            self.sessions.remove(&session_id);
                         }
                         tracing::warn!(
                             session_id = %session_id,
@@ -587,6 +602,8 @@ impl SyncService for PushServiceHandler {
                             "upload exceeds decompressed-bytes limit ({max_decompressed} bytes)"
                         )));
                     }
+
+                    let raw_len = raw.len() as u64;
 
                     // Verify hash.
                     let arr: [u8; 32] = oid.hash.as_slice().try_into().unwrap();
@@ -606,7 +623,26 @@ impl SyncService for PushServiceHandler {
                                 .chunks
                                 .put_chunk(raw)
                                 .map_err(cas_err_to_status)?;
-                            if was_new { stored += 1; } else { duplicates += 1; }
+                            if was_new {
+                                new_bytes = new_bytes.saturating_add(raw_len);
+                                if let Some((budget, quota, used)) = quota_budget {
+                                    if new_bytes > budget {
+                                        if !session_id.is_empty() {
+                                            self.sessions.remove(&session_id);
+                                        }
+                                        tracing::warn!(
+                                            session_id = %session_id,
+                                            used,
+                                            quota,
+                                            "upload_pack rejected: tenant quota exceeded"
+                                        );
+                                        return Err(Status::resource_exhausted(format!(
+                                            "quota_exceeded: {used} of {quota} bytes used"
+                                        )));
+                                    }
+                                }
+                                stored += 1;
+                            } else { duplicates += 1; }
                         }
 
                         PROTO_TYPE_TREE_NODE => {
@@ -669,6 +705,15 @@ impl SyncService for PushServiceHandler {
             }
         }
 
+        // Charge the tenant once the pack is fully accepted.
+        if let (Some(tenant), Some(repo)) = (quota_tenant.as_deref(), self.state.usage.as_ref()) {
+            if new_bytes > 0 {
+                if let Err(err) = repo.add(tenant, new_bytes) {
+                    tracing::error!(error = %err, tenant, "failed to record sync usage");
+                }
+            }
+        }
+
         Ok(Response::new(UploadPackResponse {
             session_id,
             received,
@@ -687,10 +732,10 @@ impl SyncService for PushServiceHandler {
         // Look up (and remove) the push session. A missing session means the
         // client never called NegotiatePush — reject so the per-session
         // mismatch / quota guards below are never bypassed.
-        let session = {
-            let mut sessions = self.sessions.lock();
-            sessions.remove(&req.session_id)
-        }
+        let session = self
+            .sessions
+            .remove(&req.session_id)
+            .map(|(_, session)| session)
         .ok_or_else(|| {
             Status::not_found(format!("unknown push session '{}'", req.session_id))
         })?;
@@ -774,12 +819,26 @@ impl SyncService for PushServiceHandler {
                 kind: RefKind::Branch,
                 target: new_vid,
             };
-            match self.state.refs.put_ref(&new_ref) {
-                Ok(()) => {
+            match self.state.refs.compare_and_swap_ref(
+                &upd.ref_name,
+                current_remote.as_ref().map(|r| &r.target),
+                &new_ref,
+            ) {
+                Ok(true) => {
                     results.push(RefUpdateResult {
                         ref_name: upd.ref_name.clone(),
                         status: "ok".into(),
                         message: String::new(),
+                    });
+                }
+                Ok(false) => {
+                    results.push(RefUpdateResult {
+                        ref_name: upd.ref_name.clone(),
+                        status: "non-fast-forward".into(),
+                        message: format!(
+                            "remote tip moved while finalizing '{}'",
+                            upd.ref_name
+                        ),
                     });
                 }
                 Err(e) => {

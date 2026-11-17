@@ -21,6 +21,7 @@ use crate::store::traits::{
     ChunkStore, NodeStore, ObjectManifestRepo, RefRepo, RemoteTrackingRepo, SyncDirection,
     SyncSessionRepo, TreeStore, VersionRepo,
 };
+use crate::sync::client_auth::ClientAuth;
 use crate::sync::proto::{
     DownloadPackRequest, ListRefsRequest, NegotiatePullRequest, WantEntry,
     download_pack_response::Payload,
@@ -96,12 +97,22 @@ pub struct PullResult {
 /// Executes the three-step gRPC pull protocol against a remote sync server.
 pub struct PullClient {
     inner: SyncServiceClient<Channel>,
+    auth: ClientAuth,
 }
 
 impl PullClient {
     /// Connect to a gRPC sync server at `endpoint`.
     pub async fn connect(
         endpoint: impl Into<tonic::transport::Endpoint>,
+    ) -> CasResult<Self> {
+        Self::connect_authenticated(endpoint, None).await
+    }
+
+    /// Connect to a gRPC sync server, optionally attaching a bearer token to
+    /// every request made by this client.
+    pub async fn connect_authenticated(
+        endpoint: impl Into<tonic::transport::Endpoint>,
+        auth_token: Option<&str>,
     ) -> CasResult<Self> {
         let channel = endpoint
             .into()
@@ -110,6 +121,7 @@ impl PullClient {
             .map_err(|e| CasError::SyncError(format!("connect: {e}")))?;
         Ok(Self {
             inner: SyncServiceClient::new(channel),
+            auth: ClientAuth::from_token(auth_token)?,
         })
     }
 
@@ -225,10 +237,10 @@ impl PullClient {
 
         let list_resp = self
             .inner
-            .list_refs(Request::new(ListRefsRequest {
+            .list_refs(self.auth.apply(Request::new(ListRefsRequest {
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("list_refs: {e}")))?
             .into_inner();
@@ -302,12 +314,12 @@ impl PullClient {
 
         let neg_resp = self
             .inner
-            .negotiate_pull(Request::new(NegotiatePullRequest {
+            .negotiate_pull(self.auth.apply(Request::new(NegotiatePullRequest {
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
                 wants,
                 have_filter,
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("negotiate_pull: {e}")))?
             .into_inner();
@@ -318,11 +330,11 @@ impl PullClient {
         // ── Step 3: DownloadPack ──────────────────────────────────────────
         let mut dl_stream = self
             .inner
-            .download_pack(Request::new(DownloadPackRequest {
+            .download_pack(self.auth.apply(Request::new(DownloadPackRequest {
                 session_id: server_session_id.clone(),
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("download_pack: {e}")))?
             .into_inner();

@@ -19,6 +19,7 @@ use crate::store::traits::{
     ChunkStore, NodeStore, ObjectManifestRepo, RefRepo, RemoteTrackingRepo, SyncDirection,
     SyncSessionRepo, TreeStore, VersionRepo,
 };
+use crate::sync::client_auth::ClientAuth;
 use crate::sync::proto::{
     FinalizeRefsRequest, ListRefsRequest, NegotiatePushRequest, ObjectId, ObjectList,
     PackEntry, PackHeader, RefUpdate, UploadPackRequest,
@@ -97,12 +98,22 @@ pub struct PushConfig {
 /// Executes the four-step gRPC push protocol against a remote sync server.
 pub struct PushClient {
     inner: SyncServiceClient<Channel>,
+    auth: ClientAuth,
 }
 
 impl PushClient {
     /// Connect to a gRPC sync server at `endpoint`.
     pub async fn connect(
         endpoint: impl Into<tonic::transport::Endpoint>,
+    ) -> CasResult<Self> {
+        Self::connect_authenticated(endpoint, None).await
+    }
+
+    /// Connect to a gRPC sync server, optionally attaching a bearer token to
+    /// every request made by this client.
+    pub async fn connect_authenticated(
+        endpoint: impl Into<tonic::transport::Endpoint>,
+        auth_token: Option<&str>,
     ) -> CasResult<Self> {
         let channel = endpoint
             .into()
@@ -111,6 +122,7 @@ impl PushClient {
             .map_err(|e| CasError::SyncError(format!("connect: {e}")))?;
         Ok(Self {
             inner: SyncServiceClient::new(channel),
+            auth: ClientAuth::from_token(auth_token)?,
         })
     }
 
@@ -229,10 +241,10 @@ impl PushClient {
 
         let list_resp = self
             .inner
-            .list_refs(Request::new(ListRefsRequest {
+            .list_refs(self.auth.apply(Request::new(ListRefsRequest {
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("list_refs: {e}")))?
             .into_inner();
@@ -315,13 +327,13 @@ impl PushClient {
 
         let neg_resp = self
             .inner
-            .negotiate_push(Request::new(NegotiatePushRequest {
+            .negotiate_push(self.auth.apply(Request::new(NegotiatePushRequest {
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
                 ref_updates: ref_updates.clone(),
                 local_versions,
                 client_inventory,
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("negotiate_push: {e}")))?
             .into_inner();
@@ -383,6 +395,7 @@ impl PushClient {
                 .map(|shard| {
                     upload_shard(
                         self.inner.clone(),
+                        self.auth.clone(),
                         server_session_id.clone(),
                         shard,
                         chunks,
@@ -463,7 +476,7 @@ impl PushClient {
             }
 
             self.inner
-                .upload_pack(Request::new(stream::iter(messages)))
+                .upload_pack(self.auth.apply(Request::new(stream::iter(messages))))
                 .await
                 .map_err(|e| CasError::SyncError(format!("upload_pack: {e}")))?;
 
@@ -485,12 +498,12 @@ impl PushClient {
 
         let fin_resp = self
             .inner
-            .finalize_refs(Request::new(FinalizeRefsRequest {
+            .finalize_refs(self.auth.apply(Request::new(FinalizeRefsRequest {
                 session_id: server_session_id,
                 workspace_id: config.workspace_id.clone(),
                 tenant_id: config.tenant_id.clone(),
                 ref_updates,
-            }))
+            })))
             .await
             .map_err(|e| CasError::SyncError(format!("finalize_refs: {e}")))?
             .into_inner();
@@ -535,6 +548,7 @@ impl PushClient {
 /// Returns `(objects_sent, compressed_bytes, hex_hashes)`.
 async fn upload_shard(
     mut client: SyncServiceClient<Channel>,
+    auth: ClientAuth,
     server_session_id: String,
     shard: Vec<ObjectList>,
     chunks: &dyn ChunkStore,
@@ -578,7 +592,7 @@ async fn upload_shard(
     }
 
     client
-        .upload_pack(Request::new(stream::iter(messages)))
+        .upload_pack(auth.apply(Request::new(stream::iter(messages))))
         .await
         .map_err(|e| CasError::SyncError(format!("upload_pack shard: {e}")))?;
 

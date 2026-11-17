@@ -10,10 +10,19 @@ use serde::Serialize;
 use crate::error::CasError;
 
 /// Structured error response body.
+///
+/// `code` is the stable, machine-readable identifier (also mirrored into
+/// `error` for backwards compatibility); `message` is human-readable.
 #[derive(Serialize)]
 pub struct ErrorResponse {
     pub error: String,
+    pub code: String,
     pub message: String,
+    /// Correlation id (also returned in the `x-request-id` header).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Whether the client may retry the same request.
+    pub retryable: bool,
 }
 
 /// Wrapper that implements `IntoResponse` for `CasError`.
@@ -35,6 +44,7 @@ impl IntoResponse for ApiError {
             CasError::InvalidRef(_) => (StatusCode::BAD_REQUEST, "invalid_ref"),
             CasError::Store(_) => (StatusCode::INTERNAL_SERVER_ERROR, "store_error"),
             CasError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            CasError::TokenExpired(_) => (StatusCode::UNAUTHORIZED, "token_expired"),
             CasError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             CasError::TenantNotFound(_) => (StatusCode::NOT_FOUND, "tenant_not_found"),
             CasError::WorkspaceNotFound(_) => (StatusCode::NOT_FOUND, "workspace_not_found"),
@@ -46,9 +56,16 @@ impl IntoResponse for ApiError {
             CasError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "io_error"),
         };
 
+        let retryable = status.is_server_error()
+            || status == StatusCode::TOO_MANY_REQUESTS
+            || error_type == "token_expired";
+
         let body = ErrorResponse {
             error: error_type.to_string(),
+            code: error_type.to_string(),
             message: self.0.to_string(),
+            request_id: crate::telemetry::current_request_id(),
+            retryable,
         };
 
         (status, Json(body)).into_response()

@@ -25,6 +25,9 @@ pub enum CasError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    #[error("token expired: {0}")]
+    TokenExpired(String),
+
     #[error("forbidden: {0}")]
     Forbidden(String),
 

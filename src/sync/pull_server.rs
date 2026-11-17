@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 use tonic::{Request, Response, Status};
 
 use crate::error::{CasError, CasResult};
-use crate::model::{NodeEntry, Ref, TreeNode, VersionId, VersionNode};
+use crate::model::{NodeEntry, NodeKind, Ref, TreeNode, TreeNodeKind, VersionId, VersionNode};
 use crate::sync::shallow::collect_versions_shallow;
 use crate::sync::bloom_negotiate::BloomFilter;
 use crate::store::traits::{ChunkStore, NodeStore, RefRepo, SyncStore, TreeStore, VersionRepo};
@@ -233,6 +233,124 @@ fn fetch_raw(
     }
 }
 
+fn build_ordered_object_list(
+    want_vids: &[VersionId],
+    have_vids: &HashSet<VersionId>,
+    versions: &dyn VersionRepo,
+    nodes: &dyn NodeStore,
+    trees: &dyn TreeStore,
+) -> CasResult<Vec<(i32, [u8; 32])>> {
+    #[derive(Default)]
+    struct OrderedObjectBuilder {
+        objects: Vec<(i32, [u8; 32])>,
+        seen_versions: HashSet<VersionId>,
+        seen_nodes: HashSet<blake3::Hash>,
+        seen_trees: HashSet<blake3::Hash>,
+        seen_chunks: HashSet<blake3::Hash>,
+    }
+
+    impl OrderedObjectBuilder {
+        fn push_version(
+            &mut self,
+            vid: &VersionId,
+            have_vids: &HashSet<VersionId>,
+            versions: &dyn VersionRepo,
+            nodes: &dyn NodeStore,
+            trees: &dyn TreeStore,
+        ) -> CasResult<()> {
+            if have_vids.contains(vid) || !self.seen_versions.insert(vid.clone()) {
+                return Ok(());
+            }
+
+            let version = versions
+                .get_version(vid)?
+                .ok_or_else(|| CasError::NotFound(format!("version {}", vid.as_str())))?;
+
+            for parent in &version.parents {
+                self.push_version(parent, have_vids, versions, nodes, trees)?;
+            }
+
+            self.push_node(&version.root, nodes, trees)?;
+
+            let bytes = hex::decode(vid.as_str())
+                .map_err(|e| CasError::SyncError(format!("invalid version id {}: {e}", vid.as_str())))?;
+            if bytes.len() != 32 {
+                return Err(CasError::SyncError(format!(
+                    "version id {} must decode to 32 bytes",
+                    vid.as_str()
+                )));
+            }
+
+            let arr: [u8; 32] = bytes.try_into().unwrap();
+            self.objects.push((PROTO_TYPE_VERSION, arr));
+            Ok(())
+        }
+
+        fn push_node(
+            &mut self,
+            node_hash: &blake3::Hash,
+            nodes: &dyn NodeStore,
+            trees: &dyn TreeStore,
+        ) -> CasResult<()> {
+            if !self.seen_nodes.insert(*node_hash) {
+                return Ok(());
+            }
+
+            let node = nodes
+                .get_node(node_hash)?
+                .ok_or_else(|| CasError::NotFound(format!("node {node_hash}")))?;
+
+            match &node.kind {
+                NodeKind::File { root, .. } => self.push_tree(root, trees)?,
+                NodeKind::Directory { children } => {
+                    for child_hash in children.values() {
+                        self.push_node(child_hash, nodes, trees)?;
+                    }
+                }
+            }
+
+            self.objects.push((PROTO_TYPE_NODE_ENTRY, *node_hash.as_bytes()));
+            Ok(())
+        }
+
+        fn push_tree(
+            &mut self,
+            tree_hash: &blake3::Hash,
+            trees: &dyn TreeStore,
+        ) -> CasResult<()> {
+            if !self.seen_trees.insert(*tree_hash) {
+                return Ok(());
+            }
+
+            let tree = trees
+                .get_tree_node(tree_hash)?
+                .ok_or_else(|| CasError::NotFound(format!("tree node {tree_hash}")))?;
+
+            match &tree.kind {
+                TreeNodeKind::Leaf { chunk } => {
+                    if self.seen_chunks.insert(*chunk) {
+                        self.objects.push((PROTO_TYPE_CHUNK, *chunk.as_bytes()));
+                    }
+                }
+                TreeNodeKind::Internal { children } => {
+                    for child_hash in children {
+                        self.push_tree(child_hash, trees)?;
+                    }
+                }
+            }
+
+            self.objects.push((PROTO_TYPE_TREE_NODE, *tree_hash.as_bytes()));
+            Ok(())
+        }
+    }
+
+    let mut builder = OrderedObjectBuilder::default();
+    for vid in want_vids {
+        builder.push_version(vid, have_vids, versions, nodes, trees)?;
+    }
+    Ok(builder.objects)
+}
+
 // ─── SyncService impl ─────────────────────────────────────────────────────────
 
 #[tonic::async_trait]
@@ -274,35 +392,16 @@ impl SyncService for PullServiceHandler {
             }));
         }
 
-        // BFS to collect all objects the client is missing.
-        let reachable = self
-            .state
-            .sync
-            .collect_reachable_with_have(&want_vids, &have_vids)
-            .map_err(cas_err_to_status)?;
-
-        // Build ordered object list: versions → tree nodes → node entries → chunks.
-        // This ordering means the client can store objects in receive-order
-        // without forward-reference gaps.
-        let mut objects: Vec<(i32, [u8; 32])> = Vec::new();
-
-        for vid in &reachable.versions {
-            if let Ok(bytes) = hex::decode(vid.as_str()) {
-                if bytes.len() == 32 {
-                    let arr: [u8; 32] = bytes.try_into().unwrap();
-                    objects.push((PROTO_TYPE_VERSION, arr));
-                }
-            }
-        }
-        for h in &reachable.tree_hashes {
-            objects.push((PROTO_TYPE_TREE_NODE, *h.as_bytes()));
-        }
-        for h in &reachable.node_hashes {
-            objects.push((PROTO_TYPE_NODE_ENTRY, *h.as_bytes()));
-        }
-        for h in &reachable.chunk_hashes {
-            objects.push((PROTO_TYPE_CHUNK, *h.as_bytes()));
-        }
+        // Build dependency-first object list so every received object can be
+        // validated against already-stored children with no forward refs.
+        let mut objects = build_ordered_object_list(
+            &want_vids,
+            &have_vids,
+            self.state.versions.as_ref(),
+            self.state.nodes.as_ref(),
+            self.state.trees.as_ref(),
+        )
+        .map_err(cas_err_to_status)?;
 
         // ── E05-S05: Bloom-filter post-filtering ──────────────────────────
         // If the client sent a non-empty `have_filter`, remove any objects
@@ -454,44 +553,28 @@ impl SyncService for PullServiceHandler {
             selected_refs.iter().map(|r| r.target.clone()).collect();
 
         // Collect objects based on depth (None or 0 = full clone).
-        let reachable = if tips.is_empty() {
-            crate::store::traits::ReachableObjects::default()
+        let (object_roots, have_set) = if tips.is_empty() {
+            (Vec::new(), HashSet::new())
         } else {
             let depth = req.depth.unwrap_or(0);
             if depth == 0 {
-                self.state.sync
-                    .collect_reachable_objects(&tips)
-                    .map_err(cas_err_to_status)?
+                (tips.clone(), HashSet::new())
             } else {
                 let (version_ids, boundary) =
                     collect_versions_shallow(&tips, depth, self.state.versions.as_ref())
                         .map_err(cas_err_to_status)?;
-                let have_set = boundary.into_set();
-                self.state.sync
-                    .collect_reachable_with_have(&version_ids, &have_set)
-                    .map_err(cas_err_to_status)?
+                (version_ids, boundary.into_set())
             }
         };
 
-        // Build ordered object list (versions → tree nodes → node entries → chunks).
-        let mut objects: Vec<(i32, [u8; 32])> = Vec::new();
-        for vid in &reachable.versions {
-            if let Ok(bytes) = hex::decode(vid.as_str()) {
-                if bytes.len() == 32 {
-                    let arr: [u8; 32] = bytes.try_into().unwrap();
-                    objects.push((PROTO_TYPE_VERSION, arr));
-                }
-            }
-        }
-        for h in &reachable.tree_hashes {
-            objects.push((PROTO_TYPE_TREE_NODE, *h.as_bytes()));
-        }
-        for h in &reachable.node_hashes {
-            objects.push((PROTO_TYPE_NODE_ENTRY, *h.as_bytes()));
-        }
-        for h in &reachable.chunk_hashes {
-            objects.push((PROTO_TYPE_CHUNK, *h.as_bytes()));
-        }
+        let objects = build_ordered_object_list(
+            &object_roots,
+            &have_set,
+            self.state.versions.as_ref(),
+            self.state.nodes.as_ref(),
+            self.state.trees.as_ref(),
+        )
+        .map_err(cas_err_to_status)?;
 
         let total_objects = objects.len() as u64;
         let session_id = new_session_id();
